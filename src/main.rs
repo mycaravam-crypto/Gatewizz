@@ -1,5 +1,7 @@
 //! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
 
+mod ca;
+mod castore;
 mod config;
 mod event;
 mod process;
@@ -28,6 +30,8 @@ gatewizz: a local HTTPS gate for code sent to AI models
 Usage:
   gatewizz [--config <path>]                  run the proxy until Ctrl+C
   gatewizz [--config <path>] --check-config   validate the config and print the effective values
+  gatewizz ca install                         create the local CA if missing and trust it for the current user
+  gatewizz ca remove                          untrust every gatewizz CA and delete the CA files
   gatewizz --version | --help
 
 Options:
@@ -39,19 +43,34 @@ Options:
 
 Point tools at the proxy with HTTPS_PROXY=http://127.0.0.1:8899 (the default listen address).
 
-Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events]), 130 stopped by Ctrl+C or console close.
+The local CA lives in %LOCALAPPDATA%\\gatewizz\\: ca.cer is the public certificate, ca.key its private key,
+encrypted with DPAPI so only the current Windows user can read it. Trusted in the CurrentUser Root store, the CA can
+sign a certificate for any host that this user's programs accept, which is what lets gatewizz inspect HTTPS. It is
+created on this machine and never leaves it. Windows asks to confirm both install and remove.
+
+Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events], [ca]), 130 stopped by Ctrl+C or
+console close.
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Run(Option<PathBuf>),
     CheckConfig(Option<PathBuf>),
+    CaInstall,
+    CaRemove,
     Version,
     Help,
 }
 
 // Four flags do not justify an argument-parsing dependency (PLAN rule 4).
 fn parse(args: &[String]) -> Result<Command, String> {
+    if args.first().is_some_and(|a| a == "ca") {
+        return match &args[1..] {
+            [action] if action == "install" => Ok(Command::CaInstall),
+            [action] if action == "remove" => Ok(Command::CaRemove),
+            _ => Err("[usage] ca needs install or remove; see gatewizz --help".into()),
+        };
+    }
     let (mut config, mut check) = (None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -137,10 +156,26 @@ fn run_proxy(config: &Config) -> Result<(), String> {
     served.and(flushed)
 }
 
+fn ca_err(err: String) -> String {
+    format!("[ca] {err}")
+}
+
+fn ca_dir() -> Result<PathBuf, String> {
+    ca::default_dir().map_err(ca_err)
+}
+
 fn run(command: Command) -> Result<ExitCode, String> {
     match command {
         Command::Version => println!("gatewizz {VERSION}"),
         Command::Help => print!("{USAGE}"),
+        Command::CaInstall => println!(
+            "gatewizz: {}",
+            ca_dir().and_then(|d| castore::install(&d).map_err(ca_err))?
+        ),
+        Command::CaRemove => println!(
+            "gatewizz: {}",
+            ca_dir().and_then(|d| castore::remove(&d).map_err(ca_err))?
+        ),
         Command::CheckConfig(path) => {
             let config = load(path)?;
             config.event_target()?;
@@ -193,6 +228,8 @@ mod tests {
             parse(&args(&["--check-config", "--config", "g.toml"])),
             Ok(Command::CheckConfig(Some("g.toml".into())))
         );
+        assert_eq!(parse(&args(&["ca", "install"])), Ok(Command::CaInstall));
+        assert_eq!(parse(&args(&["ca", "remove"])), Ok(Command::CaRemove));
         assert_eq!(
             parse(&args(&["--check-config"])),
             Ok(Command::CheckConfig(None))
@@ -208,6 +245,10 @@ mod tests {
             &["--config", "a", "--config", "b"][..],
             &["--check-config", "--version"][..],
             &["--help", "x"][..],
+            &["ca"][..],
+            &["ca", "path"][..],
+            &["ca", "install", "x"][..],
+            &["--config", "g.toml", "ca", "install"][..],
         ] {
             let err = parse(&args(input)).unwrap_err();
             assert!(err.starts_with("[usage]"), "{err}");
@@ -221,6 +262,11 @@ mod tests {
             "--check-config",
             "--version",
             "--help",
+            "ca install",
+            "ca remove",
+            "ca.cer",
+            "ca.key",
+            "DPAPI",
             "HTTPS_PROXY",
             "130",
         ] {

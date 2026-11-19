@@ -15,12 +15,30 @@ it for approval before any byte goes upstream. Every decision is logged; content
 
     gatewizz [--config gatewizz.toml]                 # run until Ctrl+C; exits 130
     gatewizz [--config gatewizz.toml] --check-config  # print the effective config; exits 0, or 2 on an error
+    gatewizz ca install                               # create the local CA if missing and trust it (this user)
+    gatewizz ca remove                                # untrust every gatewizz CA and delete its files
 
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
 defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
 bodies.
 
 `gatewizz --help` lists every flag and the exit codes.
+
+## Local CA
+
+To inspect HTTPS (from M2), gatewizz signs a certificate for each host with its own CA, and the wizz tools must trust
+it. `gatewizz ca install` creates the CA on first use and adds it to the **CurrentUser** Root store: no admin rights,
+and no other user or machine trusts it. Windows shows its own confirmation prompt. Re-running it is safe.
+
+- **Files:** `%LOCALAPPDATA%\gatewizz\ca.cer` is the public certificate (DER); `ca.key` is its private key (ECDSA
+  P-256, PKCS#8), encrypted with DPAPI so only the current Windows user can decrypt it. The key is never on disk in the
+  clear and never leaves the machine.
+- **What the CA can do:** sign a certificate for any host name or IP that programs running as this user then accept.
+  That is the point, and also why the key is protected: anyone who can run code as you could already read it, but a
+  copy of the files alone is useless elsewhere. The CA is valid for five years and cannot sign intermediate CAs (path
+  length 0); leaf certificates last seven days.
+- **Removing it:** `gatewizz ca remove` deletes every certificate named `gatewizz local CA` from the CurrentUser Root
+  store (Windows asks again), then both files, then the folder if nothing else is in it.
 
 ## Use with the wizz tools
 

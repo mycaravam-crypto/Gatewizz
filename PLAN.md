@@ -35,7 +35,7 @@ applies. On top of it, as in reswizz and powerwizz:
 | Async / HTTP | `tokio` (minimal features), `hyper` 1 (http1) | M1 |
 | Config / CLI | `serde`, `toml`; flags are hand-rolled (four flags do not justify `clap`) | M1 |
 | Win32 | `windows-sys` (IP Helper, Threading, DPAPI, certificate store) | M1 |
-| TLS | `rustls`, `tokio-rustls`, `rcgen`, `rustls-platform-verifier` | M2 |
+| TLS | `rcgen` (ring), then `rustls`, `tokio-rustls`, `rustls-platform-verifier` | M2 |
 | Approval window | `eframe`/`egui` (glow), reswizz look | M3 |
 
 Dependencies are added by the issue that first needs them, not before.
@@ -44,9 +44,11 @@ Dependencies are added by the issue that first needs them, not before.
 
 ```
 src/
+├── ca.rs        # local CA: generation, leaf issuance, bounded leaf cache, ca.cer/ca.key files (#18)
+├── castore.rs   # ca install|remove: CurrentUser Root store and DPAPI (Win32) (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
-├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
+├── main.rs      # entry point, --config/--check-config, ca install|remove, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
 ├── process.rs   # client process of a loopback connection via IP Helper, keyed by (pid, start) (#5)
 └── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ```
@@ -59,7 +61,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 | Milestone | Goal | Done when | Status |
 |---|---|---|---|
 | **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete (#2–#6, #8); Windows smoke test with smartwizz pending |
-| **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | planned |
+| **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | in progress: local CA (#18) |
 | **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | planned |
 
 ## 6. Quality gates
