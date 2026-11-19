@@ -1,5 +1,6 @@
 //! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
 
+mod process;
 mod proxy;
 
 use std::process::ExitCode;
