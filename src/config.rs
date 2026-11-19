@@ -39,7 +39,7 @@ impl Default for General {
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_connections: usize,
-    /// Largest request head; hyper needs at least 8192.
+    /// Largest request head (start line plus headers); larger heads get 431.
     pub max_header_bytes: usize,
     pub connect_timeout_secs: u64,
     pub header_timeout_secs: u64,
@@ -125,6 +125,7 @@ impl Config {
         let l = &self.limits;
         for (key, value) in [
             ("max_connections", l.max_connections as u64),
+            ("max_header_bytes", l.max_header_bytes as u64),
             ("connect_timeout_secs", l.connect_timeout_secs),
             ("header_timeout_secs", l.header_timeout_secs),
             ("response_timeout_secs", l.response_timeout_secs),
@@ -134,9 +135,6 @@ impl Config {
             if value == 0 {
                 return Err(format!("limits.{key}: must be at least 1"));
             }
-        }
-        if l.max_header_bytes < 8192 {
-            return Err("limits.max_header_bytes: must be at least 8192".into());
         }
         if l.max_connections > u32::MAX as usize {
             return Err("limits.max_connections: too large".into());
@@ -268,8 +266,8 @@ mod tests {
                 "limits.idle_timeout_secs: must be at least 1",
             ),
             (
-                "[limits]\nmax_header_bytes = 100",
-                "limits.max_header_bytes: must be at least 8192",
+                "[limits]\nmax_header_bytes = 0",
+                "limits.max_header_bytes: must be at least 1",
             ),
             (
                 "[events]\nmax_file_bytes = 10",
