@@ -1,0 +1,11 @@
+[package]
+name = "gatewizz"
+version = "0.1.0"
+edition = "2024"
+description = "Local HTTPS gate for code sent to AI models"
+license = "Apache-2.0"
+repository = "https://github.com/mycaravam-crypto/Gatewizz"
+readme = "README.md"
+
+[profile.release]
+strip = true
