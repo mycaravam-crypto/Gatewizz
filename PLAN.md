@@ -44,12 +44,12 @@ Dependencies are added by the issue that first needs them, not before.
 
 ```
 src/
-├── main.rs      # entry point, exit codes (0 ok, 2 failure, 130 cancelled)
+├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
+├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
+├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
 ├── process.rs   # client process of a loopback connection via IP Helper, keyed by (pid, start) (#5)
 └── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ```
-
-Planned for M1, added by its issue: `config.rs` and `event.rs` (#4).
 
 Request framing is parsed by hyper alone and re-framed towards the upstream, so client and upstream cannot disagree
 about request boundaries (no smuggling). Tests in `proxy.rs` drive the real listener against raw TCP peers.
@@ -58,7 +58,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 
 | Milestone | Goal | Done when | Status |
 |---|---|---|---|
-| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | in progress (#2, #3, #5 done) |
+| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | in progress (#2, #3, #4, #5 done) |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | planned |
 | **M3: Ask first** | `approve` action, egui window | A held request sends zero bytes upstream until allowed; deny and timeout both block | planned |
 
