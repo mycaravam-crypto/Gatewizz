@@ -41,7 +41,7 @@ const HOP_BY_HOP: [&str; 9] = [
 pub struct Settings {
     pub allowed_connect_ports: Vec<u16>,
     pub max_connections: usize,
-    /// Read buffer limit for a request head; hyper requires at least 8192.
+    /// Largest request head (start line plus headers) accepted; larger heads get 431.
     pub max_header_bytes: usize,
     /// DNS lookup plus TCP connect to the upstream.
     pub connect_timeout: Duration,
@@ -178,7 +178,7 @@ pub async fn serve(
             let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(ctx.settings.header_timeout)
-                .max_buf_size(ctx.settings.max_header_bytes)
+                .max_header_size(ctx.settings.max_header_bytes)
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades();
             // hyper answers malformed requests itself (400, 431) before any handler runs, so record them here.
@@ -790,6 +790,189 @@ mod tests {
         assert!(
             matches!(read, Ok(0) | Err(_)),
             "second connection must be closed"
+        );
+    }
+
+    /// Reads one response whose body length is given by `Content-Length` (all responses in these tests).
+    async fn read_response(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                line.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().to_string())
+            })
+            .map_or(0, |v| v.parse::<usize>().unwrap());
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await.unwrap();
+        head + &String::from_utf8(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn keeps_the_client_connection_alive_across_requests() {
+        let (proxy, mut events) = start(Settings::default()).await;
+        let (upstream, mut seen) = recording_upstream().await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        for path in ["/one", "/two"] {
+            let request =
+                format!("GET http://{upstream}{path} HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            let response = read_response(&mut client).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            // The upstream's `Connection: close` is hop-by-hop and must not end the client's connection.
+            assert!(
+                !response.to_lowercase().contains("connection: close"),
+                "{response}"
+            );
+            assert!(
+                String::from_utf8(seen.recv().await.unwrap())
+                    .unwrap()
+                    .contains(path)
+            );
+            assert_eq!(next_event(&mut events).await.path, path);
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_chunked_body_after_100_continue() {
+        let (proxy, _events) = start(Settings::default()).await;
+        let (upstream, mut seen) = recording_upstream().await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let head = format!(
+            "POST http://{upstream}/up HTTP/1.1\r\nHost: {upstream}\r\nExpect: 100-continue\r\n\
+             Transfer-Encoding: chunked\r\n\r\n"
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        let mut interim = [0u8; 25];
+        client.read_exact(&mut interim).await.unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        client.write_all(b"5\r\nhello\r\n0\r\n\r\n").await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        let received = String::from_utf8(seen.recv().await.unwrap())
+            .unwrap()
+            .to_lowercase();
+        assert!(received.contains("hello"), "{received}");
+        assert!(!received.contains("expect:"), "{received}");
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_mid_upload_closes_the_upstream() {
+        let (proxy, _events) = start(Settings::default()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        let closed = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            // Ends only when the proxy closes its side.
+            timeout(Duration::from_secs(5), stream.read_to_end(&mut sink))
+                .await
+                .is_ok()
+        });
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let head = format!(
+            "POST http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\nContent-Length: 1000\r\n\r\n"
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.write_all(&[b'x'; 10]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+        assert!(closed.await.unwrap(), "upstream connection must be closed");
+    }
+
+    #[tokio::test]
+    async fn silent_upstream_gets_a_gateway_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let settings = Settings {
+            response_timeout: Duration::from_millis(200),
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        let response = exchange(
+            proxy,
+            format!("GET http://{upstream}/ HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.status, event.reason),
+            (504, Some("upstream response timeout"))
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_client_is_disconnected() {
+        let settings = Settings {
+            header_timeout: Duration::from_millis(200),
+            ..Settings::default()
+        };
+        let (proxy, _events) = start(settings).await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let mut buf = Vec::new();
+        let read = timeout(Duration::from_secs(3), client.read_to_end(&mut buf)).await;
+        assert!(
+            read.is_ok(),
+            "a client that sends no request head must be disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_requests_to_itself() {
+        let (proxy, mut events) = start(Settings::default()).await;
+        let port = proxy.port();
+        for target in [
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://localhost:{port}/"),
+        ] {
+            let response = exchange(
+                proxy,
+                format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{target}: {response}");
+            assert_eq!(
+                next_event(&mut events).await.reason,
+                Some("request targets gatewizz itself")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_obs_fold_and_oversized_heads() {
+        let (proxy, mut events) = start(Settings::default()).await;
+        let folded = exchange(
+            proxy,
+            b"GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: x\r\nX-A: a\r\n b\r\n\r\n",
+        )
+        .await;
+        assert!(folded.starts_with("HTTP/1.1 400"), "{folded}");
+        assert_eq!(
+            next_event(&mut events).await.reason,
+            Some("malformed request")
+        );
+
+        let big = format!(
+            "GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: x\r\nX-Big: {}\r\n\r\n",
+            "a".repeat(Settings::default().max_header_bytes + 1)
+        );
+        let oversized = exchange(proxy, big.as_bytes()).await;
+        assert!(oversized.starts_with("HTTP/1.1 431"), "{oversized}");
+        assert_eq!(
+            next_event(&mut events).await.reason,
+            Some("request head too large")
         );
     }
 }
