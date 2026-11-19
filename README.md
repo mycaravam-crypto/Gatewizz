@@ -6,8 +6,9 @@ Tools that send code to a model (smartwizz, testwizz, `docwizz --ai`, gitwizz, c
 `HTTPS_PROXY`. It decrypts each request with a local CA, checks it against a few TOML rules, and allows, blocks or holds
 it for approval before any byte goes upstream. Every decision is logged; content never is.
 
-**Status:** early development. Only the project skeleton exists; the proxy is not implemented yet. Design and
-milestones: [PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
+**Status:** early development. `gatewizz` forwards plain HTTP and tunnels HTTPS (CONNECT to port 443) on
+`127.0.0.1:8899` and prints one record per request to stderr. Configuration, the event file and process attribution
+follow in M1. Design and milestones: [PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
 
 ## Build
 
