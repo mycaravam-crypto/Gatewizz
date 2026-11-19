@@ -16,7 +16,8 @@
 # Concurrent client connections; connections over the limit are closed.
 # max_connections = 512
 
-# Largest request head (request line plus headers) in bytes; at least 8192.
+# Largest request head (request line plus headers) in bytes; larger heads
+# get 431.
 # max_header_bytes = 65536
 
 # Seconds for DNS lookup plus TCP connect to an upstream.
