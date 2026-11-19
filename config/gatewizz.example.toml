@@ -1,0 +1,48 @@
+# Gatewizz example configuration.
+#
+# Every key is optional; the values shown are the defaults. Unknown keys are
+# rejected. Validate a file with:
+#   gatewizz --config gatewizz.toml --check-config
+
+[general]
+# Loopback address the proxy listens on. Point HTTPS_PROXY/HTTP_PROXY here.
+# Non-loopback addresses are rejected.
+# listen = "127.0.0.1:8899"
+
+# Ports a CONNECT may target. Any other port is blocked.
+# allowed_connect_ports = [443]
+
+[limits]
+# Concurrent client connections; connections over the limit are closed.
+# max_connections = 512
+
+# Largest request head (request line plus headers) in bytes; at least 8192.
+# max_header_bytes = 65536
+
+# Seconds for DNS lookup plus TCP connect to an upstream.
+# connect_timeout_secs = 10
+
+# Seconds a client has to send a complete request head, also between
+# keep-alive requests.
+# header_timeout_secs = 30
+
+# Seconds the upstream has to answer with response headers.
+# response_timeout_secs = 120
+
+# Seconds a CONNECT tunnel may pass no bytes before it is closed.
+# idle_timeout_secs = 300
+
+# Seconds shutdown waits for in-flight requests (Ctrl+C or console close).
+# shutdown_timeout_secs = 10
+
+[events]
+# JSON Lines event file. Empty means %LOCALAPPDATA%\gatewizz\events.jsonl;
+# "-" writes to stdout. Events hold metadata only: no bodies, header values
+# or query strings.
+# path = ""
+
+# The file is rotated before a line would push it past this many bytes.
+# max_file_bytes = 10485760
+
+# Rotated files kept next to the live one (events.jsonl.1, .2, ...).
+# keep_files = 5

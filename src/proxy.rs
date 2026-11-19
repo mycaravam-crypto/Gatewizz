@@ -3,6 +3,7 @@
 //! Bodies are streamed, never buffered; the proxy never retries and never follows redirects.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,9 +18,10 @@ use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::timeout;
 
+use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -51,6 +53,8 @@ pub struct Settings {
     pub response_timeout: Duration,
     /// A tunnel with no bytes in either direction for this long is closed.
     pub idle_timeout: Duration,
+    /// On shutdown, in-flight requests get this long to finish.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for Settings {
@@ -63,39 +67,9 @@ impl Default for Settings {
             header_timeout: Duration::from_secs(30),
             response_timeout: Duration::from_secs(120),
             idle_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(10),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coverage {
-    /// Plain HTTP: request metadata is seen.
-    // ponytail: bodies are not inspected before M2, so plain HTTP is only partially inspected.
-    PartiallyInspected,
-    /// CONNECT passed through without decryption.
-    Tunneled,
-    /// Rejected by the proxy before anything was forwarded.
-    Blocked,
-}
-
-/// One request or tunnel. Holds metadata only: never header values, query strings or bodies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Event {
-    pub client: SocketAddr,
-    pub process: Process,
-    pub method: String,
-    pub host: String,
-    pub port: u16,
-    /// Request path without the query string; empty for CONNECT.
-    pub path: String,
-    pub coverage: Coverage,
-    pub status: u16,
-    /// Why the proxy itself answered (rejection or upstream failure).
-    pub reason: Option<&'static str>,
-    /// Bytes client→upstream and upstream→client.
-    // ponytail: counted for tunnels only; plain HTTP bodies get counters with the event writer (#4).
-    pub bytes_up: Option<u64>,
-    pub bytes_down: Option<u64>,
 }
 
 impl Event {
@@ -106,6 +80,7 @@ impl Event {
         reason: &'static str,
     ) -> Self {
         Self {
+            time: event::now(),
             client,
             process,
             method: String::new(),
@@ -135,34 +110,44 @@ impl Ctx {
     }
 }
 
-/// Accepts connections until the listener fails. Each connection is served on its own task.
+/// Accepts connections until `shutdown` completes, each served on its own task. Then it stops accepting, asks every
+/// connection to finish its in-flight request and close, and returns once all have, or after `shutdown_timeout`.
+// ponytail: CONNECT tunnels run detached after the upgrade and are not drained; they end with the runtime.
 pub async fn serve(
     listener: TcpListener,
     settings: Settings,
     events: mpsc::Sender<Event>,
+    shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     let listen = listener.local_addr()?;
-    let limit = Arc::new(Semaphore::new(settings.max_connections));
+    let max = settings.max_connections;
+    let limit = Arc::new(Semaphore::new(max));
+    let (stop, stopping) = watch::channel(false);
     let ctx = Arc::new(Ctx {
         settings,
         listen,
         events,
     });
+    tokio::pin!(shutdown);
     loop {
-        let (stream, client) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                // Out of file handles and similar: back off instead of spinning, keep serving.
-                eprintln!("gatewizz: accept failed: {err}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        let (stream, client) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // Out of file handles and similar: back off instead of spinning, keep serving.
+                    eprintln!("gatewizz: accept failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
         };
         // ponytail: over the limit the connection is closed without a response; queueing would hide overload.
         let Ok(permit) = limit.clone().try_acquire_owned() else {
             continue;
         };
         let ctx = ctx.clone();
+        let mut stopping = stopping.clone();
         tokio::spawn(async move {
             let _permit = permit;
             // Attribute once per connection, at accept: the client's socket row exists only while it is connected.
@@ -181,9 +166,18 @@ pub async fn serve(
                 .max_header_size(ctx.settings.max_header_bytes)
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades();
+            tokio::pin!(conn);
+            let result = tokio::select! {
+                result = conn.as_mut() => result,
+                () = async { let _ = stopping.wait_for(|stop| *stop).await; } => {
+                    // Finish the request in flight, then close instead of waiting for the next one.
+                    conn.as_mut().graceful_shutdown();
+                    conn.await
+                }
+            };
             // hyper answers malformed requests itself (400, 431) before any handler runs, so record them here.
             // Client resets and idle keep-alive timeouts are normal ends and are not recorded.
-            if let Err(err) = conn.await
+            if let Err(err) = result
                 && let Some((status, reason)) = malformed(&err)
             {
                 ctx.emit(Event::rejected_by_parser(client, process, status, reason))
@@ -191,6 +185,18 @@ pub async fn serve(
             }
         });
     }
+    drop(listener);
+    let _ = stop.send(true);
+    // Every connection holds a permit until it ends, so holding all of them means none is left.
+    let drained = timeout(
+        ctx.settings.shutdown_timeout,
+        limit.acquire_many(max as u32),
+    )
+    .await;
+    if drained.is_err() {
+        eprintln!("gatewizz: shutdown deadline reached with requests still in flight");
+    }
+    Ok(())
 }
 
 async fn handle(
@@ -213,6 +219,7 @@ async fn forward(
     mut req: Request<Incoming>,
 ) -> Response<Body> {
     let mut event = Event {
+        time: event::now(),
         client,
         process,
         method: req.method().to_string(),
@@ -300,6 +307,7 @@ async fn tunnel(
     req: Request<Incoming>,
 ) -> Response<Body> {
     let mut event = Event {
+        time: event::now(),
         client,
         process,
         method: Method::CONNECT.to_string(),
@@ -612,7 +620,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (events, received) = mpsc::channel(16);
-        tokio::spawn(serve(listener, settings, events));
+        tokio::spawn(serve(listener, settings, events, std::future::pending()));
         (addr, received)
     }
 
@@ -667,6 +675,125 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// An upstream that answers each request after `delay`, and reports when a request head arrived.
+    async fn slow_upstream(delay: Duration) -> (SocketAddr, mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrived, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let arrived = arrived.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = arrived.send(()).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow")
+                        .await;
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn events_never_hold_header_values_or_queries() {
+        let (proxy, mut events) = start(Settings::default()).await;
+        let (upstream, _seen) = recording_upstream().await;
+        let request = format!(
+            "GET http://{upstream}/v1/chat?api_key=QSECRET HTTP/1.1\r\nHost: {upstream}\r\n\
+             Authorization: Bearer ASECRET\r\nCookie: session=CSECRET\r\n\
+             Proxy-Authorization: Basic PSECRET\r\nConnection: close\r\n\r\n"
+        );
+        let response = exchange(proxy, request.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let event = next_event(&mut events).await;
+        assert_eq!(event.path, "/v1/chat");
+        let line = serde_json::to_string(&event).unwrap();
+        for leak in ["SECRET", "api_key", "Bearer", "session", "Basic"] {
+            assert!(!line.contains(leak), "{leak} in {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_a_slow_request() {
+        let (upstream, mut arrived) = slow_upstream(Duration::from_millis(500)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let (events, mut received) = mpsc::channel(16);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let settings = Settings {
+            shutdown_timeout: Duration::from_secs(5),
+            ..Settings::default()
+        };
+        let server = tokio::spawn(serve(listener, settings, events, async {
+            let _ = stopped.await;
+        }));
+
+        let client = tokio::spawn(async move {
+            let request =
+                format!("GET http://{upstream}/slow HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+            exchange(proxy, request.as_bytes()).await
+        });
+        timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        stop.send(()).unwrap();
+
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve must return once drained")
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "drain waited for the deadline"
+        );
+        // The keep-alive connection was answered, then closed instead of waiting for another request.
+        let response = client.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("slow"), "{response}");
+        assert_eq!(next_event(&mut received).await.status, 200);
+        // No new connections once shutdown has started.
+        assert!(TcpStream::connect(proxy).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_at_the_deadline() {
+        let (upstream, mut arrived) = slow_upstream(Duration::from_secs(60)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let (events, _received) = mpsc::channel(16);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let settings = Settings {
+            shutdown_timeout: Duration::from_millis(200),
+            ..Settings::default()
+        };
+        let server = tokio::spawn(serve(listener, settings, events, async {
+            let _ = stopped.await;
+        }));
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let request = format!("GET http://{upstream}/hang HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("serve must return at the deadline")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
