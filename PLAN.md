@@ -58,9 +58,9 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 
 | Milestone | Goal | Done when | Status |
 |---|---|---|---|
-| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | in progress (#2, #3, #4, #5 done) |
+| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete (#2–#6, #8); Windows smoke test with smartwizz pending |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | planned |
-| **M3: Ask first** | `approve` action, egui window | A held request sends zero bytes upstream until allowed; deny and timeout both block | planned |
+| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | planned |
 
 ## 6. Quality gates
 
