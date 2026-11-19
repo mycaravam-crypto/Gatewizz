@@ -31,6 +31,8 @@ const LEAF_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
 const LEAF_RENEW: Duration = Duration::from_secs(24 * 3600);
 /// Backdating absorbs a client clock that runs a little behind.
 const BACKDATE: Duration = Duration::from_secs(3600);
+/// Hosts with a cached leaf; a few tools talk to far fewer model hosts.
+const LEAF_CACHE: usize = 256;
 
 pub const CERT_FILE: &str = "ca.cer";
 pub const KEY_FILE: &str = "ca.key";
@@ -39,6 +41,7 @@ pub const KEY_FILE: &str = "ca.key";
 pub struct Ca {
     cert: Vec<u8>,
     issuer: Issuer<'static, KeyPair>,
+    leaves: Leaves,
 }
 
 /// A leaf certificate for one host and its own private key.
@@ -76,6 +79,7 @@ impl Ca {
         Ok(Ca {
             cert: cert.der().to_vec(),
             issuer: Issuer::new(params, key),
+            leaves: Leaves::new(LEAF_CACHE),
         })
     }
 
@@ -98,7 +102,13 @@ impl Ca {
         Ok(Ca {
             cert,
             issuer: Issuer::new(ca_params(SystemTime::now()), key),
+            leaves: Leaves::new(LEAF_CACHE),
         })
+    }
+
+    /// The leaf for `host` from this CA's cache, issued if missing or close to expiry.
+    pub fn leaf(&self, host: &str) -> Result<Arc<Leaf>, String> {
+        self.leaves.get(self, host, SystemTime::now())
     }
 
     /// The public certificate, DER.
@@ -357,6 +367,20 @@ mod tests {
             &cache.get(&ca, "a.example", now).unwrap()
         ));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn ca_leaf_uses_its_own_cache() {
+        let ca = Ca::generate(SystemTime::now()).unwrap();
+        let leaf = ca.leaf("api.example.com").unwrap();
+        assert!(Arc::ptr_eq(&leaf, &ca.leaf("API.example.com").unwrap()));
+        verify(
+            ca.cert_der(),
+            &leaf.cert,
+            "api.example.com",
+            SystemTime::now(),
+        )
+        .unwrap();
     }
 
     #[test]
