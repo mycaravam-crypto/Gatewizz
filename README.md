@@ -15,7 +15,6 @@ it for approval before any byte goes upstream. Every decision is logged; content
 
     gatewizz [--config gatewizz.toml]                 # run until Ctrl+C; exits 130
     gatewizz [--config gatewizz.toml] --check-config  # print the effective config; exits 0, or 2 on an error
-    set HTTPS_PROXY=http://127.0.0.1:8899
 
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
 defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or

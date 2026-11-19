@@ -33,7 +33,7 @@ applies. On top of it, as in reswizz and powerwizz:
 |---|---|---|
 | Language | Rust stable, edition 2024, single `gatewizz.exe` | M1 |
 | Async / HTTP | `tokio` (minimal features), `hyper` 1 (http1) | M1 |
-| Config / CLI | `serde`, `toml`, `clap` | M1 |
+| Config / CLI | `serde`, `toml`; flags are hand-rolled (four flags do not justify `clap`) | M1 |
 | Win32 | `windows-sys` (IP Helper, Threading, DPAPI, certificate store) | M1 |
 | TLS | `rustls`, `tokio-rustls`, `rcgen`, `rustls-platform-verifier` | M2 |
 | Approval window | `eframe`/`egui` (glow), reswizz look | M3 |
