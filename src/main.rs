@@ -4,6 +4,7 @@ mod config;
 mod event;
 mod process;
 mod proxy;
+mod tls;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
