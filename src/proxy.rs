@@ -20,6 +20,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::timeout;
 
+use crate::process::{self, Process};
+
 type Body = BoxBody<Bytes, hyper::Error>;
 
 /// Hop-by-hop headers (RFC 9110 §7.6.1) plus the proxy-only ones; never forwarded in either direction.
@@ -80,6 +82,7 @@ pub enum Coverage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub client: SocketAddr,
+    pub process: Process,
     pub method: String,
     pub host: String,
     pub port: u16,
@@ -96,9 +99,15 @@ pub struct Event {
 }
 
 impl Event {
-    fn rejected_by_parser(client: SocketAddr, status: StatusCode, reason: &'static str) -> Self {
+    fn rejected_by_parser(
+        client: SocketAddr,
+        process: Process,
+        status: StatusCode,
+        reason: &'static str,
+    ) -> Self {
         Self {
             client,
+            process,
             method: String::new(),
             host: String::new(),
             port: 0,
@@ -156,8 +165,16 @@ pub async fn serve(
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            // Attribute once per connection, at accept: the client's socket row exists only while it is connected.
+            // The IP Helper and process queries block, so they run off the async workers.
+            let process =
+                tokio::task::spawn_blocking(move || process::client_process(client, listen))
+                    .await
+                    .unwrap_or(Process::Unknown("lookup panicked"));
             let svc_ctx = ctx.clone();
-            let svc = service_fn(move |req| handle(svc_ctx.clone(), client, req));
+            let svc_process = process.clone();
+            let svc =
+                service_fn(move |req| handle(svc_ctx.clone(), client, svc_process.clone(), req));
             let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(ctx.settings.header_timeout)
@@ -169,7 +186,7 @@ pub async fn serve(
             if let Err(err) = conn.await
                 && let Some((status, reason)) = malformed(&err)
             {
-                ctx.emit(Event::rejected_by_parser(client, status, reason))
+                ctx.emit(Event::rejected_by_parser(client, process, status, reason))
                     .await;
             }
         });
@@ -179,18 +196,25 @@ pub async fn serve(
 async fn handle(
     ctx: Arc<Ctx>,
     client: SocketAddr,
+    process: Process,
     req: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     Ok(if req.method() == Method::CONNECT {
-        tunnel(ctx, client, req).await
+        tunnel(ctx, client, process, req).await
     } else {
-        forward(&ctx, client, req).await
+        forward(&ctx, client, process, req).await
     })
 }
 
-async fn forward(ctx: &Ctx, client: SocketAddr, mut req: Request<Incoming>) -> Response<Body> {
+async fn forward(
+    ctx: &Ctx,
+    client: SocketAddr,
+    process: Process,
+    mut req: Request<Incoming>,
+) -> Response<Body> {
     let mut event = Event {
         client,
+        process,
         method: req.method().to_string(),
         host: req.uri().host().unwrap_or_default().to_string(),
         port: req.uri().port_u16().unwrap_or(80),
@@ -269,9 +293,15 @@ async fn forward(ctx: &Ctx, client: SocketAddr, mut req: Request<Incoming>) -> R
     Response::from_parts(parts, body.boxed())
 }
 
-async fn tunnel(ctx: Arc<Ctx>, client: SocketAddr, req: Request<Incoming>) -> Response<Body> {
+async fn tunnel(
+    ctx: Arc<Ctx>,
+    client: SocketAddr,
+    process: Process,
+    req: Request<Incoming>,
+) -> Response<Body> {
     let mut event = Event {
         client,
+        process,
         method: Method::CONNECT.to_string(),
         host: req.uri().host().unwrap_or_default().to_string(),
         port: req.uri().port_u16().unwrap_or(0),
@@ -721,6 +751,15 @@ mod tests {
         let event = next_event(&mut events).await;
         assert_eq!(event.coverage, Coverage::Tunneled);
         assert_eq!((event.bytes_up, event.bytes_down), (Some(4), Some(4)));
+        // The test itself is the client, so attribution must name this process.
+        #[cfg(windows)]
+        assert!(
+            matches!(event.process, Process::Known { pid, .. } if pid == std::process::id()),
+            "{:?}",
+            event.process
+        );
+        #[cfg(not(windows))]
+        assert_eq!(event.process, Process::Unknown("unsupported"));
     }
 
     #[tokio::test]
