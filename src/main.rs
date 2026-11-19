@@ -1,71 +1,139 @@
 //! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
 
+mod config;
+mod event;
 mod process;
 mod proxy;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use config::Config;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Exit code for an execution failure, as in smartwizz.
 const EXIT_FAILURE: u8 = 2;
 
-// ponytail: fixed until the config file (#4) and the CLI (#6) make it configurable.
-const LISTEN: &str = "127.0.0.1:8899";
+/// Exit code after Ctrl+C or console close, as in smartwizz.
+const EXIT_CANCELLED: u8 = 130;
 
-/// Bounded so a stalled consumer slows the proxy down instead of growing memory.
+/// Bounded so a stalled writer slows the proxy down instead of growing memory.
 const EVENT_QUEUE: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Run,
+    Run(Option<PathBuf>),
+    CheckConfig(Option<PathBuf>),
     Version,
 }
 
-// ponytail: hand-rolled until #6 needs real flags; replace with clap there.
+// ponytail: hand-rolled until #6 needs more flags; replace with clap there.
 fn parse(args: &[String]) -> Result<Command, String> {
-    match args {
-        [] => Ok(Command::Run),
-        [flag] if flag == "--version" || flag == "-V" => Ok(Command::Version),
-        _ => Err("[usage] gatewizz takes no arguments yet, except --version".into()),
+    let (mut config, mut check) = (None, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--version" | "-V" if config.is_none() && !check && args.len() == 0 => {
+                return Ok(Command::Version);
+            }
+            "--config" if config.is_none() => match args.next() {
+                Some(path) => config = Some(PathBuf::from(path)),
+                None => return Err("[usage] --config needs a path".into()),
+            },
+            "--check-config" if !check => check = true,
+            other => {
+                return Err(format!(
+                    "[usage] unexpected argument {other:?}; usage: gatewizz [--config <path>] [--check-config] | --version"
+                ));
+            }
+        }
+    }
+    Ok(if check {
+        Command::CheckConfig(config)
+    } else {
+        Command::Run(config)
+    })
+}
+
+fn load(path: Option<PathBuf>) -> Result<Config, String> {
+    path.map_or_else(|| Ok(Config::default()), |p| Config::load(&p))
+}
+
+/// Resolves on Ctrl+C or, on Windows, when the console window is closed.
+async fn cancelled() {
+    #[cfg(windows)]
+    {
+        // ponytail: Windows ends the process about 5 s after a console close, so a longer shutdown_timeout is cut.
+        if let Ok(mut close) = tokio::signal::windows::ctrl_close() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = close.recv() => {}
+            }
+            return;
+        }
+    }
+    // An error here means no handler could be installed; then only the process kill ends the proxy.
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
-fn run_proxy() -> Result<(), String> {
+/// Runs until cancelled, then drains, flushes the events and returns.
+fn run_proxy(config: &Config) -> Result<(), String> {
+    let target = config.event_target()?;
+    let (events, writer) = event::spawn(
+        target,
+        config.events.max_file_bytes,
+        config.events.keep_files,
+        EVENT_QUEUE,
+    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("[configuration] cannot start runtime: {err}"))?;
-    runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(LISTEN)
+    let listen = config.general.listen;
+    let served = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(listen)
             .await
-            .map_err(|err| format!("[network] cannot listen on {LISTEN}: {err}"))?;
-        eprintln!("gatewizz {VERSION} listening on {LISTEN}");
-        let (events, mut received) = tokio::sync::mpsc::channel(EVENT_QUEUE);
-        // ponytail: events go to stderr in Debug form until the JSON Lines writer (#4).
-        tokio::spawn(async move {
-            while let Some(event) = received.recv().await {
-                eprintln!("{event:?}");
-            }
-        });
-        proxy::serve(listener, proxy::Settings::default(), events)
+            .map_err(|err| format!("[network] cannot listen on {listen}: {err}"))?;
+        eprintln!("gatewizz {VERSION} listening on {listen}");
+        proxy::serve(listener, config.settings(), events, cancelled())
             .await
             .map_err(|err| format!("[network] {err}"))
-    })
+    });
+    // Ending the runtime cancels what is left (tunnels), which drops the last event senders, so the writer drains
+    // its queue and stops.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    let flushed = writer
+        .join()
+        .map_err(|_| "[events] writer panicked".to_string())
+        .and_then(|result| result);
+    served.and(flushed)
+}
+
+fn run(command: Command) -> Result<ExitCode, String> {
+    match command {
+        Command::Version => println!("gatewizz {VERSION}"),
+        Command::CheckConfig(path) => {
+            let config = load(path)?;
+            config.event_target()?;
+            print!("{}", config.effective());
+        }
+        Command::Run(path) => {
+            run_proxy(&load(path)?)?;
+            eprintln!("gatewizz: stopped");
+            return Ok(ExitCode::from(EXIT_CANCELLED));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match parse(&args) {
-        Ok(Command::Version) => {
-            println!("gatewizz {VERSION}");
-            Ok(())
-        }
-        Ok(Command::Run) => run_proxy(),
-        Err(err) => Err(err),
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    match parse(&args).and_then(run) {
+        Ok(code) => code,
         Err(err) => {
             eprintln!("gatewizz: {err}");
             ExitCode::from(EXIT_FAILURE)
@@ -83,16 +151,49 @@ mod tests {
 
     #[test]
     fn parses_commands() {
-        assert_eq!(parse(&args(&[])), Ok(Command::Run));
+        assert_eq!(parse(&args(&[])), Ok(Command::Run(None)));
         assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
         assert_eq!(parse(&args(&["-V"])), Ok(Command::Version));
+        assert_eq!(
+            parse(&args(&["--config", "g.toml"])),
+            Ok(Command::Run(Some("g.toml".into())))
+        );
+        assert_eq!(
+            parse(&args(&["--config", "g.toml", "--check-config"])),
+            Ok(Command::CheckConfig(Some("g.toml".into())))
+        );
+        assert_eq!(
+            parse(&args(&["--check-config", "--config", "g.toml"])),
+            Ok(Command::CheckConfig(Some("g.toml".into())))
+        );
+        assert_eq!(
+            parse(&args(&["--check-config"])),
+            Ok(Command::CheckConfig(None))
+        );
     }
 
     #[test]
     fn rejects_anything_else_as_usage_error() {
-        for input in [&["--bogus"][..], &["--version", "x"][..]] {
+        for input in [
+            &["--bogus"][..],
+            &["--version", "x"][..],
+            &["--config"][..],
+            &["--config", "a", "--config", "b"][..],
+            &["--check-config", "--version"][..],
+        ] {
             let err = parse(&args(input)).unwrap_err();
             assert!(err.starts_with("[usage]"), "{err}");
         }
+    }
+
+    #[test]
+    fn check_config_validates_the_file() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "[general]\nlisten = \"0.0.0.0:1\"\n").unwrap();
+        let err = run(Command::CheckConfig(Some(path))).unwrap_err();
+        assert!(err.contains("general.listen"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

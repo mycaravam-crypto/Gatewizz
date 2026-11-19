@@ -7,8 +7,19 @@ Tools that send code to a model (smartwizz, testwizz, `docwizz --ai`, gitwizz, c
 it for approval before any byte goes upstream. Every decision is logged; content never is.
 
 **Status:** early development. `gatewizz` forwards plain HTTP and tunnels HTTPS (CONNECT to port 443) on
-`127.0.0.1:8899` and prints one record per request to stderr. Configuration, the event file and process attribution
-follow in M1. Design and milestones: [PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
+`127.0.0.1:8899`, names the client process of each connection, and writes one JSON line per request to
+`%LOCALAPPDATA%\gatewizz\events.jsonl`. TLS interception and rules follow in M2. Design and milestones:
+[PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
+
+## Usage
+
+    gatewizz [--config gatewizz.toml]                 # run until Ctrl+C; exits 130
+    gatewizz [--config gatewizz.toml] --check-config  # print the effective config; exits 0, or 2 on an error
+    set HTTPS_PROXY=http://127.0.0.1:8899
+
+Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
+defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
+bodies.
 
 ## Build
 
