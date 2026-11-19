@@ -15,11 +15,32 @@ it for approval before any byte goes upstream. Every decision is logged; content
 
     gatewizz [--config gatewizz.toml]                 # run until Ctrl+C; exits 130
     gatewizz [--config gatewizz.toml] --check-config  # print the effective config; exits 0, or 2 on an error
-    set HTTPS_PROXY=http://127.0.0.1:8899
 
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
 defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
 bodies.
+
+`gatewizz --help` lists every flag and the exit codes.
+
+## Use with the wizz tools
+
+Start gatewizz in one terminal, then run the tool in another with the proxy set for that shell only:
+
+```powershell
+gatewizz                                    # terminal 1
+$env:HTTPS_PROXY = "http://127.0.0.1:8899"  # terminal 2 (cmd: set HTTPS_PROXY=http://127.0.0.1:8899)
+$env:HTTP_PROXY  = "http://127.0.0.1:8899"
+smartwizz check                             # or testwizz …, docwizz generate --ai
+```
+
+smartwizz, testwizz, docwizz and gitwizz are .NET tools: they honour `HTTPS_PROXY` without any change, and each model
+request then shows up in `events.jsonl` with the tool's process, the model host and `"coverage": "tunneled"`.
+
+- **Local models bypass gatewizz.** .NET never proxies `localhost`, so an Ollama on the same machine is not seen. That is
+  intended: the traffic never leaves the machine. A model on another host is seen.
+- **`NO_PROXY` wins.** A host listed there (smartwizz suggests it for internal model hosts) goes direct and is not seen.
+- **In M1, HTTPS is tunneled.** gatewizz sees which process talks to which host and how much, not the content.
+  Decryption and rules come in M2.
 
 ## Build
 

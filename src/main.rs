@@ -22,14 +22,35 @@ const EXIT_CANCELLED: u8 = 130;
 /// Bounded so a stalled writer slows the proxy down instead of growing memory.
 const EVENT_QUEUE: usize = 4096;
 
+const USAGE: &str = "\
+gatewizz: a local HTTPS gate for code sent to AI models
+
+Usage:
+  gatewizz [--config <path>]                  run the proxy until Ctrl+C
+  gatewizz [--config <path>] --check-config   validate the config and print the effective values
+  gatewizz --version | --help
+
+Options:
+  --config <path>   TOML configuration; without it every default applies
+                    (see config/gatewizz.example.toml)
+  --check-config    validate and print the configuration, then exit
+  -V, --version     print the version
+  -h, --help        print this help
+
+Point tools at the proxy with HTTPS_PROXY=http://127.0.0.1:8899 (the default listen address).
+
+Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events]), 130 stopped by Ctrl+C or console close.
+";
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Run(Option<PathBuf>),
     CheckConfig(Option<PathBuf>),
     Version,
+    Help,
 }
 
-// ponytail: hand-rolled until #6 needs more flags; replace with clap there.
+// Four flags do not justify an argument-parsing dependency (PLAN rule 4).
 fn parse(args: &[String]) -> Result<Command, String> {
     let (mut config, mut check) = (None, false);
     let mut args = args.iter();
@@ -38,6 +59,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
             "--version" | "-V" if config.is_none() && !check && args.len() == 0 => {
                 return Ok(Command::Version);
             }
+            "--help" | "-h" if config.is_none() && !check && args.len() == 0 => {
+                return Ok(Command::Help);
+            }
             "--config" if config.is_none() => match args.next() {
                 Some(path) => config = Some(PathBuf::from(path)),
                 None => return Err("[usage] --config needs a path".into()),
@@ -45,7 +69,7 @@ fn parse(args: &[String]) -> Result<Command, String> {
             "--check-config" if !check => check = true,
             other => {
                 return Err(format!(
-                    "[usage] unexpected argument {other:?}; usage: gatewizz [--config <path>] [--check-config] | --version"
+                    "[usage] unexpected argument {other:?}; see gatewizz --help"
                 ));
             }
         }
@@ -116,6 +140,7 @@ fn run_proxy(config: &Config) -> Result<(), String> {
 fn run(command: Command) -> Result<ExitCode, String> {
     match command {
         Command::Version => println!("gatewizz {VERSION}"),
+        Command::Help => print!("{USAGE}"),
         Command::CheckConfig(path) => {
             let config = load(path)?;
             config.event_target()?;
@@ -154,6 +179,8 @@ mod tests {
         assert_eq!(parse(&args(&[])), Ok(Command::Run(None)));
         assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
         assert_eq!(parse(&args(&["-V"])), Ok(Command::Version));
+        assert_eq!(parse(&args(&["--help"])), Ok(Command::Help));
+        assert_eq!(parse(&args(&["-h"])), Ok(Command::Help));
         assert_eq!(
             parse(&args(&["--config", "g.toml"])),
             Ok(Command::Run(Some("g.toml".into())))
@@ -180,9 +207,24 @@ mod tests {
             &["--config"][..],
             &["--config", "a", "--config", "b"][..],
             &["--check-config", "--version"][..],
+            &["--help", "x"][..],
         ] {
             let err = parse(&args(input)).unwrap_err();
             assert!(err.starts_with("[usage]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn help_names_every_flag() {
+        for flag in [
+            "--config",
+            "--check-config",
+            "--version",
+            "--help",
+            "HTTPS_PROXY",
+            "130",
+        ] {
+            assert!(USAGE.contains(flag), "{flag}");
         }
     }
 

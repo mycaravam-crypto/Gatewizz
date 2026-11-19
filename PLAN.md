@@ -33,7 +33,7 @@ applies. On top of it, as in reswizz and powerwizz:
 |---|---|---|
 | Language | Rust stable, edition 2024, single `gatewizz.exe` | M1 |
 | Async / HTTP | `tokio` (minimal features), `hyper` 1 (http1) | M1 |
-| Config / CLI | `serde`, `toml`, `clap` | M1 |
+| Config / CLI | `serde`, `toml`; flags are hand-rolled (four flags do not justify `clap`) | M1 |
 | Win32 | `windows-sys` (IP Helper, Threading, DPAPI, certificate store) | M1 |
 | TLS | `rustls`, `tokio-rustls`, `rcgen`, `rustls-platform-verifier` | M2 |
 | Approval window | `eframe`/`egui` (glow), reswizz look | M3 |
@@ -58,9 +58,9 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 
 | Milestone | Goal | Done when | Status |
 |---|---|---|---|
-| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | in progress (#2, #3, #4, #5 done) |
+| **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete (#2–#6, #8); Windows smoke test with smartwizz pending |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | planned |
-| **M3: Ask first** | `approve` action, egui window | A held request sends zero bytes upstream until allowed; deny and timeout both block | planned |
+| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | planned |
 
 ## 6. Quality gates
 
