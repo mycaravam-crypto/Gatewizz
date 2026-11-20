@@ -40,14 +40,6 @@ impl TrayState {
             Self::Waiting => format!("gatewizz: {waiting} approval(s) waiting"),
         }
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Running => "PROTECTED",
-            Self::Paused => "PAUSED",
-            Self::Waiting => "ACTION REQUIRED",
-        }
-    }
 }
 
 /// A filled circle in the state's colour on a transparent square, RGBA.
@@ -76,6 +68,22 @@ fn program(process: &Process) -> String {
     }
 }
 
+/// Time left before a held request is denied, as `m:ss`.
+fn countdown(left: std::time::Duration) -> String {
+    let secs = left.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// A grant duration for buttons: `15 min`, `1 hour`, `8 hours`, `1 h 30 min`.
+fn duration_label(minutes: u32) -> String {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m} min"),
+        (1, 0) => "1 hour".into(),
+        (h, 0) => format!("{h} hours"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
 #[cfg(windows)]
 pub use app::run;
 
@@ -88,29 +96,40 @@ mod app {
     use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread::JoinHandle;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, ViewportCommand};
+    use eframe::egui::{
+        self, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Layout, Margin,
+        Rect, RichText, Sense, Stroke, ViewportCommand,
+    };
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
-    use super::{TrayState, icon_rgba, program};
-    use crate::approve::{Approvals, Verdict, Window};
+    use super::{TrayState, countdown, duration_label, icon_rgba, program};
+    use crate::approve::{Approvals, Held, Verdict, Window};
     use crate::process::Process;
     use crate::rules::Action;
 
-    const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x18);
-    const PANEL: Color32 = Color32::from_rgb(0x15, 0x1b, 0x25);
-    const PANEL_HOVER: Color32 = Color32::from_rgb(0x1d, 0x26, 0x34);
-    const BORDER: Color32 = Color32::from_rgb(0x2a, 0x35, 0x45);
-    const TEXT: Color32 = Color32::from_rgb(0xe7, 0xec, 0xf4);
-    const MUTED: Color32 = Color32::from_rgb(0x91, 0x9e, 0xb0);
-    const AMBER: Color32 = Color32::from_rgb(0xf2, 0xb7, 0x4b);
-    const GREEN: Color32 = Color32::from_rgb(0x55, 0xd6, 0x91);
-    const RED: Color32 = Color32::from_rgb(0xf0, 0x6b, 0x73);
-    const BLUE: Color32 = Color32::from_rgb(0x75, 0xa9, 0xff);
+    // Design tokens: one dark theme. Surfaces step up in lightness; status colours are used for meaning only.
+    const BG: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x14);
+    const SURFACE: Color32 = Color32::from_rgb(0x12, 0x16, 0x1f);
+    const RAISED: Color32 = Color32::from_rgb(0x1a, 0x20, 0x2c);
+    const BORDER: Color32 = Color32::from_rgb(0x24, 0x2b, 0x39);
+    const BORDER_STRONG: Color32 = Color32::from_rgb(0x35, 0x3f, 0x52);
+    const TEXT: Color32 = Color32::from_rgb(0xe8, 0xec, 0xf3);
+    const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb6);
+    const SUBTLE: Color32 = Color32::from_rgb(0x6b, 0x75, 0x88);
+    const BLUE: Color32 = Color32::from_rgb(0x6e, 0x9d, 0xff);
+    const GREEN: Color32 = Color32::from_rgb(0x41, 0xc4, 0x83);
+    const AMBER: Color32 = Color32::from_rgb(0xf0, 0xab, 0x3e);
+    const RED: Color32 = Color32::from_rgb(0xef, 0x63, 0x63);
+    const GREEN_FILL: Color32 = Color32::from_rgb(0x1d, 0x8a, 0x58);
+    /// Font family name for headings and labels; falls back to the regular face.
+    const SEMIBOLD: &str = "semibold";
+    /// How long "Copied" confirmations stay visible.
+    const FEEDBACK: Duration = Duration::from_secs(2);
 
     /// Starts the proxy on its own thread with a stop signal, shows the tray, and returns the proxy's result once it
     /// has stopped: after Quit, Ctrl+C or a proxy error.
@@ -123,9 +142,9 @@ mod app {
         let (quit, stop) = tokio::sync::oneshot::channel();
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("gatewizz: approval")
-                .with_inner_size([980.0, 700.0])
-                .with_min_inner_size([760.0, 560.0])
+                .with_title("Gatewizz")
+                .with_inner_size([1040.0, 720.0])
+                .with_min_inner_size([820.0, 580.0])
                 .with_resizable(true)
                 .with_visible(false),
             ..Default::default()
@@ -190,6 +209,10 @@ mod app {
         history_rx: Receiver<Vec<HistoryEvent>>,
         history_stop: Sender<()>,
         history_worker: Option<JoinHandle<()>>,
+        /// When the proxy address was last copied, for the button's confirmation.
+        address_copied: Option<Instant>,
+        /// When the CSV was last copied, and how many rows.
+        csv_copied: Option<(Instant, usize)>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -369,6 +392,8 @@ mod app {
                 history_rx,
                 history_stop,
                 history_worker,
+                address_copied: None,
+                csv_copied: None,
             })
         }
 
@@ -394,16 +419,9 @@ mod app {
         fn on_menu(&mut self, ctx: &egui::Context, event: &MenuEvent) {
             let id = event.id();
             if id == self.items.pause.id() {
-                let paused = !self.approvals.paused();
-                self.approvals.set_paused(paused);
-                self.items
-                    .pause
-                    .set_text(if paused { "Resume" } else { "Pause" });
+                self.set_paused(!self.approvals.paused());
             } else if id == self.items.open_log.id() {
-                if let Some(path) = &self.events_path {
-                    // Opens the file with its default app, as a double click would.
-                    let _ = std::process::Command::new("explorer").arg(path).spawn();
-                }
+                self.open_log();
             } else if id == self.items.copy.id() {
                 copy_to_clipboard(&format!("http://{}", self.listen));
             } else if id == self.items.quit.id() {
@@ -426,22 +444,242 @@ mod app {
         }
     }
 
-    fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_min_width(105.0);
-            ui.label(RichText::new(value).size(21.0).strong().color(color));
-            ui.label(RichText::new(label).size(9.0).strong().color(MUTED));
-        });
+    fn semibold(size: f32) -> FontId {
+        FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
     }
 
-    fn metadata(ui: &mut egui::Ui, key: &str, value: &str) {
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [92.0, 18.0],
-                egui::Label::new(RichText::new(key).size(9.0).strong().color(MUTED)),
+    fn mono(size: f32) -> FontId {
+        FontId::new(size, FontFamily::Monospace)
+    }
+
+    /// A status colour at low opacity, for badge and banner backgrounds.
+    fn tint(color: Color32) -> Color32 {
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 34)
+    }
+
+    fn card() -> egui::Frame {
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(10)
+            .inner_margin(Margin::same(16))
+    }
+
+    /// Small uppercase heading above a group of content.
+    fn caption(ui: &mut egui::Ui, text: &str) {
+        ui.label(RichText::new(text).font(semibold(11.0)).color(SUBTLE));
+    }
+
+    /// Glyph-free status dot: painted, so it renders with any font.
+    fn dot(ui: &mut egui::Ui, color: Color32, radius: f32) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), radius, color);
+    }
+
+    /// A rounded badge painted into `rect`'s left edge, vertically centred.
+    fn paint_badge(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) -> Rect {
+        let galley = painter.layout_no_wrap(text.to_owned(), semibold(11.5), color);
+        let size = galley.size() + egui::vec2(16.0, 6.0);
+        let badge = Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - size.y / 2.0),
+            size,
+        );
+        painter.rect_filled(badge, CornerRadius::same(255), tint(color));
+        painter.galley(badge.min + egui::vec2(8.0, 3.0), galley, color);
+        badge
+    }
+
+    /// The header's state indicator: a dot and a label on a tinted capsule.
+    fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), semibold(12.5), color);
+        let size = egui::vec2(galley.size().x + 40.0, 30.0);
+        let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(255), tint(color));
+        painter.circle_filled(egui::pos2(rect.left() + 16.0, rect.center().y), 4.0, color);
+        let pos = egui::pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0);
+        painter.galley(pos, galley, color);
+    }
+
+    fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+        let width = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), semibold(11.5), color)
+            .size()
+            .x;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width + 16.0, 22.0), Sense::hover());
+        paint_badge(ui.painter(), rect, text, color);
+    }
+
+    /// Single-line text cut to `rect`'s width with an ellipsis, vertically centred.
+    fn paint_cell(painter: &egui::Painter, rect: Rect, text: &str, font: FontId, color: Color32) {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width().max(1.0));
+        let galley = painter.layout_job(job);
+        let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+        painter.galley(pos, galley, color);
+    }
+
+    /// A circled check mark for empty states.
+    fn check_icon(ui: &mut egui::Ui, color: Color32, size: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+        let painter = ui.painter();
+        let c = rect.center();
+        painter.circle_filled(c, size / 2.0, tint(color));
+        let s = size / 2.0;
+        let stroke = Stroke::new(size / 14.0, color);
+        let points = [
+            c + egui::vec2(-0.38 * s, 0.02 * s),
+            c + egui::vec2(-0.1 * s, 0.3 * s),
+            c + egui::vec2(0.4 * s, -0.26 * s),
+        ];
+        painter.line_segment([points[0], points[1]], stroke);
+        painter.line_segment([points[1], points[2]], stroke);
+    }
+
+    fn button(text: &str, fill: Color32, color: Color32) -> egui::Button<'static> {
+        egui::Button::new(RichText::new(text).font(semibold(13.5)).color(color))
+            .fill(fill)
+            .corner_radius(8)
+            .min_size(egui::vec2(0.0, 34.0))
+    }
+
+    fn quiet_button(text: &str) -> egui::Button<'static> {
+        egui::Button::new(RichText::new(text).size(12.5).color(MUTED))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(6)
+    }
+
+    /// A toggle chip: filters and duration presets.
+    fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+        let (fill, stroke, color) = if selected {
+            (tint(BLUE), Stroke::new(1.0, BLUE), TEXT)
+        } else {
+            (Color32::TRANSPARENT, Stroke::new(1.0, BORDER), MUTED)
+        };
+        ui.add(
+            egui::Button::new(RichText::new(text).size(12.5).color(color))
+                .fill(fill)
+                .stroke(stroke)
+                .corner_radius(255)
+                .min_size(egui::vec2(0.0, 28.0)),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+    }
+
+    fn stat_card(ui: &mut egui::Ui, label: &str, value: usize, color: Color32, hint: &str) {
+        card()
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    dot(ui, color, 4.0);
+                    ui.label(RichText::new(label).font(semibold(12.5)).color(MUTED));
+                });
+                ui.label(
+                    RichText::new(value.to_string())
+                        .font(semibold(28.0))
+                        .color(TEXT),
+                );
+                ui.add(egui::Label::new(RichText::new(hint).size(11.5).color(SUBTLE)).truncate());
+            });
+    }
+
+    /// Label/value pairs in two aligned columns.
+    fn details(ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]) {
+        ui.spacing_mut().interact_size.y = 20.0;
+        egui::Grid::new(id)
+            .num_columns(2)
+            .spacing([20.0, 8.0])
+            .show(ui, |ui| {
+                for (key, value) in rows {
+                    ui.label(RichText::new(*key).size(12.5).color(SUBTLE));
+                    ui.add(egui::Label::new(RichText::new(*value).size(13.0).color(TEXT)).wrap());
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn decision_style(action: Option<Action>) -> (&'static str, Color32) {
+        match action {
+            Some(Action::Allow) => ("Allowed", GREEN),
+            Some(Action::Block) => ("Blocked", RED),
+            Some(Action::Approve) => ("Approval", AMBER),
+            None => ("Unknown", SUBTLE),
+        }
+    }
+
+    fn urgency(left: Duration) -> Color32 {
+        if left.as_secs() < 15 { RED } else { AMBER }
+    }
+
+    /// Column rectangles of an activity row: time, program, destination, decision, status.
+    fn history_columns(rect: Rect) -> [Rect; 5] {
+        let inner = rect.shrink2(egui::vec2(12.0, 0.0));
+        let flex = (inner.width() - 150.0 - 104.0 - 52.0).max(120.0);
+        let mut x = inner.left();
+        [150.0, flex * 0.4, flex * 0.6, 104.0, 52.0].map(|width| {
+            let column = Rect::from_min_max(
+                egui::pos2(x, inner.top()),
+                egui::pos2(x + width - 10.0, inner.bottom()),
             );
-            ui.label(RichText::new(value).size(11.0));
-        });
+            x += width;
+            column
+        })
+    }
+
+    fn history_header(ui: &mut egui::Ui) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
+        let columns = history_columns(rect);
+        for (column, title) in
+            columns
+                .iter()
+                .zip(["TIME (UTC)", "PROGRAM", "DESTINATION", "DECISION", "STATUS"])
+        {
+            paint_cell(ui.painter(), *column, title, semibold(11.0), SUBTLE);
+        }
+        ui.painter()
+            .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, BORDER));
+    }
+
+    /// One clickable, full-width activity row.
+    fn history_row(ui: &mut egui::Ui, event: &HistoryEvent, active: bool) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+        let response = response.on_hover_cursor(CursorIcon::PointingHand);
+        let painter = ui.painter();
+        if active {
+            painter.rect_filled(rect, 6, tint(BLUE));
+        } else if response.hovered() {
+            painter.rect_filled(rect, 6, RAISED);
+        }
+        let [time, program, host, decision, status] = history_columns(rect);
+        let (label, color) = decision_style(event.action);
+        let when = event.time.replace('T', " ");
+        paint_cell(painter, time, when.trim_end_matches('Z'), mono(12.0), MUTED);
+        paint_cell(
+            painter,
+            program,
+            &event.process_name(),
+            FontId::proportional(13.5),
+            TEXT,
+        );
+        paint_cell(painter, host, &event.host, mono(12.5), BLUE);
+        paint_badge(painter, decision, label, color);
+        let status_color = if event.status >= 400 { RED } else { MUTED };
+        paint_cell(
+            painter,
+            status,
+            &event.status.to_string(),
+            mono(12.5),
+            status_color,
+        );
+        response
     }
 
     /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
@@ -557,24 +795,788 @@ mod app {
         Icon::from_rgba(icon_rgba(state.rgb(), 32), 32, 32).expect("32x32 RGBA is a valid icon")
     }
 
+    /// Prefers the Windows UI fonts (Segoe UI, Segoe UI Semibold, Consolas) from the system font folder, so text looks
+    /// native and crisp. Each missing face falls back to egui's bundled fonts, which also cover glyphs Segoe UI lacks.
+    fn setup_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let dir = std::env::var_os("WINDIR").map(|windows| PathBuf::from(windows).join("Fonts"));
+        let mut load = |name: &str, file: &str| -> Option<String> {
+            let bytes = std::fs::read(dir.as_ref()?.join(file)).ok()?;
+            fonts
+                .font_data
+                .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+            Some(name.into())
+        };
+        let regular = load("segoe-ui", "segoeui.ttf");
+        let semibold = load("segoe-ui-semibold", "seguisb.ttf");
+        let mono = load("consolas", "consola.ttf");
+        let family = |fonts: &mut egui::FontDefinitions, family: FontFamily| {
+            fonts.families.entry(family).or_default().clone()
+        };
+        let mut proportional = family(&mut fonts, FontFamily::Proportional);
+        proportional.splice(0..0, regular);
+        let mut heading = proportional.clone();
+        heading.splice(0..0, semibold);
+        let mut monospace = family(&mut fonts, FontFamily::Monospace);
+        monospace.splice(0..0, mono);
+        fonts
+            .families
+            .insert(FontFamily::Proportional, proportional);
+        fonts
+            .families
+            .insert(FontFamily::Name(SEMIBOLD.into()), heading);
+        fonts.families.insert(FontFamily::Monospace, monospace);
+        ctx.set_fonts(fonts);
+    }
+
     fn setup_style(ctx: &egui::Context) {
+        setup_fonts(ctx);
         ctx.set_theme(egui::Theme::Dark);
         ctx.all_styles_mut(|style| {
-            for font in style.text_styles.values_mut() {
-                font.family = egui::FontFamily::Proportional;
+            use egui::TextStyle;
+            style.text_styles = [
+                (TextStyle::Small, FontId::proportional(11.5)),
+                (TextStyle::Body, FontId::proportional(13.5)),
+                (TextStyle::Button, FontId::proportional(13.5)),
+                (TextStyle::Heading, semibold(20.0)),
+                (TextStyle::Monospace, mono(12.5)),
+            ]
+            .into();
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(14.0, 6.0);
+            style.spacing.interact_size.y = 28.0;
+            style.interaction.selectable_labels = false;
+            let visuals = &mut style.visuals;
+            visuals.panel_fill = BG;
+            visuals.window_fill = SURFACE;
+            visuals.window_stroke = Stroke::new(1.0, BORDER);
+            visuals.window_corner_radius = CornerRadius::same(10);
+            visuals.menu_corner_radius = CornerRadius::same(8);
+            visuals.extreme_bg_color = Color32::from_rgb(0x0e, 0x12, 0x1a);
+            visuals.faint_bg_color = SURFACE;
+            visuals.override_text_color = None;
+            visuals.selection.bg_fill = tint(BLUE);
+            visuals.selection.stroke = Stroke::new(1.0, BLUE);
+            visuals.hyperlink_color = BLUE;
+            let widgets = &mut visuals.widgets;
+            widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+            widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+            for (state, fill, stroke) in [
+                (&mut widgets.inactive, SURFACE, BORDER),
+                (&mut widgets.hovered, RAISED, BORDER_STRONG),
+                (&mut widgets.active, RAISED, BLUE),
+                (&mut widgets.open, RAISED, BORDER_STRONG),
+            ] {
+                state.bg_fill = fill;
+                state.weak_bg_fill = fill;
+                state.bg_stroke = Stroke::new(1.0, stroke);
+                state.fg_stroke = Stroke::new(1.0, TEXT);
+                state.corner_radius = CornerRadius::same(7);
+                state.expansion = 0.0;
             }
-            style.spacing.item_spacing = egui::vec2(9.0, 7.0);
-            style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.visuals.panel_fill = BG;
-            style.visuals.window_fill = BG;
-            style.visuals.extreme_bg_color = PANEL;
-            style.visuals.override_text_color = Some(TEXT);
-            style.visuals.widgets.inactive.bg_fill = PANEL;
-            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-            style.visuals.widgets.hovered.bg_fill = PANEL_HOVER;
-            style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
-            style.visuals.widgets.active.bg_fill = Color32::from_rgb(0x25, 0x35, 0x49);
         });
+    }
+
+    /// Workspace views. Each draws one region; all decisions go through `Approvals`.
+    impl App {
+        fn header(&mut self, ui: &mut egui::Ui, state: TrayState, waiting: usize) {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), Sense::hover());
+                ui.painter().rect_filled(rect, 9, BLUE);
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "G",
+                    semibold(20.0),
+                    Color32::from_rgb(0x0b, 0x12, 0x24),
+                );
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(RichText::new("Gatewizz").font(semibold(18.0)).color(TEXT));
+                    ui.label(
+                        RichText::new("Local security gate for traffic to AI models")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (text, color) = match state {
+                        TrayState::Running => ("Protected".to_string(), GREEN),
+                        TrayState::Paused => ("Approvals paused".to_string(), MUTED),
+                        TrayState::Waiting => (format!("{waiting} awaiting review"), AMBER),
+                    };
+                    status_pill(ui, &text, color);
+                });
+            });
+            ui.add_space(14.0);
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(9)
+                .inner_margin(Margin::same(3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (tab, label, badge) in [
+                            (Tab::Overview, "Overview", waiting),
+                            (Tab::Activity, "Activity", 0),
+                        ] {
+                            let selected = self.tab == tab;
+                            let mut button = egui::Button::new(
+                                RichText::new(label)
+                                    .font(semibold(13.0))
+                                    .color(if selected { TEXT } else { MUTED }),
+                            )
+                            .corner_radius(7)
+                            .min_size(egui::vec2(96.0, 30.0))
+                            .fill(if selected {
+                                RAISED
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(if selected {
+                                Stroke::new(1.0, BORDER_STRONG)
+                            } else {
+                                Stroke::NONE
+                            });
+                            if badge > 0 {
+                                button = button.right_text(
+                                    RichText::new(badge.to_string())
+                                        .font(semibold(12.0))
+                                        .color(AMBER),
+                                );
+                            }
+                            if ui
+                                .add(button)
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.tab = tab;
+                            }
+                        }
+                    });
+                });
+            ui.add_space(14.0);
+        }
+
+        fn status_bar(&mut self, ui: &mut egui::Ui, state: TrayState) {
+            ui.horizontal(|ui| {
+                let paused = state == TrayState::Paused;
+                dot(ui, if paused { SUBTLE } else { GREEN }, 4.0);
+                ui.label(
+                    RichText::new(format!("Proxy on http://{}", self.listen))
+                        .size(12.5)
+                        .color(MUTED),
+                );
+                let copied = self
+                    .address_copied
+                    .is_some_and(|at| at.elapsed() < FEEDBACK);
+                let copy = ui
+                    .add(quiet_button(if copied { "Copied" } else { "Copy" }))
+                    .on_hover_text("Copy the proxy address, for HTTPS_PROXY");
+                if copy.clicked() {
+                    copy_to_clipboard(&format!("http://{}", self.listen));
+                    self.address_copied = Some(Instant::now());
+                    ui.ctx().request_repaint_after(FEEDBACK);
+                }
+                if let Some(path) = &self.events_path {
+                    let open = ui
+                        .add(quiet_button("Open log"))
+                        .on_hover_text(path.display().to_string());
+                    if open.clicked() {
+                        self.open_log();
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(quiet_button("Hide to tray"))
+                        .on_hover_text("Gatewizz keeps running in the notification area")
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.show(&ctx, false);
+                    }
+                    let (text, hint) = if paused {
+                        ("Resume approvals", "Hold requests for review again")
+                    } else {
+                        (
+                            "Pause approvals",
+                            "Block every request that needs approval until resumed",
+                        )
+                    };
+                    if ui.add(quiet_button(text)).on_hover_text(hint).clicked() {
+                        self.set_paused(!paused);
+                    }
+                });
+            });
+        }
+
+        fn paused_banner(&mut self, ui: &mut egui::Ui) {
+            egui::Frame::new()
+                .fill(tint(AMBER))
+                .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.45)))
+                .corner_radius(8)
+                .inner_margin(Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        dot(ui, AMBER, 4.0);
+                        ui.label(
+                            RichText::new(
+                                "Approvals are paused. Requests that need approval are blocked.",
+                            )
+                            .size(13.0)
+                            .color(TEXT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.add(button("Resume", AMBER, BG)).clicked() {
+                                self.set_paused(false);
+                            }
+                        });
+                    });
+                });
+            ui.add_space(12.0);
+        }
+
+        fn overview(&mut self, ui: &mut egui::Ui, pending: &[(u64, Held, Duration)]) {
+            // While requests wait, the decision gets the space; the summary returns once the queue is clear.
+            if pending.is_empty() {
+                let recent = self.history.len();
+                let blocked = self
+                    .history
+                    .iter()
+                    .filter(|event| event.action == Some(Action::Block))
+                    .count();
+                let logged = self.events_path.is_some();
+                let source = if logged {
+                    "from the event log"
+                } else {
+                    "event log disabled"
+                };
+                ui.columns(4, |columns| {
+                    stat_card(
+                        &mut columns[0],
+                        "Awaiting review",
+                        pending.len(),
+                        AMBER,
+                        "held until you decide",
+                    );
+                    stat_card(&mut columns[1], "Recent requests", recent, BLUE, source);
+                    stat_card(&mut columns[2], "Blocked", blocked, RED, source);
+                    stat_card(
+                        &mut columns[3],
+                        "Not blocked",
+                        recent - blocked,
+                        GREEN,
+                        source,
+                    );
+                });
+                ui.add_space(16.0);
+            }
+
+            egui::Panel::left("approval_queue")
+                .resizable(false)
+                .exact_size(290.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(Margin {
+                    right: 16,
+                    ..Margin::ZERO
+                }))
+                .show(ui, |ui| self.queue(ui, pending));
+
+            let selected = self
+                .selected
+                .and_then(|id| pending.iter().find(|p| p.0 == id));
+            match selected {
+                Some((id, held, left)) => self.request(ui, *id, held, *left),
+                None => self.latest_activity(ui),
+            }
+        }
+
+        fn queue(&mut self, ui: &mut egui::Ui, pending: &[(u64, Held, Duration)]) {
+            ui.horizontal(|ui| {
+                caption(ui, "APPROVAL QUEUE");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(pending.len().to_string())
+                            .font(semibold(12.0))
+                            .color(MUTED),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            if pending.is_empty() {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(14.0);
+                        check_icon(ui, GREEN, 40.0);
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Queue is clear")
+                                .font(semibold(14.5))
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Held requests appear here and open this window.")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(14.0);
+                    });
+                });
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (id, held, left) in pending {
+                        let active = self.selected == Some(*id);
+                        let response = egui::Frame::new()
+                            .fill(if active { RAISED } else { SURFACE })
+                            .stroke(Stroke::new(
+                                if active { 1.5 } else { 1.0 },
+                                if active { BLUE } else { BORDER },
+                            ))
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(program(&held.process))
+                                                .font(semibold(14.0))
+                                                .color(TEXT),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        badge(ui, &countdown(*left), urgency(*left));
+                                    });
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&held.host).font(mono(12.5)).color(MUTED),
+                                    )
+                                    .truncate(),
+                                );
+                                let (findings, color) = match held.findings.len() {
+                                    0 => ("Held by rule".to_string(), SUBTLE),
+                                    1 => ("1 finding".to_string(), AMBER),
+                                    n => (format!("{n} findings"), AMBER),
+                                };
+                                ui.label(RichText::new(findings).size(12.0).color(color));
+                            })
+                            .response
+                            .interact(Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        if response.clicked() {
+                            self.selected = Some(*id);
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+        }
+
+        fn request(&mut self, ui: &mut egui::Ui, id: u64, held: &Held, left: Duration) {
+            let name = program(&held.process);
+            let (image, pid, user) = match &held.process {
+                Process::Known {
+                    image, pid, user, ..
+                } => (image.clone(), pid.to_string(), user.clone()),
+                Process::Unknown(why) => (
+                    format!("Unknown ({why})"),
+                    "Unknown".into(),
+                    "Unknown".into(),
+                ),
+            };
+            // The decision stays pinned and visible; only the request details scroll.
+            let mut verdict = None;
+            egui::Panel::bottom("decision")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(Margin {
+                    top: 12,
+                    ..Margin::ZERO
+                }))
+                .show(ui, |ui| {
+                    verdict = self.decision(ui, &name, &held.host);
+                });
+            card().inner_margin(Margin::same(20)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(ui.available_height());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            caption(ui, "APPROVAL REQUIRED");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                badge(
+                                    ui,
+                                    &format!("Auto-deny in {}", countdown(left)),
+                                    urgency(left),
+                                );
+                            });
+                        });
+                        ui.add(
+                            egui::Label::new(RichText::new(&name).font(semibold(22.0)).color(TEXT))
+                                .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&held.host).font(mono(14.0)).color(BLUE),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(14.0);
+                        caption(ui, "WHY IT WAS HELD");
+                        if held.findings.is_empty() {
+                            ui.label(
+                            RichText::new(format!(
+                                "Rule \"{}\" asks for approval before traffic reaches this host.",
+                                held.rule
+                            ))
+                            .size(13.0)
+                            .color(MUTED),
+                        );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                for finding in &held.findings {
+                                    badge(ui, finding, AMBER);
+                                }
+                            });
+                        }
+                        ui.add_space(14.0);
+                        caption(ui, "REQUEST");
+                        details(
+                            ui,
+                            "held_request",
+                            &[
+                                ("Program", &image),
+                                ("Process ID", &pid),
+                                ("User", &user),
+                                ("Matched rule", &held.rule),
+                            ],
+                        );
+                    });
+            });
+            if let Some(verdict) = verdict {
+                self.approvals.answer(id, verdict);
+                self.selected = None;
+            }
+        }
+
+        /// Deny, allow once, or allow this program and host for a while.
+        fn decision(&mut self, ui: &mut egui::Ui, name: &str, host: &str) -> Option<Verdict> {
+            let mut verdict = None;
+            card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let deny = button("Deny", tint(RED), RED)
+                        .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
+                        .min_size(egui::vec2(width, 38.0));
+                    if ui.add(deny).on_hover_text("Block this request").clicked() {
+                        verdict = Some(Verdict::Deny);
+                    }
+                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, 38.0));
+                    if ui.add(allow).on_hover_text("Send this request only").clicked() {
+                        verdict = Some(Verdict::AllowOnce);
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Or allow for").size(12.5).color(MUTED));
+                    for minutes in [5, 15, 60, 480] {
+                        if chip(ui, &duration_label(minutes), self.minutes == minutes).clicked() {
+                            self.minutes = minutes;
+                        }
+                    }
+                    ui.add(egui::DragValue::new(&mut self.minutes).range(1..=480).suffix(" min"))
+                        .on_hover_text("Custom duration, 1 to 480 minutes");
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let grant = button(
+                        &format!("Allow for {}", duration_label(self.minutes)),
+                        RAISED,
+                        TEXT,
+                    )
+                    .stroke(Stroke::new(1.0, BORDER_STRONG))
+                    .min_size(egui::vec2(150.0, 32.0));
+                    if ui.add(grant).clicked() {
+                        verdict = Some(Verdict::AllowFor(Duration::from_secs(
+                            u64::from(self.minutes) * 60,
+                        )));
+                    }
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "Covers only {name} connecting to {host}. Closing the window or letting the timer run out denies the request."
+                            ))
+                            .size(12.0)
+                            .color(SUBTLE),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+            verdict
+        }
+
+        /// Shown beside an empty queue: the latest decisions, one click away from their details.
+        fn latest_activity(&mut self, ui: &mut egui::Ui) {
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(ui.available_height());
+                ui.horizontal(|ui| {
+                    caption(ui, "LATEST ACTIVITY");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if !self.history.is_empty() && ui.add(quiet_button("View all")).clicked() {
+                            self.tab = Tab::Activity;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if self.history.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        check_icon(ui, GREEN, 48.0);
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("You're all caught up")
+                                .font(semibold(17.0))
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new(self.empty_history_message())
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                    });
+                    return;
+                }
+                history_header(ui);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let rows = ((ui.available_height() - 8.0) / 38.0).max(1.0) as usize;
+                let mut open = None;
+                for (index, event) in self.history.iter().enumerate().take(rows) {
+                    if history_row(ui, event, false).clicked() {
+                        open = Some(index);
+                    }
+                }
+                if let Some(index) = open {
+                    self.history_selected = Some(index);
+                    self.tab = Tab::Activity;
+                }
+            });
+        }
+
+        fn empty_history_message(&self) -> &'static str {
+            if self.events_path.is_some() {
+                "No events recorded yet. New requests appear here automatically."
+            } else {
+                "Activity history is off because events are written to stdout."
+            }
+        }
+
+        fn activity(&mut self, ui: &mut egui::Ui) {
+            let rows = &self.history;
+            let count = |decision: &str| {
+                rows.iter()
+                    .filter(|event| event.decision() == decision)
+                    .count()
+            };
+            let counts = [
+                ("all", "All", rows.len()),
+                ("allow", "Allowed", count("allow")),
+                ("block", "Blocked", count("block")),
+                ("approve", "Approval", count("approve")),
+            ];
+            let filtered = filter_history(rows, &self.history_filter, &self.history_decision);
+
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.history_filter)
+                        .hint_text("Search program or host")
+                        .desired_width(220.0)
+                        .margin(Margin::symmetric(10, 6)),
+                );
+                ui.add_space(6.0);
+                for (value, label, n) in counts {
+                    if chip(ui, &format!("{label}  {n}"), self.history_decision == value).clicked()
+                    {
+                        self.history_decision = value.into();
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let copied = self.csv_copied.filter(|(at, _)| at.elapsed() < FEEDBACK);
+                    let text = match copied {
+                        Some((_, n)) => format!("Copied {n} rows"),
+                        None => "Copy CSV".into(),
+                    };
+                    let copy = ui
+                        .add_enabled(!filtered.is_empty(), quiet_button(&text))
+                        .on_hover_text("Copy the filtered rows' metadata to the clipboard");
+                    if copy.clicked() {
+                        copy_to_clipboard(&history_csv(&filtered));
+                        self.csv_copied = Some((Instant::now(), filtered.len()));
+                        ui.ctx().request_repaint_after(FEEDBACK);
+                    }
+                    ui.label(
+                        RichText::new(format!("{} of {}", filtered.len(), rows.len()))
+                            .size(12.0)
+                            .color(SUBTLE),
+                    );
+                });
+            });
+            ui.add_space(12.0);
+
+            egui::Panel::bottom("privacy_note")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(Margin { top: 8, ..Margin::ZERO }))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Metadata only. Request bodies, header values, query strings and secrets are never stored or exported.")
+                            .size(11.5)
+                            .color(SUBTLE),
+                    );
+                });
+
+            let mut selected = self.history_selected.filter(|index| *index < rows.len());
+            if let Some(event) = selected.and_then(|index| rows.get(index)) {
+                egui::Panel::right("event_details")
+                    .resizable(false)
+                    .exact_size(310.0)
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().inner_margin(Margin {
+                        left: 16,
+                        ..Margin::ZERO
+                    }))
+                    .show(ui, |ui| {
+                        if event_details(ui, event) {
+                            selected = None;
+                        }
+                    });
+            }
+
+            card().inner_margin(Margin::same(8)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(ui.available_height());
+                if rows.is_empty() || filtered.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(48.0);
+                        let (title, message) = if rows.is_empty() {
+                            ("No activity yet", self.empty_history_message())
+                        } else {
+                            (
+                                "No matching events",
+                                "Try another search or decision filter.",
+                            )
+                        };
+                        ui.label(RichText::new(title).font(semibold(16.0)).color(TEXT));
+                        ui.label(RichText::new(message).size(12.5).color(MUTED));
+                    });
+                    return;
+                }
+                history_header(ui);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, 36.0, filtered.len(), |ui, range| {
+                        for event in &filtered[range] {
+                            let index = rows
+                                .iter()
+                                .position(|row| std::ptr::eq(row, *event))
+                                .unwrap_or(usize::MAX);
+                            let active = selected == Some(index);
+                            if history_row(ui, event, active).clicked() {
+                                selected = if active { None } else { Some(index) };
+                            }
+                        }
+                    });
+            });
+            self.history_selected = selected;
+        }
+
+        fn set_paused(&mut self, paused: bool) {
+            self.approvals.set_paused(paused);
+            self.items
+                .pause
+                .set_text(if paused { "Resume" } else { "Pause" });
+        }
+
+        fn open_log(&self) {
+            if let Some(path) = &self.events_path {
+                // Opens the file with its default app, as a double click would.
+                let _ = std::process::Command::new("explorer").arg(path).spawn();
+            }
+        }
+    }
+
+    /// The selected activity event. Returns true when the user closes it.
+    fn event_details(ui: &mut egui::Ui, event: &HistoryEvent) -> bool {
+        let mut close = false;
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                caption(ui, "EVENT DETAILS");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.add(quiet_button("Close")).clicked();
+                });
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(event.process_name())
+                        .font(semibold(17.0))
+                        .color(TEXT),
+                )
+                .truncate(),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{}:{}", event.host, event.port))
+                        .font(mono(13.0))
+                        .color(BLUE),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            let (label, color) = decision_style(event.action);
+            ui.horizontal(|ui| {
+                badge(ui, label, color);
+                badge(
+                    ui,
+                    &format!("HTTP {}", event.status),
+                    if event.status >= 400 { RED } else { SUBTLE },
+                );
+            });
+            ui.add_space(10.0);
+            let when = format!("{} UTC", event.time.replace('T', " ").trim_end_matches('Z'));
+            let path = if event.path.is_empty() {
+                "(CONNECT tunnel)"
+            } else {
+                &event.path
+            };
+            let mut rows = vec![
+                ("Time", when.as_str()),
+                ("Method", event.method.as_str()),
+                ("Path", path),
+                ("Coverage", event.coverage.as_str()),
+                ("Rule", event.rule.as_deref().unwrap_or("Default action")),
+            ];
+            if let Some(model) = &event.model {
+                rows.push(("Model", model));
+            }
+            if let Some(reason) = &event.reason {
+                rows.push(("Reason", reason));
+            }
+            details(ui, "event_details_grid", &rows);
+        });
+        close
     }
 
     impl eframe::App for App {
@@ -634,309 +1636,38 @@ mod app {
             }
             let state = TrayState::of(self.approvals.paused(), pending.len());
 
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.heading(RichText::new("gatewizz").size(23.0).strong());
-                    ui.label(RichText::new("LOCAL SECURITY GATE").size(10.0).strong().color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (color, message) = match state {
-                            TrayState::Running => (GREEN, "Proxy active"),
-                            TrayState::Paused => (MUTED, "Approvals paused"),
-                            TrayState::Waiting => (AMBER, "Approval required"),
-                        };
-                        ui.label(RichText::new(state.label()).size(10.0).strong().color(color));
-                        ui.label(RichText::new("●").color(color));
-                        if !pending.is_empty() {
-                            ui.label(RichText::new(format!("{} waiting", pending.len())).strong().color(AMBER));
-                        }
-                        ui.label(RichText::new(message).size(11.0).color(MUTED));
-                    });
-                });
-                ui.label(RichText::new("Review outbound requests before they reach an external model endpoint.")
-                    .size(11.0).color(MUTED));
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let overview = ui.selectable_label(self.tab == Tab::Overview, "  Overview  ");
-                    if overview.clicked() { self.tab = Tab::Overview; }
-                    let activity = ui.selectable_label(self.tab == Tab::Activity, "  Activity history  ");
-                    if activity.clicked() { self.tab = Tab::Activity; }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{} pending", pending.len())).size(10.0).color(AMBER));
-                    });
-                });
-                ui.separator();
-                if self.tab == Tab::Activity {
-                    let rows = &self.history;
-                    let blocked = rows.iter().filter(|event| event.action == Some(Action::Block)).count();
-                    let other = rows.len().saturating_sub(blocked);
-                    ui.horizontal(|ui| {
-                        stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
-                        stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
-                        stat_card(ui, "OTHER", &other.to_string(), GREEN);
-                    });
-                    ui.add_space(8.0);
-                    let filtered = ui
-                        .horizontal(|ui| {
-                        ui.label(RichText::new("ACTIVITY").strong().size(11.0));
-                        ui.add(egui::TextEdit::singleline(&mut self.history_filter)
-                            .hint_text("Filter host or process...")
-                            .desired_width(205.0));
-                        egui::ComboBox::from_id_salt("history_decision")
-                            .selected_text(match self.history_decision.as_str() {
-                                "allow" => "Allowed",
-                                "block" => "Blocked",
-                                "approve" => "Approval",
-                                _ => "All decisions",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.history_decision, "all".into(), "All decisions");
-                                ui.selectable_value(&mut self.history_decision, "allow".into(), "Allowed");
-                                ui.selectable_value(&mut self.history_decision, "block".into(), "Blocked");
-                                ui.selectable_value(&mut self.history_decision, "approve".into(), "Approval");
-                            });
-                        let filtered =
-                            filter_history(rows, &self.history_filter, &self.history_decision);
-                        if ui.button("Copy CSV").on_hover_text("Copy filtered metadata to the clipboard").clicked() {
-                            copy_to_clipboard(&history_csv(&filtered));
-                        }
-                        ui.label(RichText::new(format!("{} shown", filtered.len())).size(10.0).color(MUTED));
-                        ui.add_space(4.0);
-                        filtered
-                    })
-                        .inner;
-                    ui.add_space(5.0);
-                    let mut selected = self.history_selected;
-                    egui::ScrollArea::vertical().max_height(310.0).auto_shrink([false, false]).show(ui, |ui| {
-                        egui::Grid::new("activity_grid").striped(true).num_columns(5).show(ui, |ui| {
-                            for heading in ["TIME (UTC)", "APPLICATION", "DESTINATION", "DECISION", "STATUS"] {
-                                ui.label(RichText::new(heading).size(9.0).strong().color(MUTED));
-                            }
-                            ui.end_row();
-                            for event in &filtered {
-                                let index = rows.iter().position(|row| std::ptr::eq(row, *event)).unwrap_or(usize::MAX);
-                                let active = selected == Some(index);
-                                let decision = event.decision();
-                                let color = match event.action {
-                                    Some(Action::Block) => RED,
-                                    Some(Action::Approve) => AMBER,
-                                    _ => GREEN,
-                                };
-                                let time = event.time.replace('T', " ").trim_end_matches('Z').to_string();
-                                if ui.selectable_label(active, RichText::new(time).size(10.0).color(MUTED)).clicked() {
-                                    selected = Some(index);
-                                }
-                                ui.label(RichText::new(event.process_name()).size(10.0));
-                                ui.label(RichText::new(&event.host).size(10.0).color(BLUE));
-                                ui.label(RichText::new(decision).size(10.0));
-                                ui.label(RichText::new(event.status.to_string()).size(10.0).strong().color(color));
-                                ui.end_row();
-                            }
-                        });
-                        if rows.is_empty() {
-                            ui.add_space(12.0);
-                            let message = if self.events_path.is_some() { "No events recorded yet. New requests will appear here automatically." } else { "Persistent history is disabled because events are sent to stdout." };
-                            ui.label(RichText::new(message).color(MUTED));
-                        } else if filtered.is_empty() {
-                            ui.label(RichText::new("No events match these filters.").color(MUTED));
-                        }
-                    });
-                    self.history_selected = selected.filter(|index| *index < rows.len());
-                    if let Some(event) = self.history_selected.and_then(|index| rows.get(index)) {
-                        ui.add_space(7.0);
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.label(RichText::new("EVENT DETAILS").size(10.0).strong().color(MUTED));
-                            ui.horizontal(|ui| {
-                                metadata(ui, "TIME (UTC)", &event.time);
-                                metadata(ui, "METHOD", &event.method);
-                                metadata(ui, "STATUS", &event.status.to_string());
-                            });
-                            metadata(ui, "DESTINATION", &format!("{}:{}", event.host, event.port));
-                            metadata(ui, "PATH", if event.path.is_empty() { "(CONNECT tunnel)" } else { &event.path });
-                            metadata(ui, "COVERAGE", &event.coverage);
-                            metadata(ui, "RULE", event.rule.as_deref().unwrap_or("default / unavailable"));
-                            if let Some(model) = &event.model { metadata(ui, "MODEL", model); }
-                            if let Some(reason) = &event.reason { metadata(ui, "PROXY REASON", reason); }
-                        });
+            egui::Panel::top("header")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(BG).inner_margin(Margin {
+                    left: 20,
+                    right: 20,
+                    top: 16,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| self.header(ui, state, pending.len()));
+            egui::Panel::bottom("status_bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(SURFACE)
+                        .inner_margin(Margin::symmetric(20, 8)),
+                )
+                .show(ui, |ui| self.status_bar(ui, state));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BG).inner_margin(Margin {
+                    left: 20,
+                    right: 20,
+                    top: 0,
+                    bottom: 16,
+                }))
+                .show(ui, |ui| {
+                    if self.approvals.paused() {
+                        self.paused_banner(ui);
                     }
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Metadata only. Request bodies, header values, query strings and secret values are never stored or exported.")
-                        .size(10.0).color(MUTED));
-                    return;
-                }
-                let recent = &self.history;
-                let blocked = recent.iter().filter(|event| event.action == Some(Action::Block)).count();
-                let allowed = recent.len().saturating_sub(blocked);
-                ui.horizontal(|ui| {
-                    stat_card(ui, "RECENT REQUESTS", &recent.len().to_string(), BLUE);
-                    stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
-                    stat_card(ui, "OTHER DECISIONS", &allowed.to_string(), GREEN);
-                    stat_card(ui, "AWAITING REVIEW", &pending.len().to_string(), AMBER);
+                    match self.tab {
+                        Tab::Overview => self.overview(ui, &pending),
+                        Tab::Activity => self.activity(ui),
+                    }
                 });
-                ui.add_space(10.0);
-
-                ui.columns(2, |columns| {
-                    columns[0].set_min_width(205.0);
-                    columns[0].set_max_width(270.0);
-                    columns[0].vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("PENDING").size(10.0).strong().color(MUTED));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(pending.len().to_string()).strong());
-                            });
-                        });
-                        ui.add_space(6.0);
-                        if pending.is_empty() {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_min_height(120.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(18.0);
-                                    ui.label(RichText::new("✓").size(25.0).color(GREEN));
-                                    ui.label(RichText::new("Queue is clear").strong());
-                                    ui.label(RichText::new("Nothing needs your attention.").size(11.0).color(MUTED));
-                                    ui.add_space(12.0);
-                                });
-                            });
-                        } else {
-                            for (id, held, left) in &pending {
-                                let active = self.selected == Some(*id);
-                                let fill = if active {
-                                    Color32::from_rgb(0x1d, 0x26, 0x34)
-                                } else {
-                                    Color32::from_rgb(0x15, 0x1b, 0x25)
-                                };
-                                let stroke = if active {
-                                    Stroke::new(1.5, BLUE)
-                                } else {
-                                    Stroke::new(1.0, Color32::from_rgb(0x2a, 0x35, 0x45))
-                                };
-                                let response = egui::Frame::group(ui.style())
-                                    .fill(fill)
-                                    .stroke(stroke)
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.horizontal(|ui| {
-                                            ui.vertical(|ui| {
-                                                ui.label(RichText::new(program(&held.process)).strong());
-                                                ui.label(RichText::new(&held.host).size(10.0).color(MUTED));
-                                            });
-                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                ui.label(RichText::new(format!("{}s", left.as_secs()))
-                                                    .size(10.0).strong().color(if left.as_secs() < 15 { RED } else { AMBER }));
-                                            });
-                                        });
-                                        ui.label(RichText::new(format!("{} finding(s)", held.findings.len()))
-                                            .size(10.0).color(AMBER));
-                                    });
-                                if response.response.interact(egui::Sense::click()).clicked() {
-                                    self.selected = Some(*id);
-                                }
-                                ui.add_space(4.0);
-                            }
-                        }
-                    });
-
-                    let selected = self.selected.and_then(|id| pending.iter().find(|p| p.0 == id));
-                    columns[1].vertical(|ui| {
-                        let Some((id, held, left)) = selected else {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_min_height(280.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.add_space(55.0);
-                                    ui.label(RichText::new("All clear").size(22.0).strong().color(GREEN));
-                                    ui.label(RichText::new("Request details will appear here when approval is needed.")
-                                        .size(11.0).color(MUTED));
-                                });
-                            });
-                            return;
-                        };
-
-                        let (pid, user) = match &held.process {
-                            Process::Known { pid, user, .. } => (pid.to_string(), user.clone()),
-                            Process::Unknown(why) => ("Unknown".into(), why.to_string()),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("REQUEST DETAILS").size(10.0).strong().color(MUTED));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{}s remaining", left.as_secs()))
-                                    .size(11.0).strong().color(if left.as_secs() < 15 { RED } else { AMBER }));
-                            });
-                        });
-                        ui.add_space(6.0);
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.label(RichText::new(program(&held.process)).size(20.0).strong());
-                            ui.label(RichText::new(&held.host).size(13.0).color(BLUE));
-                            ui.add_space(8.0);
-                            ui.separator();
-                            metadata(ui, "PROCESS ID", &pid);
-                            metadata(ui, "USER", &user);
-                            metadata(ui, "MATCHED RULE", &held.rule);
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("DETECTION").size(10.0).strong().color(MUTED));
-                            if held.findings.is_empty() {
-                                ui.label(RichText::new("No finding details supplied by the rule engine.")
-                                    .size(11.0).color(MUTED));
-                            } else {
-                                for finding in &held.findings {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("◆").color(AMBER));
-                                        ui.label(RichText::new(finding).size(11.0));
-                                    });
-                                }
-                            }
-                            ui.add_space(8.0);
-                            ui.separator();
-                            ui.label(RichText::new("The request remains held until you decide.")
-                                .size(11.0).color(MUTED));
-                            ui.add_space(7.0);
-                            ui.horizontal(|ui| {
-                                if ui.add_sized([90.0, 34.0],
-                                    egui::Button::new(RichText::new("Deny").strong().color(RED))).clicked() {
-                                    self.approvals.answer(*id, Verdict::Deny);
-                                    self.selected = None;
-                                }
-                                if ui.add_sized([120.0, 34.0],
-                                    egui::Button::new(RichText::new("Allow once").strong().color(Color32::WHITE))
-                                        .fill(Color32::from_rgb(0x25, 0x8b, 0x60))).clicked() {
-                                    self.approvals.answer(*id, Verdict::AllowOnce);
-                                    self.selected = None;
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Temporary grant").strong());
-                                ui.add(egui::DragValue::new(&mut self.minutes).range(1..=480).suffix(" min"));
-                            });
-                            if ui.add_sized([250.0, 30.0],
-                                egui::Button::new("Allow this program + host for this duration")).clicked() {
-                                self.approvals.answer(*id,
-                                    Verdict::AllowFor(Duration::from_secs(u64::from(self.minutes) * 60)));
-                                self.selected = None;
-                            }
-                            ui.label(RichText::new("Grant applies only to this executable and destination host.")
-                                .size(10.0).color(MUTED));
-                        });
-                    });
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").color(if state == TrayState::Paused { MUTED } else { GREEN }));
-                    ui.label(RichText::new(format!("Proxy  {}", self.listen)).size(10.0).color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Hide to tray").clicked() {
-                            self.show(&ctx, false);
-                        }
-                        if state == TrayState::Paused {
-                            ui.label(RichText::new("New approval requests are blocked while paused.")
-                                .size(10.0).color(AMBER));
-                        }
-                    });
-                });
-            });
 
             if !pending.is_empty() {
                 ctx.request_repaint_after(Duration::from_millis(500));
@@ -1103,6 +1834,22 @@ mod tests {
         assert_eq!(alpha(16, 16), 255);
         assert_eq!(alpha(0, 0), 0);
         assert_eq!(&rgba[(16 * 32 + 16) * 4..][..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn countdown_is_minutes_and_seconds() {
+        use std::time::Duration;
+        assert_eq!(countdown(Duration::from_secs(0)), "0:00");
+        assert_eq!(countdown(Duration::from_millis(9_900)), "0:09");
+        assert_eq!(countdown(Duration::from_secs(102)), "1:42");
+    }
+
+    #[test]
+    fn duration_label_reads_naturally() {
+        assert_eq!(duration_label(5), "5 min");
+        assert_eq!(duration_label(60), "1 hour");
+        assert_eq!(duration_label(480), "8 hours");
+        assert_eq!(duration_label(90), "1 h 30 min");
     }
 
     #[test]
