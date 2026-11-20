@@ -116,6 +116,16 @@ pub fn client_process(peer: SocketAddr, local: SocketAddr) -> Process {
     cache().lookup(pid, start, Instant::now(), || sys::describe(pid, start))
 }
 
+/// The creation time of `pid` (FILETIME ticks), or `None` if it exited or cannot be opened.
+pub fn start_time(pid: u32) -> Option<u64> {
+    sys::start_time(pid)
+}
+
+/// Names the process `(pid, start)`, through the same cache the proxy uses.
+pub fn describe_pid(pid: u32, start: u64) -> Process {
+    cache().lookup(pid, start, Instant::now(), || sys::describe(pid, start))
+}
+
 impl Cache {
     fn lookup(
         &self,

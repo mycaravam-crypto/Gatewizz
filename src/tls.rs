@@ -146,6 +146,7 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Record;
 
     #[test]
     fn builds_the_platform_verifier() {
@@ -273,7 +274,7 @@ mod tests {
         trusted: &TestCa,
         port: u16,
         tunnel_hosts: Vec<String>,
-    ) -> (SocketAddr, mpsc::Receiver<Event>) {
+    ) -> (SocketAddr, mpsc::Receiver<Record>) {
         let interceptor = Interceptor::new(
             Box::new(move |host: &str| Ok(leaf(&gatewizz, host))),
             trusting(trusted),
@@ -374,11 +375,15 @@ mod tests {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
-    async fn next(events: &mut mpsc::Receiver<Event>) -> Event {
-        timeout(Duration::from_secs(5), events.recv())
+    async fn next(events: &mut mpsc::Receiver<crate::event::Record>) -> Event {
+        match timeout(Duration::from_secs(5), events.recv())
             .await
             .unwrap()
             .unwrap()
+        {
+            crate::event::Record::Request(event) => event,
+            other => panic!("expected a request event, got {other:?}"),
+        }
     }
 
     /// Every file below `dir`, rotated events and CA files included.

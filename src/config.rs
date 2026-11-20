@@ -19,6 +19,7 @@ pub struct Config {
     pub events: Events,
     pub tls: Tls,
     pub approval: Approval,
+    pub monitor: Monitor,
     /// Allow/block rules (#21); see `config/gatewizz.example.toml`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
@@ -131,6 +132,37 @@ impl Default for Approval {
     }
 }
 
+/// The connection monitor (#57): every TCP connection on the machine, per process, logged and shown in the Network
+/// tab. Read-only and off by default.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Monitor {
+    pub enabled: bool,
+    /// How often the connection tables are sampled. Connections shorter than this can be missed.
+    pub poll_ms: u64,
+    /// Remote IP → hostname entries kept from the DNS cache.
+    pub dns_cache_size: usize,
+}
+
+impl Default for Monitor {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_ms: 1000,
+            dns_cache_size: 4096,
+        }
+    }
+}
+
+impl Monitor {
+    pub fn settings(&self) -> crate::connections::Settings {
+        crate::connections::Settings {
+            poll: Duration::from_millis(self.poll_ms),
+            dns_cache_size: self.dns_cache_size,
+        }
+    }
+}
+
 /// Where events go once `[events].path` is resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventTarget {
@@ -198,6 +230,12 @@ impl Config {
         }
         if self.approval.max_pending == 0 {
             return Err("approval.max_pending: must be at least 1".into());
+        }
+        if !(100..=60_000).contains(&self.monitor.poll_ms) {
+            return Err("monitor.poll_ms: must be between 100 and 60000".into());
+        }
+        if !(16..=1_000_000).contains(&self.monitor.dns_cache_size) {
+            return Err("monitor.dns_cache_size: must be between 16 and 1000000".into());
         }
         if self.events.max_file_bytes < 4096 {
             return Err("events.max_file_bytes: must be at least 4096".into());
@@ -380,6 +418,31 @@ mod tests {
         assert_eq!(
             format!("{:?}", Config::default().settings()),
             format!("{:?}", Settings::default())
+        );
+    }
+
+    #[test]
+    fn monitor_is_off_by_default_and_validated() {
+        let c = Config::parse("").unwrap();
+        assert!(!c.monitor.enabled);
+        assert_eq!(c.monitor.poll_ms, 1000);
+        let on = Config::parse("[monitor]\nenabled = true\npoll_ms = 500\n").unwrap();
+        assert!(on.monitor.enabled);
+        assert_eq!(on.monitor.settings().poll, Duration::from_millis(500));
+        assert!(
+            Config::parse("[monitor]\npoll_ms = 10\n")
+                .unwrap_err()
+                .contains("monitor.poll_ms")
+        );
+        assert!(
+            Config::parse("[monitor]\ndns_cache_size = 1\n")
+                .unwrap_err()
+                .contains("monitor.dns_cache_size")
+        );
+        assert!(
+            Config::parse("[monitor]\nenable = true\n")
+                .unwrap_err()
+                .contains("enable")
         );
     }
 

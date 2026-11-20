@@ -164,13 +164,36 @@ Timeout, a full queue or pausing approvals blocks the request. All approvals sha
 
 ## Activity history
 
-The Gatewizz window has two tabs: **Overview** (summary counts and pending approvals) and **Activity history**. The history tab shows recent decisions read back from the event log. It shows only the metadata the log already holds, never request content.
+The Gatewizz window has three tabs: **Overview** (summary counts and pending approvals), **Activity history** and **Network** (see [Connection monitor](#connection-monitor)). The history tab shows recent decisions read back from the event log. It shows only the metadata the log already holds, never request content.
 
 - **Source:** the current event file and up to five rotated files (`events.jsonl.1` to `.5`). From each file only the last 1 MiB is read, and at most 500 events are shown, newest first. The list refreshes every two seconds. If `[events].path = "-"` (stdout), there is no file to read and the tab says that persistent history is disabled.
 - **Summary:** counts of recent, blocked and other events.
 - **Filters:** a text filter that matches the host or the program name, ignoring case, and a decision filter (all, allowed, blocked, approval). Both filters must match.
 - **Details:** selecting a row shows time, method, status, destination, path (or "CONNECT tunnel"), inspection coverage, the deciding rule, the AI model and the proxy's reason.
 - **Copy CSV:** copies the rows currently shown to the clipboard as CSV with CRLF line endings and every field quoted. Columns: `time_utc, process, host, port, method, path, decision, status, coverage, rule, reason, model`. Nothing is written to disk.
+
+## Connection monitor
+
+The proxy only sees tools that use it. The connection monitor shows everything else too: every TCP connection on the computer, attributed to its program. It is Phase 1 of the connection firewall (#56, #57). It only watches, it needs no admin rights, and it is off by default:
+
+```toml
+[monitor]
+enabled = true
+# poll_ms = 1000
+# dns_cache_size = 4096
+```
+
+- **What is shown:** the **Network** tab lists the current connections grouped by program. Each one shows the hostname (or the IP), the remote address and port, and the direction. A **New** badge marks the first connection from a program to a host since Gatewizz started. The search box matches the program, the hostname or the IP.
+- **What is logged:** each connection that opens or closes is written to the event log as a `connection` record. A record holds the time, `opened`/`closed`, the process (PID, image, user), `tcp`, the direction, the remote IP and port, the hostname or `null`, and `first_seen`. It never holds content: the monitor reads no bytes of any connection. At most one record per process, remote address and state is written every 10 seconds. Records left out are counted in the next one's `suppressed` field. The Activity tab ignores these records, so its counts are unchanged.
+- **How:** the IP Helper TCP tables (IPv4 and IPv6) are read every `poll_ms`. A connection is inbound when its program listens on its local port, and outbound otherwise. Loopback connections (tools to the proxy, local model servers) and sockets without an owner (`TIME_WAIT`) are left out. Hostnames come from the Windows DNS Client cache, which is read again at most once per second, only when a connection to an unknown address appears. An address keeps up to four recent names, and the one most recently looked up is shown.
+- **Off:** with `enabled = false` nothing is sampled and the proxy behaves exactly as before. On other operating systems `enabled = true` is a startup error.
+
+Limits:
+
+- **Short connections:** connections that open and close between two samples are missed. Lower `poll_ms` if that matters. Phase 2 (#59) will see every connection through Windows Filtering Platform events.
+- **UDP and QUIC:** these are not shown. The Windows UDP table lists local sockets only, without a remote address.
+- **Hostnames are best effort:** apps that resolve names themselves (DNS over HTTPS in a browser, hard-coded IPs) show an IP only. A CDN address shared by many sites shows the name that was looked up most recently. The DNS cache does not say which program asked.
+- **Overhead:** the CPU cost at the default interval still has to be measured on a real machine (#57). Reading the tables is one system call per address family per sample.
 
 ## Events and privacy
 
@@ -253,4 +276,4 @@ GitHub Actions run tests on pull requests and `main`:
 - The proxy handles HTTP/1.1. HTTP/2 and QUIC/HTTP/3 are not transparently captured.
 - Applications with private certificate stores need their own CA configuration.
 - Process attribution can be `unknown` if the client exits before process lookup completes.
-- This is not a system-wide firewall or transparent egress control. It does not prevent an application from bypassing it by ignoring proxy settings.
+- This is not a system-wide firewall or transparent egress control. It does not prevent an application from bypassing it by ignoring proxy settings. With `[monitor] enabled = true` such connections are at least visible (see [Connection monitor](#connection-monitor)); blocking them is Phase 2 of #56.

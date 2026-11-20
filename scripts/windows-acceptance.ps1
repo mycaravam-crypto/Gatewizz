@@ -1,5 +1,5 @@
 # Gatewizz manual acceptance on a real Windows machine: the checks left open in #17 (M1), #22 (M2), #35 (M3 approval
-# and tray) and #36 (M3.1 background application). Everything that can be measured is measured; what only a person
+# and tray), #36 (M3.1 background application) and #57 (connection monitor). Everything that can be measured is measured; what only a person
 # can see (the icon, the tray, a window flash) is asked as a y/n/s question. The result is a Markdown report to paste
 # into the issues.
 #
@@ -15,6 +15,7 @@
 #   -SmartwizzRepo  a git checkout with changed source files; runs `smartwizz check` through Gatewizz (#17)
 #   -SkipCa         skip the HTTPS interception and secret-routing part (#22), which adds and removes the CA
 #   -SkipApproval   skip the interactive approval and tray part (#35)
+#   -SkipMonitor    skip the connection monitor part (#57)
 #   -Report         where to write the Markdown report
 param(
     [string] $Exe = (Join-Path $env:LOCALAPPDATA 'Programs\Gatewizz\gatewizz.exe'),
@@ -22,6 +23,7 @@ param(
     [string] $SmartwizzRepo = '',
     [switch] $SkipCa,
     [switch] $SkipApproval,
+    [switch] $SkipMonitor,
     [string] $Report = (Join-Path (Get-Location) ("gatewizz-acceptance-{0:yyyyMMdd-HHmm}.md" -f (Get-Date)))
 )
 $ErrorActionPreference = 'Stop'
@@ -415,6 +417,43 @@ severity = "low"
     Check 35 'tray Quit stops Gatewizz and its listener' ($quit -and -not (Test-Port))
 }
 
+# ---------------------------------------------------------------- #57: connection monitor
+
+Stop-Gatewizz
+if ($SkipMonitor) {
+    Record 57 'connection monitor' 'skip' '-SkipMonitor'
+} else {
+    Step '#57 connection monitor'
+    $monitorConfig = Write-Config 'monitor.toml' "[monitor]`nenabled = true`npoll_ms = 250`n"
+    $null = Start-Gatewizz $monitorConfig
+    # Straight out, not through the proxy: only the monitor can see this one. The page is ~1.2 KB, so 500 B/s keeps
+    # the connection open for a couple of seconds, well over the sampling interval.
+    $direct = Start-Process -FilePath curl.exe -ArgumentList @('-s', '-o', 'NUL', '--limit-rate', '500', '--noproxy', '*', 'https://example.com/') -NoNewWindow -PassThru -Wait
+    $c = Find-GwEvent { $_.PSObject.Properties['kind'] -and $_.kind -eq 'connection' -and $_.state -eq 'opened' -and
+        $_.process.PSObject.Properties['known'] -and $_.process.known.pid -eq $direct.Id } 10
+    Check 57 'a direct (unproxied) curl.exe connection is logged with its PID and image' (
+        $c -and $c.process.known.image -like '*\curl.exe' -and $c.port -eq 443) (Format-GwEvent $c)
+    Check 57 'its hostname comes from the DNS cache' ($c -and $c.hostname -eq 'example.com') (Format-GwEvent $c)
+    $closed = Find-GwEvent { $_.PSObject.Properties['kind'] -and $_.kind -eq 'connection' -and $_.state -eq 'closed' -and
+        $_.process.PSObject.Properties['known'] -and $_.process.known.pid -eq $direct.Id } 10
+    Check 57 'and logged as closed once curl.exe exits' ([bool]$closed) (Format-GwEvent $closed)
+    $evidence.Add("Monitor event (direct curl.exe): ``$(Format-GwEvent $c)``")
+    Say 'Open the Network tab in the Gatewizz window (tray icon).'
+    Ask 57 'Network tab lists programs and hosts' 'Does the Network tab show programs (e.g. your browser) with hostnames and New badges?'
+    if ($SmartwizzRepo -and (Get-Command smartwizz -ErrorAction SilentlyContinue)) {
+        Say 'Run smartwizz now (any command that reaches its model) in another window, then answer.'
+        Ask 57 'smartwizz appears with its model host' 'Does the Network tab show smartwizz/dotnet with the model host?'
+    }
+    $proc = Get-Process -Name gatewizz -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Select-Object -First 1
+    if ($proc) {
+        $cpu0 = $proc.TotalProcessorTime; Start-Sleep -Seconds 20; $proc.Refresh()
+        $pct = (($proc.TotalProcessorTime - $cpu0).TotalSeconds / 20 / [Environment]::ProcessorCount) * 100
+        $evidence.Add(('Monitor overhead at poll_ms = 250: {0:N2} % of total CPU over 20 s (Gatewizz process, {1} logical CPUs)' -f $pct, [Environment]::ProcessorCount))
+        Record 57 ('CPU at poll_ms = 250 measured: {0:N2} % of total CPU' -f $pct) 'pass'
+    }
+    Stop-Gatewizz
+}
+
 # ---------------------------------------------------------------- #17: Ctrl+C
 
 Step '#17 Ctrl+C shutdown'
@@ -443,6 +482,7 @@ $issueTitles = [ordered]@{
     '22' = 'M2: secret routing'
     '35' = 'M3: approval window and tray'
     '36' = 'M3.1: icon, manifest and background start'
+    '57' = 'Firewall Phase 1: connection monitor'
 }
 $os = (Get-CimInstance Win32_OperatingSystem)
 $lines = New-Object System.Collections.Generic.List[string]

@@ -75,6 +75,20 @@
 # timeout_secs = 60
 # max_pending = 16
 
+[monitor]
+# Connection monitor (Windows): every outgoing TCP connection on the computer,
+# per program, with its hostname where the Windows DNS cache knows it. Logged
+# as "connection" events and shown in the Network tab. It only watches and
+# needs no admin rights; nothing is blocked.
+# enabled = false
+
+# How often the connection tables are sampled, in milliseconds (100-60000).
+# Connections shorter than this can be missed.
+# poll_ms = 1000
+
+# Remote IP -> hostname entries kept (16-1000000).
+# dns_cache_size = 4096
+
 # Allow/block/approve rules. Keys under `match` are optional and must all hold;
 # "block" beats "approve" beats "allow"; with no match, general.default_action
 # applies. A blocked request gets 403 naming the rule, and nothing is sent
