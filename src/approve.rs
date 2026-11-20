@@ -1,8 +1,9 @@
 //! Holding requests for approval (#34). The proxy asks; the approval window (#35) lists what waits and answers.
 //!
 //! Fail closed: a timeout, a full queue, no attached window or pause all block. Held requests carry metadata only.
-// ponytail: unused until the approve action is wired into the proxy after #21 (#33) lands.
-#![allow(dead_code)]
+
+// The window that answers lives in `ui.rs` (Windows only); elsewhere `approve` simply blocks.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,15 @@ pub struct Approvals {
     capacity: usize,
     /// Number of waiting requests, for the tray colour and to wake the window.
     count: watch::Sender<usize>,
+}
+
+impl std::fmt::Debug for Approvals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Approvals")
+            .field("timeout", &self.timeout)
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
 }
 
 /// While alive, an approval window is attached and requests can be held.

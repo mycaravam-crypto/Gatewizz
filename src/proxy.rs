@@ -23,6 +23,7 @@ use tokio::time::timeout;
 
 type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
 
+use crate::approve::{Approvals, Held, Outcome};
 use crate::detect::{self, BodyLimits, Inspected};
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
@@ -67,6 +68,8 @@ pub struct Settings {
     pub default_action: Action,
     /// How much of a request body is read and inspected before any request byte goes upstream.
     pub body: BodyLimits,
+    /// Where `approve` decisions wait for an answer from the approval window.
+    pub approvals: Arc<Approvals>,
 }
 
 impl Default for Settings {
@@ -84,6 +87,7 @@ impl Default for Settings {
             rules: Vec::new(),
             default_action: Action::Allow,
             body: BodyLimits::default(),
+            approvals: Arc::new(Approvals::new(Duration::from_secs(60), 16)),
         }
     }
 }
@@ -112,6 +116,7 @@ impl Event {
             bytes_down: None,
             action: None,
             rule: None,
+            approval: None,
         }
     }
 }
@@ -259,6 +264,7 @@ async fn forward(
         bytes_down: None,
         action: None,
         rule: None,
+        approval: None,
     };
     let Some((host, port)) = http_target(req.uri()) else {
         return refuse(
@@ -278,7 +284,7 @@ async fn forward(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, true).await {
         return blocked;
     }
     let upstream = match connect_upstream(ctx, &host, port).await {
@@ -363,7 +369,7 @@ async fn relay(
             defer_content: false,
         })
     };
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, false).await {
         return blocked;
     }
     let response = match timeout(ctx.settings.response_timeout, sender.send_request(req)).await {
@@ -409,6 +415,7 @@ async fn tunnel(
         bytes_down: None,
         action: None,
         rule: None,
+        approval: None,
     };
     let (Some(host), Some(port)) = (req.uri().host(), req.uri().port_u16()) else {
         return refuse(
@@ -446,7 +453,7 @@ async fn tunnel(
         content: None,
         defer_content: interceptor.is_some(),
     });
-    if let Some(blocked) = enforce(&ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(&ctx, &mut event, decision, interceptor.is_some()).await {
         return blocked;
     }
     if let Some(interceptor) = interceptor {
@@ -610,6 +617,7 @@ async fn inside(
         bytes_down: None,
         action: None,
         rule: None,
+        approval: None,
     };
     let named = req
         .headers()
@@ -641,7 +649,7 @@ async fn inside(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, true).await {
         return blocked;
     }
     let authority = if port == 443 {
@@ -667,18 +675,47 @@ async fn inside(
     relay(ctx, event, &mut sender, req).await
 }
 
-/// Notes the decision on the event. Anything but `allow` answers 403 naming the rule, records the event and closes
-/// the connection; nothing reaches the upstream.
-async fn enforce(ctx: &Ctx, event: &mut Event, decision: Decision) -> Option<Response<Body>> {
+/// Notes the decision on the event. `block`, and an `approve` that is not approved, answer 403 naming the rule,
+/// record the event and close the connection; nothing reaches the upstream.
+///
+/// `decided_later` marks a decision made before the body is known (or before a decrypted tunnel's requests): an
+/// `approve` there is asked only at the final decision, so a request is held once, with its findings shown.
+async fn enforce(
+    ctx: &Ctx,
+    event: &mut Event,
+    decision: Decision,
+    decided_later: bool,
+) -> Option<Response<Body>> {
     event.action = Some(decision.action);
     event.rule = Some(decision.rule.clone());
-    if decision.action == Action::Allow {
-        return None;
-    }
+    let reason = match decision.action {
+        Action::Allow => return None,
+        Action::Approve if decided_later => return None,
+        Action::Block => "blocked by rule",
+        Action::Approve => {
+            let held = Held {
+                process: event.process.clone(),
+                host: event.host.clone(),
+                rule: decision.rule.clone(),
+                findings: event.findings.iter().map(|f| f.kind.to_string()).collect(),
+            };
+            // Held before any request byte goes upstream; the client simply waits for its response.
+            match ctx.settings.approvals.ask(held).await {
+                Outcome::Allowed(how) => {
+                    event.approval = Some(how);
+                    return None;
+                }
+                Outcome::Blocked(why) => {
+                    event.approval = Some(why);
+                    "not approved"
+                }
+            }
+        }
+    };
     let mut blocked = event.clone();
     blocked.coverage = Coverage::Blocked;
     blocked.status = StatusCode::FORBIDDEN.as_u16();
-    blocked.reason = Some("blocked by rule");
+    blocked.reason = Some(reason);
     let time = blocked.time.clone();
     ctx.emit(blocked).await;
     let severity = decision
@@ -689,8 +726,16 @@ async fn enforce(ctx: &Ctx, event: &mut Event, decision: Decision) -> Option<Res
     } else {
         format!("{}\n", decision.description)
     };
+    let verb = if decision.action == Action::Approve {
+        "not approved"
+    } else {
+        "blocked"
+    };
+    let why = event
+        .approval
+        .map_or(String::new(), |why| format!(": {why}"));
     let text = format!(
-        "gatewizz: blocked by rule \"{}\"{severity}\n{description}event time: {time}\n",
+        "gatewizz: {verb} by rule \"{}\"{severity}{why}\n{description}event time: {time}\n",
         decision.rule
     );
     let mut response = Response::new(
@@ -881,6 +926,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approve::Verdict;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -1756,5 +1802,143 @@ mod tests {
             (Some(Action::Allow), Some("default"))
         );
         assert_eq!(event.coverage, Coverage::Inspected);
+    }
+
+    /// An upstream that reports every byte it receives and answers each request head with 200.
+    async fn counting_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (mut seen, mut buf) = (Vec::new(), [0u8; 4096]);
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        let _ = tx.send(n);
+                        seen.extend_from_slice(&buf[..n]);
+                        if seen.ends_with(b"\r\n\r\n") {
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .await;
+                            seen.clear();
+                        }
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    fn approve_rule() -> Rule {
+        Rule {
+            id: "ask".to_string(),
+            description: String::new(),
+            matches: rules::Match::default(),
+            action: Action::Approve,
+            severity: rules::Severity::High,
+        }
+    }
+
+    /// A proxy whose only rule holds every request for approval, and its approval queue.
+    async fn start_approving(
+        timeout: Duration,
+    ) -> (SocketAddr, mpsc::Receiver<Event>, Arc<Approvals>) {
+        let approvals = Arc::new(Approvals::new(timeout, 4));
+        let settings = Settings {
+            rules: vec![approve_rule()],
+            approvals: approvals.clone(),
+            ..Settings::default()
+        };
+        let (proxy, events) = start(settings).await;
+        (proxy, events, approvals)
+    }
+
+    fn get(upstream: SocketAddr) -> String {
+        format!(
+            "GET http://{upstream}/held HTTP/1.1\r\nHost: {upstream}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn held_request_sends_nothing_upstream_until_allowed() {
+        let (upstream, mut bytes) = counting_upstream().await;
+        let (proxy, mut events, approvals) = start_approving(Duration::from_secs(10)).await;
+        let _window = approvals.attach();
+        let client = tokio::spawn(async move { exchange(proxy, get(upstream).as_bytes()).await });
+
+        approvals.watch().wait_for(|n| *n == 1).await.unwrap();
+        let (id, held, _) = approvals.pending().remove(0);
+        assert_eq!(
+            (held.host.as_str(), held.rule.as_str()),
+            ("127.0.0.1", "ask")
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            bytes.try_recv().is_err(),
+            "no byte may reach the upstream while held"
+        );
+
+        assert!(approvals.answer(id, Verdict::AllowOnce));
+        let response = client.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(bytes.recv().await.unwrap() > 0);
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.action, event.rule.as_deref(), event.approval),
+            (Some(Action::Approve), Some("ask"), Some("approved once"))
+        );
+        assert!(
+            approvals.pending().is_empty(),
+            "held once, not again at the final decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_timeout_and_no_window_give_403_and_send_nothing() {
+        let (upstream, mut bytes) = counting_upstream().await;
+
+        let (proxy, mut events, approvals) = start_approving(Duration::from_secs(10)).await;
+        let window = approvals.attach();
+        let client = tokio::spawn(async move { exchange(proxy, get(upstream).as_bytes()).await });
+        approvals.watch().wait_for(|n| *n == 1).await.unwrap();
+        approvals.answer(approvals.pending()[0].0, Verdict::Deny);
+        let denied = client.await.unwrap();
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        assert!(
+            denied.contains("not approved by rule \"ask\" (high): approval denied"),
+            "{denied}"
+        );
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.coverage, event.reason, event.approval),
+            (
+                Coverage::Blocked,
+                Some("not approved"),
+                Some("approval denied")
+            )
+        );
+        drop(window);
+
+        let (proxy, mut events, approvals) = start_approving(Duration::from_millis(200)).await;
+        let _window = approvals.attach();
+        let timed_out = exchange(proxy, get(upstream).as_bytes()).await;
+        assert!(timed_out.contains("approval timed out"), "{timed_out}");
+        assert_eq!(
+            next_event(&mut events).await.approval,
+            Some("approval timed out")
+        );
+
+        let (proxy, mut events, _approvals) = start_approving(Duration::from_secs(10)).await;
+        let no_window = exchange(proxy, get(upstream).as_bytes()).await;
+        assert!(no_window.starts_with("HTTP/1.1 403"), "{no_window}");
+        assert_eq!(
+            next_event(&mut events).await.approval,
+            Some("no approval window")
+        );
+        assert!(bytes.try_recv().is_err(), "nothing reached the upstream");
     }
 }

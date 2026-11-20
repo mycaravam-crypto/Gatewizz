@@ -1,6 +1,7 @@
 //! Allow/block rules: deterministic, explainable decisions on what a request is and where it goes.
 //!
-//! `block` beats `allow`; when no rule matches, the default action applies. Every decision names its rule.
+//! `block` beats `approve` beats `allow`; when no rule matches, the default action applies. Every decision names its
+//! rule.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +12,7 @@ use crate::tls::host_matches;
 pub enum Action {
     Allow,
     Block,
-    /// Hold for approval (M3). Accepted by the parser only to give a clear error until then.
+    /// Hold for approval in the approval window (#34).
     Approve,
 }
 
@@ -103,11 +104,8 @@ pub struct Decision {
 
 pub const DEFAULT_RULE: &str = "default";
 
-/// Checks what serde cannot: unique, non-empty ids and no `approve` before M3. Errors name the rule.
-pub fn validate(rules: &[Rule], default_action: Action) -> Result<(), String> {
-    if default_action == Action::Approve {
-        return Err("general.default_action: approve is not available before M3".into());
-    }
+/// Checks what serde cannot: unique, non-empty ids. Errors name the rule.
+pub fn validate(rules: &[Rule], _default_action: Action) -> Result<(), String> {
     for (i, rule) in rules.iter().enumerate() {
         if rule.id.trim().is_empty() || rule.id == DEFAULT_RULE {
             return Err(format!(
@@ -117,23 +115,22 @@ pub fn validate(rules: &[Rule], default_action: Action) -> Result<(), String> {
         if rules[..i].iter().any(|earlier| earlier.id == rule.id) {
             return Err(format!("rules[{i}].id: duplicate id \"{}\"", rule.id));
         }
-        if rule.action == Action::Approve {
-            return Err(format!(
-                "rules[{i}].action: approve is not available before M3"
-            ));
-        }
     }
     Ok(())
 }
 
-/// The first matching `block` rule, else the first matching `allow` rule, else the default action.
+/// The first matching `block` rule, else the first matching `approve` rule, else the first matching `allow` rule,
+/// else the default action.
 pub fn decide(facts: &Facts<'_>, rules: &[Rule], default_action: Action) -> Decision {
     let first = |action: Action| {
         rules
             .iter()
             .find(|rule| rule.action == action && applies(&rule.matches, action, facts))
     };
-    match first(Action::Block).or_else(|| first(Action::Allow)) {
+    match first(Action::Block)
+        .or_else(|| first(Action::Approve))
+        .or_else(|| first(Action::Allow))
+    {
         Some(rule) => Decision {
             action: rule.action,
             rule: rule.id.clone(),
@@ -180,8 +177,8 @@ fn applies(m: &Match, action: Action, facts: &Facts<'_>) -> bool {
             Some(true) => {}
             Some(false) => return false,
             None if facts.defer_content => deferred = true,
-            // Fail closed: an unknown fact lets a block rule apply and keeps an allow rule from applying.
-            None if action == Action::Block => {}
+            // Fail closed: an unknown fact lets a block or approve rule apply and keeps an allow rule from applying.
+            None if action != Action::Allow => {}
             None => return false,
         }
     }
@@ -431,19 +428,46 @@ mod tests {
     }
 
     #[test]
+    fn block_beats_approve_beats_allow() {
+        let facts = Facts {
+            host: "api.example.com",
+            process: None,
+            path: Some("/"),
+            content: None,
+            defer_content: false,
+        };
+        let allow = rule("allow", Action::Allow, Match::default());
+        let approve = rule("approve", Action::Approve, Match::default());
+        let block = rule("block", Action::Block, Match::default());
+        let decided = |rules: &[Rule]| decide(&facts, rules, Action::Allow).rule;
+        assert_eq!(decided(&[allow.clone(), approve.clone()]), "approve");
+        assert_eq!(decided(&[allow.clone(), approve.clone(), block]), "block");
+        assert_eq!(decided(&[allow]), "allow");
+        // An approve rule on content that is unknown holds the request (fail closed), as a block rule would block it.
+        let on_secrets = rule(
+            "hold-secrets",
+            Action::Approve,
+            Match {
+                finding: Some("secret.*".into()),
+                ..Match::default()
+            },
+        );
+        assert_eq!(decided(std::slice::from_ref(&on_secrets)), "hold-secrets");
+        assert_eq!(decide(&facts, &[], Action::Approve).action, Action::Approve);
+    }
+
+    #[test]
     fn validation_names_the_rule() {
         let ok = rule("a", Action::Block, Match::default());
         assert_eq!(validate(std::slice::from_ref(&ok), Action::Allow), Ok(()));
         let duplicate = validate(&[ok.clone(), ok.clone()], Action::Allow).unwrap_err();
         assert!(duplicate.starts_with("rules[1].id"), "{duplicate}");
-        let approve = validate(
-            &[rule("x", Action::Approve, Match::default())],
-            Action::Allow,
-        )
-        .unwrap_err();
-        assert!(
-            approve.contains("rules[0].action") && approve.contains("M3"),
-            "{approve}"
+        assert_eq!(
+            validate(
+                &[rule("x", Action::Approve, Match::default())],
+                Action::Approve
+            ),
+            Ok(())
         );
         assert!(
             validate(
@@ -451,11 +475,6 @@ mod tests {
                 Action::Allow
             )
             .is_err()
-        );
-        assert!(
-            validate(&[], Action::Approve)
-                .unwrap_err()
-                .contains("general.default_action")
         );
     }
 

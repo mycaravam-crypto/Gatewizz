@@ -59,7 +59,7 @@ gatewizz at startup instead of falling back to blind tunnels.
 
 `[[rules]]` in the config decide whether a request goes upstream. Every key under `match` is optional and all must
 hold: `host`, `not_host`, `process` (e.g. `smartwizz.exe`), `path_prefix`, `finding` (`secret.*` or one kind) and `ai`.
-`block` beats `allow`; with no match, `[general] default_action` (default `allow`) applies. A blocked request gets
+`block` beats `approve` beats `allow`; with no match, `[general] default_action` (default `allow`) applies. A blocked request gets
 `403` naming the rule, its severity and the event time, and nothing is sent upstream. Every event records the action
 and the deciding rule (`default` when none matched). An allowlist is one `block` rule with `not_host`:
 
@@ -75,7 +75,7 @@ Rules on `path_prefix`, `finding` or `ai` need to see inside the request. In a b
 rule using them blocks the tunnel (fail closed); with `[tls] intercept` each decrypted request is decided instead.
 `finding` and `ai` are decided after the body is read: a body that was only partly inspected (over
 `[limits] max_body_bytes` with `over_limit = "allow"`, or compressed) counts as unknown, so a `block` rule on them
-applies.
+applies, and an `approve` rule on them holds the request.
 
 ## Tray and approvals
 
@@ -83,10 +83,22 @@ On Windows, `gatewizz` shows a tray icon while it runs. Its colour shows the sta
 amber when an approval is waiting. Clicking the icon opens the approval window. The right-click menu offers **Pause /
 Resume**, **Open event log**, **Copy proxy address** and **Quit**.
 
-When a rule holds a request for approval (the `approve` action, M3), the window opens and shows the program, PID, user,
-host, rule and finding kinds, never content, with the time left. **Allow once**, **Deny**, or **Allow <program> for N
-min** (that program and host, without asking again). A timeout, closing the window, a full queue or **Pause** all block
-the request. Ctrl+C in the console still stops gatewizz.
+A rule with `action = "approve"` holds the request, with nothing sent upstream, and the window opens. It shows the
+program, PID, user, host, rule and finding kinds, never content, with the time left. **Allow once**, **Deny**, or
+**Allow <program> for N min** (that program and host, without asking again). A timeout (`[approval] timeout_secs`,
+default 60), closing the window, a full queue (`[approval] max_pending`, default 16) or **Pause** all block the request
+with `403` naming the rule and why; the event records it under `approval`. Without the approval window (on Linux),
+`approve` blocks. A request is held once, after its body is read, so the window can show what it contains:
+
+```toml
+[[rules]]
+id = "ask-before-sending-secrets"
+match = { finding = "secret.*" }
+action = "approve"
+severity = "high"
+```
+
+Ctrl+C in the console still stops gatewizz.
 
 ## Use with the wizz tools
 

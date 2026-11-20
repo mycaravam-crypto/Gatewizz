@@ -12,7 +12,8 @@
 # Ports a CONNECT may target. Any other port is blocked.
 # allowed_connect_ports = [443]
 
-# What happens to a request that no rule matches: "allow" or "block".
+# What happens to a request that no rule matches: "allow", "block" or
+# "approve".
 # default_action = "allow"
 
 [limits]
@@ -68,9 +69,20 @@
 # certificates or use mutual TLS. Exact names or "*.suffix".
 # tunnel_hosts = []
 
-# Allow/block rules. Keys under `match` are optional and must all hold; "block"
-# beats "allow"; with no match, general.default_action applies. A blocked
-# request gets 403 naming the rule, and nothing is sent upstream.
+[approval]
+# Seconds a request held by an "approve" rule waits for an answer in the
+# approval window; then it is blocked.
+# timeout_secs = 60
+
+# Requests that may wait at once; more are blocked. Without an open approval
+# window (the tray app on Windows), "approve" blocks too.
+# max_pending = 16
+
+# Rules. Keys under `match` are optional and must all hold. "block" beats
+# "approve" beats "allow"; with no match, general.default_action applies. A
+# blocked request gets 403 naming the rule, and nothing is sent upstream. An
+# "approve" request waits, with nothing sent upstream, until the approval
+# window allows it; deny, timeout or pause give 403.
 #
 # match keys: host / not_host (exact names or "*.suffix"), process (image file
 # name, e.g. "smartwizz.exe"), path_prefix, finding (a kind such as
@@ -88,6 +100,13 @@
 # match = { finding = "secret.*", not_host = ["llm.internal.example"] }
 # action = "block"
 # severity = "critical"
+#
+# Ask before a secret goes to any other host.
+# [[rules]]
+# id = "ask-before-sending-secrets"
+# match = { finding = "secret.*" }
+# action = "approve"
+# severity = "high"
 #
 # A tool may only talk to its model host.
 # [[rules]]

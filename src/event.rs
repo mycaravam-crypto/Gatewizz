@@ -57,6 +57,8 @@ pub struct Event {
     pub action: Option<Action>,
     /// The deciding rule's id, or `default`.
     pub rule: Option<String>,
+    /// How an `approve` decision was answered: approved once, granted, or why it was blocked.
+    pub approval: Option<&'static str>,
 }
 
 /// The current time as RFC 3339 UTC with milliseconds.
@@ -241,6 +243,7 @@ mod tests {
             bytes_down: None,
             action: None,
             rule: None,
+            approval: None,
         }
     }
 
@@ -268,6 +271,7 @@ mod tests {
             keys,
             [
                 "action",
+                "approval",
                 "bytes_down",
                 "bytes_up",
                 "client",

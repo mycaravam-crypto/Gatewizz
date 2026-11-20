@@ -18,6 +18,7 @@ pub struct Config {
     pub limits: Limits,
     pub events: Events,
     pub tls: Tls,
+    pub approval: Approval,
     /// Allow/block rules (#21); see `config/gatewizz.example.toml`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
@@ -111,6 +112,24 @@ pub struct Tls {
     pub tunnel_hosts: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Approval {
+    /// Seconds a held request waits for an answer before it is blocked.
+    pub timeout_secs: u64,
+    /// Requests that may wait at once; more are blocked.
+    pub max_pending: usize,
+}
+
+impl Default for Approval {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 60,
+            max_pending: 16,
+        }
+    }
+}
+
 /// Where events go once `[events].path` is resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventTarget {
@@ -170,6 +189,14 @@ impl Config {
                 return Err(format!("limits.{key}: must be at least 1"));
             }
         }
+        for (key, value) in [
+            ("timeout_secs", self.approval.timeout_secs),
+            ("max_pending", self.approval.max_pending as u64),
+        ] {
+            if value == 0 {
+                return Err(format!("approval.{key}: must be at least 1"));
+            }
+        }
         if l.max_connections > u32::MAX as usize {
             return Err("limits.max_connections: too large".into());
         }
@@ -210,6 +237,11 @@ impl Config {
                 max_bytes: l.max_body_bytes,
                 over_limit: l.over_limit,
             },
+            // The run replaces this with the queue it shares with the approval window.
+            approvals: std::sync::Arc::new(crate::approve::Approvals::new(
+                Duration::from_secs(self.approval.timeout_secs),
+                self.approval.max_pending,
+            )),
         }
     }
 
@@ -364,11 +396,12 @@ mod tests {
     #[test]
     fn rules_are_validated_with_their_index() {
         let approve = "[[rules]]\nid = \"hold\"\naction = \"approve\"\nseverity = \"high\"\n";
-        let err = Config::parse(approve).unwrap_err();
-        assert!(
-            err.contains("rules[0].action") && err.contains("M3"),
-            "{err}"
+        assert_eq!(
+            Config::parse(approve).unwrap().rules[0].action,
+            Action::Approve
         );
+        let err = Config::parse("[approval]\ntimeout_secs = 0").unwrap_err();
+        assert!(err.starts_with("approval.timeout_secs"), "{err}");
         let typo = "[[rules]]\nid = \"x\"\nmatch = { hots = [\"a\"] }\naction = \"block\"\nseverity = \"low\"\n";
         assert!(Config::parse(typo).unwrap_err().contains("hots"));
         let block_all = "[general]\ndefault_action = \"block\"\n";
