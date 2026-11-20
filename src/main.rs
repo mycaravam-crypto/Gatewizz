@@ -15,9 +15,9 @@ mod event;
 mod process;
 mod proxy;
 mod rules;
+mod startup;
 mod tls;
 mod ui;
-mod startup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -365,13 +365,22 @@ mod tests {
         );
         assert_eq!(parse(&args(&["ca", "install"])), Ok(Command::CaInstall));
         assert_eq!(parse(&args(&["ca", "remove"])), Ok(Command::CaRemove));
-        assert_eq!(parse(&args(&["startup", "install"])), Ok(Command::StartupInstall(None)));
+        assert_eq!(
+            parse(&args(&["startup", "install"])),
+            Ok(Command::StartupInstall(None))
+        );
         assert_eq!(
             parse(&args(&["startup", "install", "--config", "gatewizz.toml"])),
             Ok(Command::StartupInstall(Some("gatewizz.toml".into())))
         );
-        assert_eq!(parse(&args(&["startup", "remove"])), Ok(Command::StartupRemove));
-        assert_eq!(parse(&args(&["startup", "status"])), Ok(Command::StartupStatus));
+        assert_eq!(
+            parse(&args(&["startup", "remove"])),
+            Ok(Command::StartupRemove)
+        );
+        assert_eq!(
+            parse(&args(&["startup", "status"])),
+            Ok(Command::StartupStatus)
+        );
     }
 
     #[test]
