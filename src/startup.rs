@@ -122,13 +122,15 @@ pub struct SingleInstance(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl SingleInstance {
     pub fn acquire() -> Result<Option<Self>, String> {
-        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, SetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
 
         let name: Vec<u16> = "Local\\Gatewizz.SingleInstance"
             .encode_utf16()
             .chain([0])
             .collect();
+        // CreateMutexW only documents a last-error value for the already-exists case.
+        unsafe { SetLastError(0) };
         let handle = unsafe { CreateMutexW(None, 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(format!(
