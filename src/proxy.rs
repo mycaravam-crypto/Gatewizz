@@ -1505,6 +1505,77 @@ mod tests {
         head + &String::from_utf8(body).unwrap()
     }
 
+    /// An upstream that keeps each connection open and answers every request head with `200 ok`.
+    async fn keep_alive_upstream() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                            pending.drain(..end + 4);
+                            let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                            if stream.write_all(reply).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Median latency of `count` bodyless GETs to `upstream`, sent one after another on one
+    /// keep-alive connection to `via` (the upstream itself, or the proxy).
+    async fn median_get_latency(via: SocketAddr, upstream: SocketAddr, count: usize) -> Duration {
+        let mut client = TcpStream::connect(via).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        let request = format!("GET http://{upstream}/ HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+        let mut samples = Vec::with_capacity(count);
+        for _ in 0..count {
+            let started = std::time::Instant::now();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let response = read_response(&mut client).await;
+            samples.push(started.elapsed());
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        samples.sort();
+        samples[count / 2]
+    }
+
+    /// PLAN.md budget: under 5 ms added p50 for requests without a body. Compares the same
+    /// keep-alive GET loop sent directly and through the proxy, after a warm-up that absorbs
+    /// connection setup and process attribution. powerwizz remains the real-world measurement.
+    #[tokio::test]
+    async fn bodyless_requests_stay_within_the_latency_budget() {
+        const BUDGET: Duration = Duration::from_millis(5);
+        const WARM_UP: usize = 20;
+        const SAMPLES: usize = 200;
+
+        let (proxy, mut events) = start(Settings::default()).await;
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let upstream = keep_alive_upstream().await;
+
+        median_get_latency(upstream, upstream, WARM_UP).await;
+        median_get_latency(proxy, upstream, WARM_UP).await;
+        let direct = median_get_latency(upstream, upstream, SAMPLES).await;
+        let proxied = median_get_latency(proxy, upstream, SAMPLES).await;
+        let added = proxied.saturating_sub(direct);
+        eprintln!("latency p50: direct {direct:?}, through proxy {proxied:?}, added {added:?}");
+        assert!(
+            added < BUDGET,
+            "added p50 latency {added:?} exceeds the {BUDGET:?} budget (direct {direct:?}, proxied {proxied:?})"
+        );
+    }
+
     #[tokio::test]
     async fn keeps_the_client_connection_alive_across_requests() {
         let (proxy, mut events) = start(Settings::default()).await;
