@@ -68,7 +68,9 @@ try {
     Check 'startup remove is idempotent' ($r.Code -eq 0 -and $r.Text -match 'was not registered') $r.Text
 }
 finally {
+    # Put the machine back as it was, also when a step above threw.
     if ($before) { Set-ItemProperty -Path $runKey -Name Gatewizz -Value $before }
+    else { Remove-ItemProperty -Path $runKey -Name Gatewizz -ErrorAction SilentlyContinue }
 }
 
 if ($failures.Count) { throw "$($failures.Count) check(s) failed: $($failures -join '; ')" }
