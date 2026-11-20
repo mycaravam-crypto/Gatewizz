@@ -236,7 +236,12 @@ gatewizz firewall remove                           # remove the service, every f
   - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
   - `ask` blocks for now. It will prompt for unknown connections once the background service and approval prompt exist (#59).
 
-Not yet: the approval prompt for blocked connections, and rules added from it. The service already detects and logs the blocked connections. Sending them to the tray app and the prompt are the next steps of #59.
+- **The prompt pipe:** the service serves `\\.\pipe\gatewizz-fw`, which only SYSTEM, administrators and interactively logged-on users can open. Remote clients are rejected, and one client is served at a time. While a client is connected, each new blocked connection is sent to it as a notice: program, path, address, port and protocol. The client answers with a decision.
+  - **What the service accepts:** only answers to notices it sent itself, within the last 10 minutes. The program, address and port always come from that notice. An answer may only widen to "any host" or "any port", choose allow or block, and pick "once" (2 minutes), 5, 15, 60 or 480 minutes, or "always".
+  - **Where the rules go:** "always" rules are appended to the protected configuration as `[[connection_rules]]` (your text and comments stay) and validated first. Timed rules stay in the service's memory until they expire.
+  - **The service only asks:** with no client connected, nothing is asked and the connection stays blocked.
+
+Not yet: the prompt itself in the tray app, which is the client of this pipe. That is the next step of #59. Until then, `default = "ask"` blocks.
 
 ## Events and privacy
 

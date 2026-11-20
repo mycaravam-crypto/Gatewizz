@@ -251,8 +251,70 @@ fn log_to(path: &Path, max: u64, line: &str) {
 
 /// One refresh in the service: read the protected configuration and apply it.
 fn refresh() -> Result<String, String> {
-    let config = Config::load(&protected_config())?;
+    let mut config = Config::load(&protected_config())?;
+    config
+        .connection_rules
+        .extend(temporary_rules(SystemTime::now()));
     apply_config(&config, &service_self_paths())
+}
+
+/// Rules from the prompt that expire ("once", "for N minutes"): kept in the service's memory only, so a restart
+/// drops them. Permanent ones are written to the protected configuration instead.
+static TEMPORARY: std::sync::Mutex<Vec<firewall::Rule>> = std::sync::Mutex::new(Vec::new());
+
+/// The temporary rules still in force, forgetting the expired ones.
+fn temporary_rules(now: SystemTime) -> Vec<firewall::Rule> {
+    let mut rules = TEMPORARY.lock().unwrap_or_else(|e| e.into_inner());
+    keep_unexpired(&mut rules, now);
+    rules.clone()
+}
+
+/// Drops the rules whose expiry has passed; a rule without one never expires.
+fn keep_unexpired(rules: &mut Vec<firewall::Rule>, now: SystemTime) {
+    rules.retain(|r| r.expires.is_none_or(|at| now < at));
+}
+
+/// Appends a permanent rule from the prompt to the protected configuration, keeping the user's text, and refuses
+/// the change unless the result is a valid configuration.
+fn append_rule(rule: &firewall::Rule) -> Result<(), String> {
+    let path = protected_config();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    match with_rule(&text, rule)? {
+        Added::Appended(new) => write_atomic(&path, &new),
+        Added::Rewritten(new) => {
+            // The rewrite drops comments and layout, so the original is kept next to it.
+            write_atomic(&path.with_extension("toml.bak"), &text)?;
+            write_atomic(&path, &new)
+        }
+    }
+}
+
+/// A configuration text with one more connection rule.
+#[derive(Debug, PartialEq)]
+enum Added {
+    /// The rule appended as a `[[connection_rules]]` table: the user's text and comments stay as they are.
+    Appended(String),
+    /// Appending would not parse (the file writes `connection_rules = [...]` inline), so the whole configuration
+    /// was serialized again with the rule added.
+    Rewritten(String),
+}
+
+fn with_rule(text: &str, rule: &firewall::Rule) -> Result<Added, String> {
+    let appended = format!("{text}{}", crate::prompt::rule_toml(rule));
+    if Config::parse(&appended).is_ok() {
+        return Ok(Added::Appended(appended));
+    }
+    let mut config = Config::parse(text)
+        .map_err(|e| format!("[firewall] the protected configuration is not valid: {e}"))?;
+    config.connection_rules.push(rule.clone());
+    let rewritten = format!(
+        "# Rewritten by the firewall prompt to add {}; the previous file is firewall.toml.bak.\n{}",
+        rule.id,
+        config.effective()
+    );
+    Config::parse(&rewritten)
+        .map_err(|e| format!("[firewall] the prompt's rule would not be valid: {e}"))?;
+    Ok(Added::Rewritten(rewritten))
 }
 
 /// `firewall apply`: with the service installed, update its protected configuration and ask it to reload, then apply
@@ -381,9 +443,10 @@ impl DropWatch {
 /// Watches WFP drop events and logs one "blocked" notice per program, host and port and [`NOTICE_WINDOW`]. Only
 /// drops by Gatewizz's own filters count; their ids change on every apply, so an unknown id re-reads them (at most
 /// once a second).
-// ponytail: the notices only reach the log so far; the pipe to the tray and the prompt are the next #59 step.
+/// With `prompt`, each new notice also goes to the connected tray app, when the program's DOS path is known
+/// (the rule it may become needs it).
 #[cfg(windows)]
-fn watch_drops() -> Result<DropWatch, String> {
+fn watch_drops(prompt: Option<std::sync::Arc<PromptState>>) -> Result<DropWatch, String> {
     let (tx, rx) = std::sync::mpsc::channel::<wfp::Dropped>();
     let subscription = wfp::subscribe_drops(tx)?;
     let thread = std::thread::Builder::new()
@@ -409,6 +472,9 @@ fn watch_drops() -> Result<DropWatch, String> {
                     std::time::Instant::now(),
                 ) {
                     log(&blocked_line(&dropped));
+                    if let Some(prompt) = &prompt {
+                        prompt.offer(&dropped);
+                    }
                 }
             }
         })
@@ -417,6 +483,124 @@ fn watch_drops() -> Result<DropWatch, String> {
         subscription,
         thread,
     })
+}
+
+/// What the prompt needs while the service runs: the notices sent, the pipe, and the drive map for device paths.
+#[cfg(windows)]
+struct PromptState {
+    outstanding: std::sync::Mutex<crate::prompt::Outstanding>,
+    server: crate::pipe::Server,
+    drives: Vec<(String, String)>,
+}
+
+#[cfg(windows)]
+impl PromptState {
+    /// Sends a notice for a blocked connection to the tray app, if one is connected and the program's path is
+    /// known. Without a tray app nothing is asked and the connection stays blocked (fail closed).
+    fn offer(&self, d: &wfp::Dropped) {
+        if !self.server.connected() {
+            return;
+        }
+        let Some(path) = crate::pipe::device_to_dos(&d.app, &self.drives) else {
+            log(&format!(
+                "not prompting for {}: no drive letter for its path",
+                d.app
+            ));
+            return;
+        };
+        let protocol = match d.protocol {
+            6 => firewall::Protocol::Tcp,
+            17 => firewall::Protocol::Udp,
+            _ => firewall::Protocol::Any,
+        };
+        let notice = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(
+                d.program(),
+                &path,
+                d.remote,
+                d.port,
+                protocol,
+                std::time::Instant::now(),
+            );
+        self.server.send(&crate::prompt::Message::Notice(notice));
+    }
+
+    /// Applies one decision from the tray app: validated against the notices sent, then written down (permanent)
+    /// or kept in memory (temporary), then applied by a reload. The tray app gets the outcome either way.
+    fn decide(&self, decision: &crate::prompt::Decision) {
+        let change = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .answer(decision, std::time::Instant::now(), SystemTime::now());
+        let outcome = change.and_then(|change| {
+            if change.permanent {
+                append_rule(&change.rule)?;
+            } else {
+                TEMPORARY
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(change.rule.clone());
+            }
+            sys::control(RELOAD)?;
+            Ok(format!("rule {} added", change.rule.id))
+        });
+        let (ok, message) = match outcome {
+            Ok(m) => (true, m),
+            Err(e) => (false, e),
+        };
+        log(&format!("prompt decision {}: {message}", decision.id));
+        self.server.send(&crate::prompt::Message::Result {
+            id: decision.id,
+            ok,
+            message,
+        });
+    }
+}
+
+/// The pipe server and the thread that applies the tray app's decisions.
+#[cfg(windows)]
+struct Prompt {
+    state: std::sync::Arc<PromptState>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+fn start_prompt() -> Result<Prompt, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<crate::prompt::Decision>();
+    // Who may open the pipe: crate::pipe::SDDL = "D:P(A;;GA;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;IU)", a protected DACL
+    // with SYSTEM full control, administrators and interactive users read/write, everyone else (network logons,
+    // services) refused; remote clients are rejected too. Pinned by pipe::tests, enforced by the restricted-token
+    // test. Opening the pipe still grants no rule: decisions only answer notices sent here (prompt::Outstanding).
+    let server = crate::pipe::serve(crate::pipe::NAME, crate::pipe::SDDL, tx)?;
+    let state = std::sync::Arc::new(PromptState {
+        outstanding: std::sync::Mutex::new(crate::prompt::Outstanding::new(256)),
+        server,
+        drives: crate::pipe::drives(),
+    });
+    let worker = state.clone();
+    let thread = std::thread::Builder::new()
+        .name("decisions".into())
+        .spawn(move || {
+            // Ends when the pipe server stops and drops its sender.
+            for decision in rx {
+                worker.decide(&decision);
+            }
+        })
+        .map_err(|e| format!("[firewall] cannot start the decision thread: {e}"))?;
+    Ok(Prompt { state, thread })
+}
+
+#[cfg(windows)]
+impl Prompt {
+    /// Stops the pipe server, which drops its decision sender and so ends the decision thread.
+    fn stop(self) {
+        self.state.server.stop();
+        let _ = self.thread.join();
+    }
 }
 
 /// The log line for a blocked connection: program, destination and the program's full (device) path.
@@ -725,8 +909,11 @@ mod sys {
         log("starting");
         // Apply before reporting "running", so `firewall install` returns with the rules in force.
         refresh_and_log();
-        // Blocked connections are reported from here on; the firewall works without them.
-        let drops = watch_drops()
+        // The prompt and the blocked-connection reports are extras: the firewall works without them.
+        let prompt = super::start_prompt()
+            .inspect_err(|err| log(&format!("error: {err}; the firewall prompt is off")))
+            .ok();
+        let drops = watch_drops(prompt.as_ref().map(|p| p.state.clone()))
             .inspect_err(|err| {
                 log(&format!(
                     "error: {err}; blocked connections are not reported"
@@ -737,6 +924,9 @@ mod sys {
         serve(&rx);
         if let Some(drops) = drops {
             drops.stop();
+        }
+        if let Some(prompt) = prompt {
+            prompt.stop();
         }
         log("stopped; the filters stay in force");
         report(handle, SERVICE_STOPPED, 0);
@@ -914,6 +1104,88 @@ mod tests {
             ..d
         };
         assert!(blocked_line(&v6).contains("-> [2001:db8::1]:443 udp"));
+    }
+
+    #[test]
+    fn temporary_rules_expire_and_join_the_applied_rules() {
+        let now = SystemTime::now();
+        let rule = |id: &str, expires: Option<SystemTime>| firewall::Rule {
+            id: id.into(),
+            process: vec![r"C:\Tools\curl.exe".into()],
+            host: Vec::new(),
+            ip: Vec::new(),
+            port: vec![443],
+            protocol: firewall::Protocol::Tcp,
+            action: firewall::RuleAction::Allow,
+            expires,
+        };
+        let mut rules = vec![
+            rule("once", Some(now + Duration::from_secs(120))),
+            rule("gone", Some(now - Duration::from_secs(1))),
+            rule("edge", Some(now)),
+            rule("kept", None),
+        ];
+        keep_unexpired(&mut rules, now);
+        let ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["once", "kept"], "expired at or before now is gone");
+        // Two minutes on, "once" is gone too.
+        keep_unexpired(&mut rules, now + Duration::from_secs(120));
+        assert_eq!(rules.len(), 1);
+
+        // The applied set is the configured rules plus the temporary ones.
+        let mut config =
+            Config::parse("[[connection_rules]]\nid = \"cfg\"\nport = [80]\naction = \"block\"\n")
+                .unwrap();
+        config.connection_rules.extend(rules);
+        let ids: Vec<&str> = config
+            .connection_rules
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, ["cfg", "kept"]);
+    }
+
+    #[test]
+    fn prompt_rules_append_and_fall_back_to_a_rewrite() {
+        let rule = firewall::Rule {
+            id: "prompt-allow-curl.exe-1-1".into(),
+            process: vec![r"C:\Tools\curl.exe".into()],
+            host: Vec::new(),
+            ip: Vec::new(),
+            port: vec![443],
+            protocol: firewall::Protocol::Tcp,
+            action: firewall::RuleAction::Allow,
+            expires: None,
+        };
+        // Usual files, ending in any table: appended, the user's text kept.
+        for text in [
+            "",
+            "# mine\n[firewall]\ndefault = \"ask\"\n",
+            "[[connection_rules]]\nid = \"a\"\naction = \"block\"\n[monitor]\nenabled = true",
+        ] {
+            let Added::Appended(new) = with_rule(text, &rule).unwrap() else {
+                panic!("expected an append for {text:?}");
+            };
+            assert!(new.starts_with(text));
+            let rules = Config::parse(&new).unwrap().connection_rules;
+            assert_eq!(rules.last().unwrap().id, rule.id);
+        }
+        // An inline `connection_rules = [...]` cannot take a [[connection_rules]] table: rewritten instead, with
+        // every rule kept.
+        let inline = "connection_rules = [{ id = \"a\", action = \"block\" }]\n";
+        let Added::Rewritten(new) = with_rule(inline, &rule).unwrap() else {
+            panic!("expected a rewrite");
+        };
+        let ids: Vec<String> = Config::parse(&new)
+            .unwrap()
+            .connection_rules
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["a", rule.id.as_str()]);
+        assert!(new.starts_with("# Rewritten by the firewall prompt"));
+        // A broken protected configuration is refused, never overwritten.
+        assert!(with_rule("[firewall\n", &rule).is_err());
     }
 
     #[test]

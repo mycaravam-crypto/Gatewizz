@@ -129,6 +129,39 @@ try {
     Restart-Service gatewizz-fw
     Check 'filters survive a service restart' ((Filter-Count) -eq $count + 1) "filters: $(Filter-Count)"
 
+    # The prompt loop over the pipe, as the tray app will run it: a blocked connection becomes a notice, and an
+    # "allow once" answer becomes a temporary rule, i.e. one more filter.
+    Check 'service serves the prompt pipe' ([bool](Get-ChildItem '\\.\pipe\' | Where-Object Name -eq 'gatewizz-fw'))
+    # Asynchronous: synchronous I/O on one pipe handle is serialized, so a pending read would block a write.
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'gatewizz-fw', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+    $pipe.Connect(5000)
+    $reader = New-Object System.IO.StreamReader($pipe)
+    $writer = New-Object System.IO.StreamWriter($pipe)
+    $writer.AutoFlush = $true
+    $before = Filter-Count
+    $pending = $reader.ReadLineAsync()
+    # 192.0.2.2:9 is blocked by smoke-block-two and has not been tried yet, so this attempt is a new notice.
+    & curl.exe -s -o NUL --max-time 5 http://192.0.2.2:9/ 2>$null
+    $notice = if ($pending.Wait(20000)) { $pending.Result | ConvertFrom-Json } else { $null }
+    Check 'a blocked connection reaches the pipe as a notice' (
+        $notice -and $notice.type -eq 'notice' -and $notice.program -eq 'curl.exe' -and $notice.port -eq 9 -and
+        $notice.remote -eq '192.0.2.2') "$($notice | ConvertTo-Json -Compress)"
+    if ($notice) {
+        $writer.WriteLine((@{ type = 'decision'; id = $notice.id; action = 'allow'; lasting = 'once' } | ConvertTo-Json -Compress))
+        $pending = $reader.ReadLineAsync()
+        $result = if ($pending.Wait(20000)) { $pending.Result | ConvertFrom-Json } else { $null }
+        Check 'the decision is accepted' ($result -and $result.type -eq 'result' -and $result.ok) "$($result | ConvertTo-Json -Compress)"
+        Check 'the temporary rule adds its filter' (Wait-Until { (Filter-Count) -eq $before + 1 }) "filters: $(Filter-Count), before $before"
+        # A made-up id is refused: the service only accepts answers to notices it sent.
+        $writer.WriteLine((@{ type = 'decision'; id = 999999; action = 'allow'; lasting = 'always' } | ConvertTo-Json -Compress))
+        $pending = $reader.ReadLineAsync()
+        $forged = if ($pending.Wait(20000)) { $pending.Result | ConvertFrom-Json } else { $null }
+        Check 'a forged decision is refused' ($forged -and -not $forged.ok -and $forged.message -match 'unknown') "$($forged | ConvertTo-Json -Compress)"
+    }
+    $pipe.Dispose()
+    Check 'the protected config is unchanged by temporary and forged decisions' (
+        -not ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'prompt-'))
+
     $r = Invoke-Gatewizz @('firewall', 'status')
     Check 'status shows the running service' ($r.Code -eq 0 -and $r.Text -match 'running') $r.Text
 }
