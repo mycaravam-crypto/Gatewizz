@@ -21,8 +21,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::timeout;
 
+type UpstreamSender = hyper::client::conn::http1::SendRequest<Incoming>;
+
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
+use crate::tls::{Interceptor, UpstreamTlsFailure};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -55,6 +58,8 @@ pub struct Settings {
     pub idle_timeout: Duration,
     /// On shutdown, in-flight requests get this long to finish.
     pub shutdown_timeout: Duration,
+    /// Decrypts CONNECT tunnels when set; without it every CONNECT is a blind tunnel (M1 behaviour).
+    pub tls: Option<Arc<Interceptor>>,
 }
 
 impl Default for Settings {
@@ -68,6 +73,7 @@ impl Default for Settings {
             response_timeout: Duration::from_secs(120),
             idle_timeout: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(10),
+            tls: None,
         }
     }
 }
@@ -245,25 +251,10 @@ async fn forward(
         Ok(stream) => stream,
         Err(failure) => return refuse(ctx, event, failure.status(), failure.reason()).await,
     };
+    // ponytail: bodies are not inspected before #20, so plain HTTP is only partially inspected.
     event.coverage = Coverage::PartiallyInspected;
-
-    let origin_form = req
-        .uri()
-        .path_and_query()
-        .map_or("/", |pq| pq.as_str())
-        .parse::<Uri>()
-        .unwrap_or_else(|_| Uri::from_static("/"));
     let authority = req.uri().authority().map(|a| a.as_str().to_string());
-    *req.uri_mut() = origin_form;
-    strip_hop_by_hop(req.headers_mut());
-    // hyper already answered `100 Continue` to the client when it read the body.
-    req.headers_mut().remove(header::EXPECT);
-    if !req.headers().contains_key(header::HOST)
-        && let Some(value) = authority.and_then(|a| HeaderValue::from_str(&a).ok())
-    {
-        req.headers_mut().insert(header::HOST, value);
-    }
-
+    to_origin_form(&mut req, authority);
     let (mut sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
             Ok(pair) => pair,
@@ -280,6 +271,35 @@ async fn forward(
     // Ends when the response body is consumed or dropped (client gone).
     tokio::spawn(conn);
     // ponytail: one upstream connection per request, no pooling; add a pool if the latency budget needs it.
+    relay(ctx, event, &mut sender, req).await
+}
+
+/// Turns a proxy request into what the upstream expects: origin-form target, no hop-by-hop headers, a `Host`.
+fn to_origin_form(req: &mut Request<Incoming>, authority: Option<String>) {
+    let origin_form = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |pq| pq.as_str())
+        .parse::<Uri>()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+    *req.uri_mut() = origin_form;
+    strip_hop_by_hop(req.headers_mut());
+    // hyper already answered `100 Continue` to the client when it read the body.
+    req.headers_mut().remove(header::EXPECT);
+    if !req.headers().contains_key(header::HOST)
+        && let Some(value) = authority.and_then(|a| HeaderValue::from_str(&a).ok())
+    {
+        req.headers_mut().insert(header::HOST, value);
+    }
+}
+
+/// Sends one request on an established upstream connection and returns the response, recording the event.
+async fn relay(
+    ctx: &Ctx,
+    mut event: Event,
+    sender: &mut UpstreamSender,
+    req: Request<Incoming>,
+) -> Response<Body> {
     let response = match timeout(ctx.settings.response_timeout, sender.send_request(req)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => return refuse(ctx, event, StatusCode::BAD_GATEWAY, "upstream failed").await,
@@ -342,6 +362,11 @@ async fn tunnel(
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
+    if let Some(interceptor) = ctx.settings.tls.clone()
+        && !interceptor.tunnels(&host)
+    {
+        return intercept(ctx, interceptor, event, host, port, req).await;
+    }
     let upstream = match connect_upstream(&ctx, &host, port).await {
         Ok(stream) => stream,
         Err(failure) => return refuse(&ctx, event, failure.status(), failure.reason()).await,
@@ -361,6 +386,185 @@ async fn tunnel(
         ctx.emit(event).await;
     });
     Response::new(Empty::new().map_err(|never| match never {}).boxed())
+}
+
+/// Opens and verifies the upstream TLS connection first, so a bad upstream certificate is answered with 502 before
+/// the client sends anything. Then the client's TLS is terminated with a leaf for `host`, and each decrypted request
+/// goes through [`inside`], always to `host`.
+async fn intercept(
+    ctx: Arc<Ctx>,
+    interceptor: Arc<Interceptor>,
+    mut event: Event,
+    host: String,
+    port: u16,
+    req: Request<Incoming>,
+) -> Response<Body> {
+    let acceptor = match interceptor.acceptor(&host) {
+        Ok(acceptor) => acceptor,
+        Err(err) => {
+            eprintln!("gatewizz: no certificate for {host}: {err}");
+            return refuse(
+                &ctx,
+                event,
+                StatusCode::BAD_GATEWAY,
+                "no certificate for this host",
+            )
+            .await;
+        }
+    };
+    let sender = match upstream_tls(&ctx, &interceptor, &host, port).await {
+        Ok(sender) => sender,
+        Err((status, reason)) => return refuse(&ctx, event, status, reason).await,
+    };
+    let upstream = Arc::new(tokio::sync::Mutex::new(sender));
+    tokio::spawn(async move {
+        let Ok(upgraded) = hyper::upgrade::on(req).await else {
+            event.reason = Some("client left before the tunnel opened");
+            ctx.emit(event).await;
+            return;
+        };
+        let handshake = timeout(
+            ctx.settings.header_timeout,
+            acceptor.accept(TokioIo::new(upgraded)),
+        );
+        let Ok(Ok(client_tls)) = handshake.await else {
+            // Pinning, a private trust store or a missing CA install: never fall back to a blind tunnel.
+            event.status = StatusCode::OK.as_u16();
+            event.reason = Some("client rejected the gatewizz certificate");
+            ctx.emit(event).await;
+            return;
+        };
+        let (client, process) = (event.client, event.process.clone());
+        let svc_ctx = ctx.clone();
+        let svc = service_fn(move |req| {
+            let (ctx, interceptor, upstream) =
+                (svc_ctx.clone(), interceptor.clone(), upstream.clone());
+            let (host, process) = (host.clone(), process.clone());
+            async move {
+                Ok::<_, Infallible>(
+                    inside(
+                        &ctx,
+                        &interceptor,
+                        &upstream,
+                        client,
+                        process,
+                        &host,
+                        port,
+                        req,
+                    )
+                    .await,
+                )
+            }
+        });
+        // ponytail: like blind tunnels, decrypted tunnels are not drained on shutdown; they end with the runtime.
+        let _ = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(ctx.settings.header_timeout)
+            .max_header_size(ctx.settings.max_header_bytes)
+            .serve_connection(TokioIo::new(client_tls), svc)
+            .await;
+    });
+    Response::new(Empty::new().map_err(|never| match never {}).boxed())
+}
+
+/// TCP plus verified TLS to the upstream, then an HTTP/1.1 connection on it.
+async fn upstream_tls(
+    ctx: &Ctx,
+    interceptor: &Interceptor,
+    host: &str,
+    port: u16,
+) -> Result<UpstreamSender, (StatusCode, &'static str)> {
+    let tcp = connect_upstream(ctx, host, port)
+        .await
+        .map_err(|failure| (failure.status(), failure.reason()))?;
+    let tls = match timeout(ctx.settings.connect_timeout, interceptor.connect(tcp, host)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(UpstreamTlsFailure::Certificate)) => {
+            return Err((StatusCode::BAD_GATEWAY, "upstream certificate rejected"));
+        }
+        Ok(Err(UpstreamTlsFailure::Handshake)) => {
+            return Err((StatusCode::BAD_GATEWAY, "upstream TLS handshake failed"));
+        }
+        Err(_) => return Err((StatusCode::GATEWAY_TIMEOUT, "upstream connect timeout")),
+    };
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "upstream handshake failed"))?;
+    tokio::spawn(conn);
+    Ok(sender)
+}
+
+/// One decrypted request in a tunnel to `host`. It always goes to `host`: a `Host` header naming anything else is
+/// refused, so a tunnel to an allowed host cannot reach another site behind the same server (domain fronting).
+#[allow(clippy::too_many_arguments)]
+async fn inside(
+    ctx: &Ctx,
+    interceptor: &Interceptor,
+    upstream: &tokio::sync::Mutex<UpstreamSender>,
+    client: SocketAddr,
+    process: Process,
+    host: &str,
+    port: u16,
+    mut req: Request<Incoming>,
+) -> Response<Body> {
+    let event = Event {
+        time: event::now(),
+        client,
+        process,
+        method: req.method().to_string(),
+        host: host.to_string(),
+        port,
+        path: req.uri().path().to_string(),
+        // ponytail: bodies are not inspected before #20, so decrypted requests are only partially inspected.
+        coverage: Coverage::PartiallyInspected,
+        status: 0,
+        reason: None,
+        bytes_up: None,
+        bytes_down: None,
+    };
+    let named = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<hyper::http::uri::Authority>().ok());
+    if named.is_some_and(|authority| {
+        !authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .eq_ignore_ascii_case(host)
+    }) {
+        let mut event = event;
+        event.coverage = Coverage::Blocked;
+        return refuse(
+            ctx,
+            event,
+            StatusCode::MISDIRECTED_REQUEST,
+            "Host header does not match the tunnel",
+        )
+        .await;
+    }
+    let authority = if port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    to_origin_form(&mut req, Some(authority));
+    let mut sender = upstream.lock().await;
+    // The upstream may have closed the idle connection between two requests; reconnecting then is not a retry,
+    // because nothing of this request was sent yet.
+    if sender.ready().await.is_err() {
+        match upstream_tls(ctx, interceptor, host, port).await {
+            Ok(fresh) => *sender = fresh,
+            Err((status, reason)) => {
+                let mut event = event;
+                event.coverage = Coverage::Blocked;
+                return refuse(ctx, event, status, reason).await;
+            }
+        }
+    }
+    // The lock is held until the response head arrives; HTTP/1.1 serves one request at a time anyway.
+    relay(ctx, event, &mut sender, req).await
 }
 
 /// Answers the client directly, records the event and closes the connection.

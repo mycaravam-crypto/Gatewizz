@@ -175,6 +175,8 @@ impl Config {
             response_timeout: Duration::from_secs(l.response_timeout_secs),
             idle_timeout: Duration::from_secs(l.idle_timeout_secs),
             shutdown_timeout: Duration::from_secs(l.shutdown_timeout_secs),
+            // Interception is wired to the CA by #18; until then every CONNECT stays a blind tunnel.
+            tls: None,
         }
     }
 
