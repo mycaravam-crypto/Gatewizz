@@ -2,7 +2,12 @@
 //!
 //! The pure part is a bounded cache with TTL expiry. Each IP keeps the few names it was most recently resolved for;
 //! a lookup prefers the name the same process asked for and otherwise takes the most recent one. On Windows the cache
-//! is filled from the DNS Client service's cache, which a normal user can read.
+//! is filled from the DNS Client service's cache, which a normal user can read: the cache lists the names it holds,
+//! and each listed name is resolved through the DNS Client again, at most once per TTL. A fresh entry is answered
+//! from the cache, so this normally causes no network traffic.
+//!
+//! A cache-only query (`DNS_QUERY_NO_WIRE_QUERY`) would avoid the wire entirely, but on current Windows it finds only
+//! static entries (the machine's own name, `hosts`), not the names apps looked up; CI showed this (#62).
 //!
 //! ponytail: the Windows source is `DnsGetCacheDataTable`, which is undocumented, gives no process ID and misses
 //! lookups done outside the DNS Client (DoH inside a browser, `hosts` overrides read by apps themselves). The ETW
@@ -39,6 +44,8 @@ pub struct Cache {
     capacity: usize,
     len: usize,
     map: HashMap<IpAddr, Vec<Entry>>,
+    /// (name, record type) → when it may be resolved again; bounds how often a listed name is looked up.
+    due: HashMap<(String, u16), Instant>,
 }
 
 impl Cache {
@@ -47,7 +54,39 @@ impl Cache {
             capacity: capacity.max(1),
             len: 0,
             map: HashMap::new(),
+            due: HashMap::new(),
         }
+    }
+
+    /// Whether `name` (record type `kind`) should be resolved again: never resolved, or its TTL has run out.
+    pub fn is_due(&self, name: &str, kind: u16, now: Instant) -> bool {
+        self.due
+            .get(&(name.to_ascii_lowercase(), kind))
+            .is_none_or(|at| now >= *at)
+    }
+
+    /// Notes that `name` was just resolved and its answers last `ttl` (at least [`MIN_TTL`], also when it had none).
+    pub fn resolved(&mut self, name: &str, kind: u16, ttl: Duration, now: Instant) {
+        if self.due.len() >= self.capacity {
+            self.due.retain(|_, at| *at > now);
+            if self.due.len() >= self.capacity {
+                self.due.clear();
+            }
+        }
+        self.due
+            .insert((name.to_ascii_lowercase(), kind), now + ttl.max(MIN_TTL));
+    }
+
+    /// Every live name recorded for `ip`.
+    #[cfg(test)]
+    fn names(&self, ip: IpAddr, now: Instant) -> Vec<&str> {
+        self.map.get(&ip).map_or_else(Vec::new, |entries| {
+            entries
+                .iter()
+                .filter(|e| e.expires > now)
+                .map(|e| e.name.as_str())
+                .collect()
+        })
     }
 
     #[cfg(test)]
@@ -143,14 +182,27 @@ pub struct Answer {
     pub ttl: Duration,
 }
 
-/// Every A and AAAA answer currently in the Windows DNS Client cache.
+/// Brings `cache` up to date with the Windows DNS Client cache: every A and AAAA name it lists that is due is resolved
+/// and its addresses recorded.
 #[cfg(windows)]
-pub fn system_answers() -> Result<Vec<Answer>, String> {
-    sys::answers()
+pub fn refresh(cache: &mut Cache, now: Instant) -> Result<(), String> {
+    for (name, kind) in sys::listed()? {
+        if !cache.is_due(&name, kind, now) {
+            continue;
+        }
+        let answers = sys::resolve(&name, kind);
+        let ttl = answers.iter().map(|a| a.ttl).min().unwrap_or(MIN_TTL);
+        for a in &answers {
+            // The name the app asked for, not the end of a CNAME chain.
+            cache.insert(a.ip, &name, None, a.ttl, now);
+        }
+        cache.resolved(&name, kind, ttl, now);
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn system_answers() -> Result<Vec<Answer>, String> {
+pub fn refresh(_cache: &mut Cache, _now: Instant) -> Result<(), String> {
     Err("[monitor] the DNS cache is read only on Windows".into())
 }
 
@@ -162,7 +214,7 @@ mod sys {
     use std::ptr::null_mut;
     use std::time::Duration;
     use windows_sys::Win32::NetworkManagement::Dns::{
-        DNS_QUERY_NO_WIRE_QUERY, DNS_RECORDW, DNS_TYPE_A, DNS_TYPE_AAAA, DnsFree, DnsFreeFlat,
+        DNS_QUERY_STANDARD, DNS_RECORDW, DNS_TYPE_A, DNS_TYPE_AAAA, DnsFree, DnsFreeFlat,
         DnsFreeRecordList, DnsQuery_W,
     };
     use windows_sys::Win32::System::LibraryLoader::{
@@ -226,14 +278,16 @@ mod sys {
         Ok(names)
     }
 
-    pub fn answers() -> Result<Vec<Answer>, String> {
-        let mut out = Vec::new();
-        for (name, kind) in cached_names()? {
-            if kind == DNS_TYPE_A || kind == DNS_TYPE_AAAA {
-                query_cache(&name, kind, &mut out);
-            }
-        }
-        Ok(out)
+    /// The A and AAAA names the cache lists, without NUL, deduplicated.
+    pub fn listed() -> Result<Vec<(String, u16)>, String> {
+        let mut names: Vec<(String, u16)> = cached_names()?
+            .into_iter()
+            .filter(|(_, kind)| *kind == DNS_TYPE_A || *kind == DNS_TYPE_AAAA)
+            .map(|(name, kind)| (String::from_utf16_lossy(&name[..name.len() - 1]), kind))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
     }
 
     /// Copies a NUL-terminated UTF-16 string, NUL included.
@@ -248,23 +302,24 @@ mod sys {
         v
     }
 
-    /// Looks `name` up in the cache only (never on the wire) and appends its addresses.
-    fn query_cache(name: &[u16], kind: u16, out: &mut Vec<Answer>) {
+    /// Resolves `name` through the DNS Client, which answers a fresh entry from its cache.
+    pub fn resolve(name: &str, kind: u16) -> Vec<Answer> {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let mut out = Vec::new();
         let mut records = null_mut();
         let rc = unsafe {
             DnsQuery_W(
-                name.as_ptr(),
+                wide.as_ptr(),
                 kind,
-                DNS_QUERY_NO_WIRE_QUERY,
+                DNS_QUERY_STANDARD,
                 null_mut(),
                 &mut records,
                 null_mut(),
             )
         };
         if rc != 0 || records.is_null() {
-            return;
+            return out;
         }
-        let text = String::from_utf16_lossy(&name[..name.len() - 1]);
         let mut r = records.cast::<DNS_RECORDW>();
         while !r.is_null() {
             let rec = unsafe { &*r };
@@ -280,7 +335,7 @@ mod sys {
             };
             if let Some(ip) = ip {
                 out.push(Answer {
-                    name: text.clone(),
+                    name: name.to_string(),
                     ip,
                     ttl: Duration::from_secs(rec.dwTtl.into()),
                 });
@@ -288,6 +343,7 @@ mod sys {
             r = rec.pNext;
         }
         unsafe { DnsFree(records as *const c_void, DnsFreeRecordList) };
+        out
     }
 }
 
@@ -417,39 +473,56 @@ mod tests {
         assert_eq!(c.len(), 0);
     }
 
-    /// The real DNS Client cache holds a name right after the system resolver looked it up.
+    #[test]
+    fn listed_names_are_resolved_again_only_after_their_ttl() {
+        let now = Instant::now();
+        let mut c = Cache::new(16);
+        assert!(c.is_due("Example.com", 1, now));
+        c.resolved("example.com", 1, Duration::from_secs(300), now);
+        assert!(!c.is_due("EXAMPLE.com", 1, now + Duration::from_secs(299)));
+        assert!(c.is_due("example.com", 1, now + Duration::from_secs(300)));
+        // Another record type is tracked on its own.
+        assert!(c.is_due("example.com", 28, now));
+        // A name without answers waits at least MIN_TTL.
+        c.resolved("gone.example", 1, Duration::ZERO, now);
+        assert!(!c.is_due("gone.example", 1, now + MIN_TTL - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn resolved_names_are_bounded() {
+        let now = Instant::now();
+        let mut c = Cache::new(4);
+        for i in 0..50 {
+            c.resolved(&format!("n{i}.example"), 1, Duration::from_secs(300), now);
+            assert!(c.due.len() <= 4);
+        }
+    }
+
+    /// After the system resolver looks a name up, a refresh maps its addresses back to it.
     #[cfg(windows)]
     #[test]
-    fn system_cache_contains_a_fresh_lookup() {
+    fn refresh_maps_a_fresh_lookup_back_to_its_name() {
         use std::net::ToSocketAddrs;
         let Ok(addrs) = ("example.com", 443).to_socket_addrs() else {
             eprintln!("no DNS on this machine; skipped");
             return;
         };
         let addrs: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-        let answers = system_answers().unwrap();
-        let found = answers
+        let now = Instant::now();
+        let mut cache = Cache::new(4096);
+        refresh(&mut cache, now).unwrap();
+        let found = addrs
             .iter()
-            .any(|a| a.name.eq_ignore_ascii_case("example.com") && addrs.contains(&a.ip));
+            .any(|ip| cache.names(*ip, now).contains(&"example.com"));
         if !found {
-            // Say which step lost it: the cache listing, the cache-only query, or the cache itself.
-            let listed: Vec<String> = sys::cached_names()
-                .unwrap()
-                .iter()
-                .map(|(n, k)| format!("{}/{k}", String::from_utf16_lossy(&n[..n.len() - 1])))
-                .collect();
-            let displaydns = std::process::Command::new("ipconfig")
-                .arg("/displaydns")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default();
-            let shown: Vec<&str> = displaydns
-                .lines()
-                .filter(|l| l.to_ascii_lowercase().contains("example"))
-                .collect();
+            let listed = sys::listed().unwrap();
+            let names: Vec<_> = addrs.iter().map(|ip| (ip, cache.names(*ip, now))).collect();
             panic!(
-                "example.com {addrs:?} not in cached answers {answers:?}\nlisted: {listed:?}\nipconfig /displaydns: {shown:?}"
+                "example.com {addrs:?} not mapped back: {names:?}\nlisted: {listed:?}\nresolve: {:?}",
+                sys::resolve("example.com", 1)
             );
         }
+        // A second refresh right away resolves nothing again.
+        assert!(!cache.is_due("example.com", 1, now));
     }
 }

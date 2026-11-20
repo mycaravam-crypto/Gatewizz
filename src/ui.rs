@@ -113,6 +113,20 @@ fn network_groups<'a>(
     groups
 }
 
+/// The distinct PIDs behind a group of connections, in ascending order.
+fn process_ids(list: &[&crate::connections::LiveConnection]) -> Vec<u32> {
+    let mut pids: Vec<u32> = list
+        .iter()
+        .filter_map(|c| match c.process {
+            Process::Known { pid, .. } => Some(pid),
+            Process::Unknown(_) => None,
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 #[cfg(windows)]
 pub use app::run;
 
@@ -136,7 +150,9 @@ mod app {
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
-    use super::{TrayState, countdown, duration_label, icon_rgba, network_groups, program};
+    use super::{
+        TrayState, countdown, duration_label, icon_rgba, network_groups, process_ids, program,
+    };
     use crate::approve::{Approvals, Held, Verdict, Window};
     use crate::connections::{Direction, Live};
     use crate::process::Process;
@@ -1532,13 +1548,16 @@ mod app {
                                             .size(12.0)
                                             .color(SUBTLE),
                                     );
-                                    if let Some(Process::Known { pid, .. }) =
-                                        list.first().map(|c| &c.process)
-                                    {
+                                    // Several instances of one program share a group; name the PID only
+                                    // when there is one.
+                                    let label = match process_ids(list).as_slice() {
+                                        [] => None,
+                                        [pid] => Some(format!("PID {pid}")),
+                                        pids => Some(format!("{} processes", pids.len())),
+                                    };
+                                    if let Some(label) = label {
                                         ui.label(
-                                            RichText::new(format!("PID {pid}"))
-                                                .font(mono(11.5))
-                                                .color(SUBTLE),
+                                            RichText::new(label).font(mono(11.5)).color(SUBTLE),
                                         );
                                     }
                                 });
@@ -2061,9 +2080,18 @@ mod tests {
     use super::*;
 
     fn conn(image: &str, host: Option<&str>, remote: &str) -> crate::connections::LiveConnection {
+        conn_pid(1, image, host, remote)
+    }
+
+    fn conn_pid(
+        pid: u32,
+        image: &str,
+        host: Option<&str>,
+        remote: &str,
+    ) -> crate::connections::LiveConnection {
         crate::connections::LiveConnection {
             process: Process::Known {
-                pid: 1,
+                pid,
                 start: 1,
                 image: image.into(),
                 user: String::new(),
@@ -2095,6 +2123,18 @@ mod tests {
         let by_ip = network_groups(&list, "1.1.1.1");
         assert_eq!((by_ip.len(), by_ip[0].0.as_str()), (1, "curl.exe"));
         assert!(network_groups(&list, "nothing").is_empty());
+    }
+
+    #[test]
+    fn process_ids_counts_each_instance_once() {
+        let list = [
+            conn_pid(7, r"C:\\a\\app.exe", None, "1.1.1.1:443"),
+            conn_pid(3, r"C:\\a\\app.exe", None, "8.8.8.8:443"),
+            conn_pid(7, r"C:\\a\\app.exe", None, "9.9.9.9:443"),
+        ];
+        let refs: Vec<_> = list.iter().collect();
+        assert_eq!(process_ids(&refs), [3, 7]);
+        assert_eq!(process_ids(&refs[..1]), [7]);
     }
 
     #[test]

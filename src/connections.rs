@@ -382,6 +382,9 @@ impl Monitor {
     }
 }
 
+/// One event per process, remote address and state per this window (see [`Limiter`]).
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+
 /// How often the DNS cache may be re-read while connections to unknown addresses keep appearing.
 const DNS_REFRESH: Duration = Duration::from_secs(1);
 
@@ -400,7 +403,7 @@ pub fn start(
     let thread = std::thread::Builder::new()
         .name("monitor".into())
         .spawn(move || {
-            let mut tracker = Tracker::new(Duration::from_secs(10));
+            let mut tracker = Tracker::new(RATE_WINDOW);
             let mut dns = crate::dns::Cache::new(settings.dns_cache_size);
             let mut dns_read: Option<Instant> = None;
             loop {
@@ -438,9 +441,8 @@ pub fn start(
                                         .is_none_or(|at| now.duration_since(at) >= DNS_REFRESH)
                                 {
                                     dns_read = Some(now);
-                                    for a in crate::dns::system_answers().unwrap_or_default() {
-                                        dns.insert(a.ip, &a.name, None, a.ttl, now);
-                                    }
+                                    // ponytail: a failed read leaves the address unnamed until the next refresh.
+                                    let _ = crate::dns::refresh(&mut dns, now);
                                 }
                                 dns.lookup(ip, pid, now).map(str::to_string)
                             },

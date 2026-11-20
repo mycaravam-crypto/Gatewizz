@@ -24,7 +24,9 @@ function Check([string] $Name, [bool] $Ok, [string] $Detail = '') {
     else { Write-Host "FAIL  $Name`n$Detail"; $failures.Add($Name) }
 }
 
-$version = (Select-String -Path (Join-Path $PSScriptRoot '..\..\Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+$versionLine = Select-String -Path (Join-Path $PSScriptRoot '..\..\Cargo.toml') -Pattern '^version = "(.+)"' | Select-Object -First 1
+if (-not $versionLine) { throw 'Cargo.toml has no version = "..." line' }
+$version = $versionLine.Matches[0].Groups[1].Value
 
 $r = Invoke-Gatewizz '--version'
 Check '--version prints the crate version' ($r.Code -eq 0 -and $r.Text.Trim() -eq "gatewizz $version") $r.Text
