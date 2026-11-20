@@ -12,6 +12,9 @@
 # Ports a CONNECT may target. Any other port is blocked.
 # allowed_connect_ports = [443]
 
+# What happens to a request that no rule matches: "allow" or "block".
+# default_action = "allow"
+
 [limits]
 # Concurrent client connections; connections over the limit are closed.
 # max_connections = 512
@@ -64,3 +67,31 @@
 # Hosts that keep a blind tunnel even when intercepting: clients that pin
 # certificates or use mutual TLS. Exact names or "*.suffix".
 # tunnel_hosts = []
+
+# Allow/block rules. Keys under `match` are optional and must all hold; "block"
+# beats "allow"; with no match, general.default_action applies. A blocked
+# request gets 403 naming the rule, and nothing is sent upstream.
+#
+# match keys: host / not_host (exact names or "*.suffix"), process (image file
+# name, e.g. "smartwizz.exe"), path_prefix, finding (a kind such as
+# "secret.github_token", or "secret.*"), ai (true for requests to AI models).
+#
+# Rules on path, finding or ai cannot see inside a blind tunnel, so a "block"
+# rule using them blocks such tunnels (fail closed). Turn on [tls] intercept to
+# have them decided per request instead.
+#
+# Secrets go only to approved model hosts. An allowlist is one block rule with
+# not_host.
+# [[rules]]
+# id = "secrets-only-to-approved-models"
+# description = "Secrets may only be sent to the internal model gateway"
+# match = { finding = "secret.*", not_host = ["llm.internal.example"] }
+# action = "block"
+# severity = "critical"
+#
+# A tool may only talk to its model host.
+# [[rules]]
+# id = "smartwizz-only-to-gemini"
+# match = { process = ["smartwizz.exe"], not_host = ["generativelanguage.googleapis.com"] }
+# action = "block"
+# severity = "high"

@@ -416,6 +416,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rules_decide_each_decrypted_request() {
+        use crate::rules::{Action, Match, Rule, Severity};
+        let (gatewizz, origin) = (Arc::new(test_ca("gatewizz test")), test_ca("origin test"));
+        let (port, mut seen) = upstream(leaf(&origin, "localhost"), false).await;
+        let interceptor = {
+            let gatewizz = gatewizz.clone();
+            Interceptor::new(
+                Box::new(move |host: &str| Ok(leaf(&gatewizz, host))),
+                trusting(&origin),
+                Vec::new(),
+            )
+        };
+        let settings = Settings {
+            allowed_connect_ports: vec![port],
+            tls: Some(Arc::new(interceptor)),
+            rules: vec![Rule {
+                id: "no-admin".into(),
+                description: String::new(),
+                matches: Match {
+                    path_prefix: Some("/admin".into()),
+                    ..Match::default()
+                },
+                action: Action::Block,
+                severity: Severity::Medium,
+            }],
+            ..Settings::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events, mut received) = mpsc::channel(16);
+        tokio::spawn(serve(listener, settings, events, std::future::pending()));
+
+        // The CONNECT carries no path, so the path rule waits for the requests inside.
+        let (tcp, status) = connect(addr, port).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (mut sender, _) = handshake(tcp, &gatewizz).await.unwrap();
+        let host = format!("localhost:{port}");
+        assert_eq!(send(&mut sender, "GET", "/public", &host, "").await.0, 200);
+        let (status, body) = send(&mut sender, "GET", "/admin/users", &host, "").await;
+        assert_eq!(status, 403);
+        assert!(body.contains("no-admin"), "{body}");
+
+        assert!(seen.recv().await.unwrap().starts_with("GET /public"));
+        assert!(
+            timeout(Duration::from_millis(200), seen.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(next(&mut received).await.rule.as_deref(), Some("default"));
+        let blocked = next(&mut received).await;
+        assert_eq!(
+            (blocked.path.as_str(), blocked.rule.as_deref()),
+            ("/admin/users", Some("no-admin"))
+        );
+    }
+
+    #[tokio::test]
     async fn refuses_untrusted_and_wrong_host_upstreams() {
         let (gatewizz, origin) = (Arc::new(test_ca("gatewizz test")), test_ca("origin test"));
         let rogue = test_ca("rogue test");

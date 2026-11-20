@@ -55,6 +55,28 @@ gets `421`, so a tunnel to an allowed host cannot reach a different site behind 
 the gatewizz certificate is logged, never silently passed through. Without `ca install`, `intercept = true` stops
 gatewizz at startup instead of falling back to blind tunnels.
 
+## Rules
+
+`[[rules]]` in the config decide whether a request goes upstream. Every key under `match` is optional and all must
+hold: `host`, `not_host`, `process` (e.g. `smartwizz.exe`), `path_prefix`, `finding` (`secret.*` or one kind) and `ai`.
+`block` beats `allow`; with no match, `[general] default_action` (default `allow`) applies. A blocked request gets
+`403` naming the rule, its severity and the event time, and nothing is sent upstream. Every event records the action
+and the deciding rule (`default` when none matched). An allowlist is one `block` rule with `not_host`:
+
+```toml
+[[rules]]
+id = "secrets-only-to-approved-models"
+match = { finding = "secret.*", not_host = ["llm.internal.example"] }
+action = "block"
+severity = "critical"
+```
+
+Rules on `path_prefix`, `finding` or `ai` need to see inside the request. In a blind tunnel they cannot, so a `block`
+rule using them blocks the tunnel (fail closed); with `[tls] intercept` each decrypted request is decided instead.
+`finding` and `ai` are decided after the body is read: a body that was only partly inspected (over
+`[limits] max_body_bytes` with `over_limit = "allow"`, or compressed) counts as unknown, so a `block` rule on them
+applies.
+
 ## Tray and approvals
 
 On Windows, `gatewizz` shows a tray icon while it runs. Its colour shows the state: green when running, grey when paused,

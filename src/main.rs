@@ -14,6 +14,7 @@ mod detect;
 mod event;
 mod process;
 mod proxy;
+mod rules;
 mod tls;
 mod ui;
 

@@ -51,6 +51,7 @@ src/
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
 ├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
 ├── process.rs   # client process of a loopback connection via IP Helper, keyed by (pid, start) (#5)
+├── rules.rs     # allow/block rules: pure decide(), block beats allow, fail closed on unknown facts (#21)
 ├── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ├── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
 └── ui.rs        # tray icon and approval window (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35)

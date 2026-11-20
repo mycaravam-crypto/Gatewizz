@@ -26,6 +26,7 @@ type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
 use crate::detect::{self, BodyLimits, Inspected};
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
+use crate::rules::{self, Action, Content, Decision, Facts, Rule};
 use crate::tls::{Interceptor, UpstreamTlsFailure};
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -61,6 +62,9 @@ pub struct Settings {
     pub shutdown_timeout: Duration,
     /// Decrypts CONNECT tunnels when set; without it every CONNECT is a blind tunnel (M1 behaviour).
     pub tls: Option<Arc<Interceptor>>,
+    /// Allow/block rules, validated at config load.
+    pub rules: Vec<Rule>,
+    pub default_action: Action,
     /// How much of a request body is read and inspected before any request byte goes upstream.
     pub body: BodyLimits,
 }
@@ -77,6 +81,8 @@ impl Default for Settings {
             idle_timeout: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(10),
             tls: None,
+            rules: Vec::new(),
+            default_action: Action::Allow,
             body: BodyLimits::default(),
         }
     }
@@ -104,6 +110,8 @@ impl Event {
             reason: Some(reason),
             bytes_up: None,
             bytes_down: None,
+            action: None,
+            rule: None,
         }
     }
 }
@@ -115,6 +123,10 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn decide(&self, facts: &Facts<'_>) -> Decision {
+        rules::decide(facts, &self.settings.rules, self.settings.default_action)
+    }
+
     /// Waits when the event queue is full: events are never dropped.
     async fn emit(&self, event: Event) {
         // A closed receiver means shutdown; nothing is left to record to.
@@ -230,7 +242,7 @@ async fn forward(
     process: Process,
     mut req: Request<Incoming>,
 ) -> Response<Body> {
-    let event = Event {
+    let mut event = Event {
         time: event::now(),
         client,
         process,
@@ -245,6 +257,8 @@ async fn forward(
         reason: None,
         bytes_up: None,
         bytes_down: None,
+        action: None,
+        rule: None,
     };
     let Some((host, port)) = http_target(req.uri()) else {
         return refuse(
@@ -255,6 +269,18 @@ async fn forward(
         )
         .await;
     };
+    // Decided before the upstream connection is opened, so a blocked request sends it nothing.
+    let decision = ctx.decide(&Facts {
+        host: &host,
+        process: image_name(&event.process),
+        path: Some(&event.path),
+        // The body is read in `relay`; rules on its content are decided there.
+        content: None,
+        defer_content: true,
+    });
+    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+        return blocked;
+    }
     let upstream = match connect_upstream(ctx, &host, port).await {
         Ok(stream) => stream,
         Err(failure) => return refuse(ctx, event, failure.status(), failure.reason()).await,
@@ -321,6 +347,25 @@ async fn relay(
             return refuse(ctx, event, status, reason).await;
         }
     };
+    // The final decision, now that the body is known. Only a fully read body counts: for a partially inspected
+    // one, rules on findings or AI requests fail closed.
+    let decision = {
+        let kinds: Vec<&str> = event.findings.iter().map(|finding| finding.kind).collect();
+        let content = (event.coverage == Coverage::Inspected).then(|| Content {
+            findings: &kinds,
+            ai: event.model.is_some(),
+        });
+        ctx.decide(&Facts {
+            host: &event.host,
+            process: image_name(&event.process),
+            path: Some(&event.path),
+            content,
+            defer_content: false,
+        })
+    };
+    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+        return blocked;
+    }
     let response = match timeout(ctx.settings.response_timeout, sender.send_request(req)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => return refuse(ctx, event, StatusCode::BAD_GATEWAY, "upstream failed").await,
@@ -362,6 +407,8 @@ async fn tunnel(
         reason: None,
         bytes_up: None,
         bytes_down: None,
+        action: None,
+        rule: None,
     };
     let (Some(host), Some(port)) = (req.uri().host(), req.uri().port_u16()) else {
         return refuse(
@@ -385,9 +432,24 @@ async fn tunnel(
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
-    if let Some(interceptor) = ctx.settings.tls.clone()
-        && !interceptor.tunnels(&host)
-    {
+    let interceptor = ctx
+        .settings
+        .tls
+        .clone()
+        .filter(|interceptor| !interceptor.tunnels(&host));
+    // A blind tunnel shows only host and process. When the tunnel is decrypted, each request inside is decided on
+    // its own, so rules about paths and content wait for those.
+    let decision = ctx.decide(&Facts {
+        host: &host,
+        process: image_name(&event.process),
+        path: None,
+        content: None,
+        defer_content: interceptor.is_some(),
+    });
+    if let Some(blocked) = enforce(&ctx, &mut event, decision).await {
+        return blocked;
+    }
+    if let Some(interceptor) = interceptor {
         return intercept(ctx, interceptor, event, host, port, req).await;
     }
     let upstream = match connect_upstream(&ctx, &host, port).await {
@@ -530,7 +592,7 @@ async fn inside(
     port: u16,
     mut req: Request<Incoming>,
 ) -> Response<Body> {
-    let event = Event {
+    let mut event = Event {
         time: event::now(),
         client,
         process,
@@ -546,6 +608,8 @@ async fn inside(
         reason: None,
         bytes_up: None,
         bytes_down: None,
+        action: None,
+        rule: None,
     };
     let named = req
         .headers()
@@ -569,6 +633,17 @@ async fn inside(
         )
         .await;
     }
+    let decision = ctx.decide(&Facts {
+        host,
+        process: image_name(&event.process),
+        path: Some(&event.path),
+        // The body is read in `relay`; rules on its content are decided there.
+        content: None,
+        defer_content: true,
+    });
+    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+        return blocked;
+    }
     let authority = if port == 443 {
         host.to_string()
     } else {
@@ -590,6 +665,55 @@ async fn inside(
     }
     // The lock is held until the response head arrives; HTTP/1.1 serves one request at a time anyway.
     relay(ctx, event, &mut sender, req).await
+}
+
+/// Notes the decision on the event. Anything but `allow` answers 403 naming the rule, records the event and closes
+/// the connection; nothing reaches the upstream.
+async fn enforce(ctx: &Ctx, event: &mut Event, decision: Decision) -> Option<Response<Body>> {
+    event.action = Some(decision.action);
+    event.rule = Some(decision.rule.clone());
+    if decision.action == Action::Allow {
+        return None;
+    }
+    let mut blocked = event.clone();
+    blocked.coverage = Coverage::Blocked;
+    blocked.status = StatusCode::FORBIDDEN.as_u16();
+    blocked.reason = Some("blocked by rule");
+    let time = blocked.time.clone();
+    ctx.emit(blocked).await;
+    let severity = decision
+        .severity
+        .map_or(String::new(), |s| format!(" ({})", s.as_str()));
+    let description = if decision.description.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", decision.description)
+    };
+    let text = format!(
+        "gatewizz: blocked by rule \"{}\"{severity}\n{description}event time: {time}\n",
+        decision.rule
+    );
+    let mut response = Response::new(
+        Full::new(Bytes::from(text))
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    Some(response)
+}
+
+/// Image file name of a known client process (`smartwizz.exe`), as `match.process` names it.
+fn image_name(process: &Process) -> Option<&str> {
+    match process {
+        Process::Known { image, .. } => image.rsplit(['\\', '/']).next(),
+        Process::Unknown(_) => None,
+    }
 }
 
 /// Answers the client directly, records the event and closes the connection.
@@ -1459,5 +1583,178 @@ mod tests {
             next_event(&mut events).await.reason,
             Some("request head too large")
         );
+    }
+
+    fn block_rule(id: &str, matches: rules::Match) -> Rule {
+        Rule {
+            id: id.to_string(),
+            description: "test rule".to_string(),
+            matches,
+            action: Action::Block,
+            severity: rules::Severity::High,
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_requests_get_403_and_send_nothing_upstream() {
+        let (upstream, mut seen) = recording_upstream().await;
+        let settings = Settings {
+            rules: vec![block_rule(
+                "only-localhost",
+                rules::Match {
+                    not_host: Some(vec!["localhost".into()]),
+                    ..rules::Match::default()
+                },
+            )],
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+
+        let blocked = format!("GET http://{upstream}/x?k=v HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+        let response = exchange(proxy, blocked.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("blocked by rule \"only-localhost\" (high)"),
+            "{response}"
+        );
+        assert!(
+            response.contains("test rule") && response.contains("event time: "),
+            "{response}"
+        );
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (
+                event.action,
+                event.rule.as_deref(),
+                event.coverage,
+                event.status
+            ),
+            (
+                Some(Action::Block),
+                Some("only-localhost"),
+                Coverage::Blocked,
+                403
+            )
+        );
+        assert!(response.contains(&event.time), "the 403 names the event");
+        assert!(
+            timeout(Duration::from_millis(300), seen.recv())
+                .await
+                .is_err(),
+            "nothing may reach the upstream"
+        );
+
+        let port = upstream.port();
+        let allowed =
+            format!("GET http://localhost:{port}/y HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n");
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(allowed.as_bytes()).await.unwrap();
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.action, event.rule.as_deref()),
+            (Some(Action::Allow), Some("default"))
+        );
+    }
+
+    #[tokio::test]
+    async fn content_rules_block_blind_tunnels() {
+        let settings = Settings {
+            rules: vec![block_rule(
+                "no-secrets",
+                rules::Match {
+                    finding: Some("secret.*".into()),
+                    ..rules::Match::default()
+                },
+            )],
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        // A blind tunnel's content cannot be checked, so a rule about content blocks it (fail closed).
+        let response = exchange(
+            proxy,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert_eq!(
+            next_event(&mut events).await.rule.as_deref(),
+            Some("no-secrets")
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_only_reach_allowlisted_hosts() {
+        let (upstream, mut seen) = recording_upstream().await;
+        let settings = Settings {
+            rules: vec![block_rule(
+                "secrets-only-to-approved-models",
+                rules::Match {
+                    finding: Some("secret.*".into()),
+                    not_host: Some(vec!["localhost".into()]),
+                    ..rules::Match::default()
+                },
+            )],
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        // Built at runtime so no token-shaped literal sits in the source.
+        let key = format!("{}{}", ["gh", "p_"].concat(), "x".repeat(36));
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"review:\n+token = {key}\n"}}]}}"#
+        );
+        let request = |host: String| {
+            format!(
+                "POST http://{host}/v1/chat/completions HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        let response = exchange(proxy, request(upstream.to_string()).as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("secrets-only-to-approved-models"),
+            "{response}"
+        );
+        assert!(!response.contains(&key), "the 403 must not echo the secret");
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            event.rule.as_deref(),
+            Some("secrets-only-to-approved-models")
+        );
+        // Blocked because the key was found, not because the body went unread.
+        assert_eq!(event.coverage, Coverage::Blocked);
+        assert!(
+            event
+                .findings
+                .iter()
+                .any(|f| f.kind == "secret.github_token"),
+            "{event:?}"
+        );
+        assert!(
+            !format!("{event:?}").contains(&key),
+            "events never hold the secret"
+        );
+        // forward() opens the TCP connection before the body is read; not one request byte may follow.
+        if let Ok(Some(bytes)) = timeout(Duration::from_millis(500), seen.recv()).await {
+            assert!(bytes.is_empty(), "upstream received {} bytes", bytes.len());
+        }
+
+        let port = upstream.port();
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(request(format!("localhost:{port}")).as_bytes())
+            .await
+            .unwrap();
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.action, event.rule.as_deref()),
+            (Some(Action::Allow), Some("default"))
+        );
+        assert_eq!(event.coverage, Coverage::Inspected);
     }
 }
