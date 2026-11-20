@@ -37,8 +37,8 @@ try {
     $downloadSums = Join-Path $tempDir "SHA256SUMS.txt"
 
     Write-Host "Downloading $($release.tag_name)..."
-    Invoke-WebRequest -Uri $exeAsset.browser_download_url -OutFile $downloadExe
-    Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $downloadSums
+    Invoke-WebRequest -Uri $exeAsset.browser_download_url -OutFile $downloadExe -UseBasicParsing
+    Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $downloadSums -UseBasicParsing
 
     $pattern = "(?m)^([0-9a-fA-F]{64})\s+\*?" + [regex]::Escape($exeAsset.name) + "\s*$"
     $match = [regex]::Match((Get-Content -Raw -LiteralPath $downloadSums), $pattern)
@@ -58,7 +58,7 @@ try {
 
     if (-not (Test-Path -LiteralPath $configPath)) {
         $configUrl = "https://raw.githubusercontent.com/$repo/$($release.tag_name)/config/gatewizz.example.toml"
-        Invoke-WebRequest -Uri $configUrl -OutFile $configPath
+        Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing
         Write-Host "Created configuration: $configPath"
     }
     else {
