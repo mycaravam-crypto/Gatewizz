@@ -455,7 +455,7 @@ mod app {
             }
             // A bounded tail can begin halfway through a JSON line. Discard that partial record.
             if offset > 0 {
-                let Some(newline) = contents.find('\\n') else {
+                let Some(newline) = contents.find('\n') else {
                     continue;
                 };
                 contents.drain(..=newline);
