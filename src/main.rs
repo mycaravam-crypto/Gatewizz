@@ -17,6 +17,7 @@ mod proxy;
 mod rules;
 mod tls;
 mod ui;
+mod startup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,6 +44,9 @@ Usage:
   gatewizz [--config <path>] --check-config   validate the config and print the effective values
   gatewizz ca install                         create the local CA if missing and trust it for the current user
   gatewizz ca remove                          untrust every gatewizz CA and delete its files
+  gatewizz startup install [--config <path>]   start Gatewizz automatically at user login
+  gatewizz startup remove                     remove automatic startup
+  gatewizz startup status                     show automatic startup configuration
   gatewizz --version | --help
 
 Options:
@@ -67,6 +71,9 @@ enum Command {
     CheckConfig(Option<PathBuf>),
     CaInstall,
     CaRemove,
+    StartupInstall(Option<PathBuf>),
+    StartupRemove,
+    StartupStatus,
     Version,
     Help,
 }
@@ -77,6 +84,23 @@ fn parse(args: &[String]) -> Result<Command, String> {
         [ca, action] if ca == "ca" && action == "install" => return Ok(Command::CaInstall),
         [ca, action] if ca == "ca" && action == "remove" => return Ok(Command::CaRemove),
         [ca, ..] if ca == "ca" => return Err("[usage] ca needs install or remove".into()),
+        [startup, action] if startup == "startup" && action == "remove" => {
+            return Ok(Command::StartupRemove);
+        }
+        [startup, action] if startup == "startup" && action == "status" => {
+            return Ok(Command::StartupStatus);
+        }
+        [startup, action] if startup == "startup" && action == "install" => {
+            return Ok(Command::StartupInstall(None));
+        }
+        [startup, action, flag, path]
+            if startup == "startup" && action == "install" && flag == "--config" =>
+        {
+            return Ok(Command::StartupInstall(Some(PathBuf::from(path))));
+        }
+        [startup, ..] if startup == "startup" => {
+            return Err("[usage] startup needs install [--config <path>], remove or status".into());
+        }
         _ => {}
     }
     let (mut config, mut check) = (None, false);
@@ -226,12 +250,30 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::Help => print!("{USAGE}"),
         Command::CaInstall => println!("{}", ca::install(&config::data_dir()?)?),
         Command::CaRemove => println!("{}", ca::remove(&config::data_dir()?)?),
+        Command::StartupInstall(path) => {
+            let config = load(path.clone())?;
+            config.event_target()?;
+            println!("{}", startup::install(path.as_deref())?);
+        }
+        Command::StartupRemove => println!("{}", startup::remove()?),
+        Command::StartupStatus => match startup::status()? {
+            Some(command) => println!("Gatewizz starts at user login: {command}"),
+            None => println!("Gatewizz is not registered for automatic startup."),
+        },
         Command::CheckConfig(path) => {
             let config = load(path)?;
             config.event_target()?;
             print!("{}", config.effective());
         }
         Command::Run(path) => {
+            #[cfg(windows)]
+            let _instance = match startup::SingleInstance::acquire()? {
+                Some(instance) => instance,
+                None => {
+                    eprintln!("gatewizz: already running in this Windows session");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            };
             let config = load(path)?;
             run_with_ui(config)?;
             eprintln!("gatewizz: stopped");
@@ -322,6 +364,13 @@ mod tests {
         );
         assert_eq!(parse(&args(&["ca", "install"])), Ok(Command::CaInstall));
         assert_eq!(parse(&args(&["ca", "remove"])), Ok(Command::CaRemove));
+        assert_eq!(parse(&args(&["startup", "install"])), Ok(Command::StartupInstall(None)));
+        assert_eq!(
+            parse(&args(&["startup", "install", "--config", "gatewizz.toml"])),
+            Ok(Command::StartupInstall(Some("gatewizz.toml".into())))
+        );
+        assert_eq!(parse(&args(&["startup", "remove"])), Ok(Command::StartupRemove));
+        assert_eq!(parse(&args(&["startup", "status"])), Ok(Command::StartupStatus));
     }
 
     #[test]
@@ -336,6 +385,10 @@ mod tests {
             &["ca"][..],
             &["ca", "bogus"][..],
             &["ca", "install", "x"][..],
+            &["startup"][..],
+            &["startup", "bogus"][..],
+            &["startup", "install", "--config"][..],
+            &["startup", "install", "--config", "a", "extra"][..],
             &["--config", "g.toml", "ca", "install"][..],
         ] {
             let err = parse(&args(input)).unwrap_err();
@@ -353,6 +406,9 @@ mod tests {
             "HTTPS_PROXY",
             "ca install",
             "ca remove",
+            "startup install",
+            "startup remove",
+            "startup status",
             "ca.key",
             "130",
         ] {
