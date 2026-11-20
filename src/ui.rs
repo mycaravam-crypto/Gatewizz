@@ -98,10 +98,13 @@ mod app {
     use crate::approve::{Approvals, Verdict, Window};
     use crate::process::Process;
 
-    const BG: Color32 = Color32::from_rgb(0x10, 0x12, 0x18);
-    const TEXT: Color32 = Color32::from_rgb(0xc8, 0xcc, 0xd4);
-    const MUTED: Color32 = Color32::from_rgb(0x7a, 0x80, 0x8c);
-    const WARN: Color32 = Color32::from_rgb(0xf0, 0xb0, 0x40);
+    const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x18);
+    const PANEL: Color32 = Color32::from_rgb(0x15, 0x1b, 0x25);
+    const PANEL_HOVER: Color32 = Color32::from_rgb(0x1d, 0x26, 0x34);
+    const BORDER: Color32 = Color32::from_rgb(0x2a, 0x35, 0x45);
+    const TEXT: Color32 = Color32::from_rgb(0xe7, 0xec, 0xf4);
+    const MUTED: Color32 = Color32::from_rgb(0x91, 0x9e, 0xb0);
+    const AMBER: Color32 = Color32::from_rgb(0xf2, 0xb7, 0x4b);
     const GREEN: Color32 = Color32::from_rgb(0x55, 0xd6, 0x91);
     const RED: Color32 = Color32::from_rgb(0xf0, 0x6b, 0x73);
     const BLUE: Color32 = Color32::from_rgb(0x75, 0xa9, 0xff);
@@ -336,14 +339,14 @@ mod app {
             }
             style.spacing.item_spacing = egui::vec2(9.0, 7.0);
             style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.visuals.panel_fill = Color32::from_rgb(0x0d, 0x11, 0x18);
-            style.visuals.window_fill = Color32::from_rgb(0x0d, 0x11, 0x18);
-            style.visuals.extreme_bg_color = Color32::from_rgb(0x15, 0x1b, 0x25);
-            style.visuals.override_text_color = Some(Color32::from_rgb(0xe7, 0xec, 0xf4));
-            style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x15, 0x1b, 0x25);
-            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2a, 0x35, 0x45));
-            style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x1d, 0x26, 0x34);
-            style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x75, 0xa9, 0xff));
+            style.visuals.panel_fill = BG;
+            style.visuals.window_fill = BG;
+            style.visuals.extreme_bg_color = PANEL;
+            style.visuals.override_text_color = Some(TEXT);
+            style.visuals.widgets.inactive.bg_fill = PANEL;
+            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+            style.visuals.widgets.hovered.bg_fill = PANEL_HOVER;
+            style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
             style.visuals.widgets.active.bg_fill = Color32::from_rgb(0x25, 0x35, 0x49);
         });
     }
