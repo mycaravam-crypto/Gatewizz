@@ -692,7 +692,7 @@ mod app {
                             }
                             ui.end_row();
                             for event in &filtered {
-                                let index = rows.iter().position(|row| std::ptr::eq(row, *event)).unwrap_or(usize::MAX);
+                                let index = rows.iter().position(|row| std::ptr::eq(*row, *event)).unwrap_or(usize::MAX);
                                 let active = selected == Some(index);
                                 let decision = event.decision();
                                 let color = match event.action {
