@@ -32,9 +32,19 @@ jobs:
       - run: cargo test --locked
       # The release binary, so a PR that breaks the shipping build fails here rather than after merge.
       - run: cargo build --release --locked
-      # The shipping exe must carry the manifest (per-monitor DPI v2, asInvoker) from build.rs (#36).
-      - name: Check embedded manifest
+      # Extract PE resource type RT_MANIFEST (24), ID 1. A string search in the EXE is not proof
+      # that Windows can load the manifest resource.
+      - name: Check embedded manifest resource
+        shell: pwsh
         run: |
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $mt) { throw "Windows SDK mt.exe not found" }
+          & $mt "-inputresource:target\release\gatewizz.exe;#1" "-out:target\release\gatewizz.manifest"
+          if ($LASTEXITCODE -ne 0) { throw "Could not extract embedded manifest resource" }
           foreach ($p in 'PerMonitorV2', 'asInvoker') {
-            if (-not (Select-String -Path target\release\gatewizz.exe -Pattern $p -SimpleMatch -Quiet)) { throw "manifest: $p missing" }
+            if (-not (Select-String -Path target\release\gatewizz.manifest -Pattern $p -SimpleMatch -Quiet)) {
+              throw "embedded manifest: $p missing"
+            }
           }
