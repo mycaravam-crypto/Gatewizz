@@ -27,6 +27,9 @@ gatewizz startup install
 gatewizz startup install --config .\gatewizz.toml
 gatewizz startup status
 gatewizz startup remove
+gatewizz firewall apply --config .\gatewizz.toml   # elevated prompt
+gatewizz firewall status
+gatewizz firewall remove                           # elevated prompt
 ```
 
 - `gatewizz`: starts the proxy and tray application; Ctrl+C or **Quit** in the tray stops it (exit 130).
@@ -37,6 +40,7 @@ gatewizz startup remove
 - `startup install [--config <path>]`: registers the current executable in the current user's Windows Run key. The optional config path is resolved to an absolute path and retained for login startup.
 - `startup status`: displays the current Run registration.
 - `startup remove`: removes only Gatewizz's Run value; it does not uninstall the executable or remove the CA.
+- `firewall apply [--config <path>]`, `firewall status`, `firewall remove`: see [Connection firewall](#connection-firewall).
 
 `gatewizz --help` is authoritative for the complete flag list and exit codes.
 
@@ -194,6 +198,34 @@ Limits:
 - **UDP and QUIC:** these are not shown. The Windows UDP table lists local sockets only, without a remote address.
 - **Hostnames are best effort:** apps that resolve names themselves (DNS over HTTPS in a browser, hard-coded IPs) show an IP only. A CDN address shared by many sites shows the name that was looked up most recently. The DNS cache does not say which program asked.
 - **Overhead:** the CPU cost at the default interval still has to be measured on a real machine (#57). Reading the tables is one system call per address family per sample.
+
+## Connection firewall
+
+The connection firewall turns `[[connection_rules]]` into Windows Filtering Platform (WFP) filters. Those filters allow or block outgoing connections per program, address, port and protocol, for every program, whether or not it uses the proxy. It is Phase 2 of #56 and needs an elevated (Run as administrator) prompt. Nothing else in Gatewizz does.
+
+```powershell
+gatewizz firewall apply --config .\gatewizz.toml   # install or replace the filters
+gatewizz firewall status                           # installed, and how many filters
+gatewizz firewall remove                           # take every Gatewizz filter away
+```
+
+- **Rules:** see the commented `[firewall]` and `[[connection_rules]]` example in [gatewizz.example.toml](../config/gatewizz.example.toml).
+  - The most specific matching rule wins: first by how many of program, address, port and protocol it pins down, then by how narrow its address is (exact host, then `*.suffix`, then IP prefix width).
+  - Between equally specific rules, `block` beats `allow`; after that, the first rule in the file wins.
+  - So an `allow` for one program to `127.0.0.1:8899` overrides a `block` for that program alone. This is the proxy-enforcement pair: the wizz tools can then reach the network only through Gatewizz.
+- **Enforcement:**
+  - Filters sit at WFP's connect layers (IPv4 and IPv6) in Gatewizz's own provider and sublayer. They decide connection attempts and never read traffic.
+  - Block filters are hard blocks, so other software cannot override them.
+  - Filters are persistent: they stay in force after a reboot, or when Gatewizz is not running, until `firewall remove`.
+  - `apply` replaces the whole set in one transaction, so a failed apply leaves the previous rules in place.
+- **Names:** WFP works with full program paths and IP addresses, so `apply` resolves names when it runs. A program file name covers the copies on `PATH` and those running at that moment. A host covers the addresses it resolves to at that moment. `apply` warns about anything it could not resolve, since that part of a rule is not enforced. Use full paths in `process`, and `ip`, for what must always be covered. Run `apply` again after installing a program or when a host's addresses change.
+- **Gatewizz itself** is always allowed. No rule can block it.
+- **`default`:**
+  - `allow` (the default) filters only what rules name.
+  - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
+  - `ask` blocks for now. It will prompt for unknown connections once the background service and approval prompt exist (#59).
+
+Not yet: the approval prompt for blocked connections, rules added from it, and a background service that keeps program paths and host addresses current. These are the next steps of #59.
 
 ## Events and privacy
 

@@ -12,15 +12,14 @@
 //!
 //! Gatewizz itself is always allowed ([`SELF_RULE`]); no rule can block the update and configuration path.
 //!
-//! Not wired in yet: the service that owns the WFP filters comes in the next #59 PR, and so do the `[firewall]` and
-//! `[[connection_rules]]` config keys, which would otherwise be accepted and silently do nothing.
-#![allow(dead_code)]
+//! `gatewizz firewall apply` uses [`plan`] to install the filters (see `wfp.rs`). [`decide`] and [`Coalescer`] serve
+//! the approval prompt for blocked connections, which comes with the service in the next #59 step.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::tls::host_matches;
 
@@ -28,7 +27,7 @@ use crate::tls::host_matches;
 pub const SELF_RULE: &str = "gatewizz-self";
 
 /// What happens to a connection no rule matches.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAction {
     #[default]
@@ -38,14 +37,14 @@ pub enum DefaultAction {
     Block,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
     Allow,
     Block,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -91,6 +90,10 @@ impl Net {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for the approval prompt, next in #59")
+    )]
     pub fn contains(&self, ip: IpAddr) -> bool {
         let bits = |a: IpAddr| match a {
             IpAddr::V4(v4) => u128::from(u32::from(v4)) << 96,
@@ -118,6 +121,23 @@ impl Net {
     }
 }
 
+impl std::fmt::Display for Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = if self.addr.is_ipv4() { 32 } else { 128 };
+        if self.len == max {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.len)
+        }
+    }
+}
+
+impl Serialize for Net {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
 impl<'de> Deserialize<'de> for Net {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let text = String::deserialize(d)?;
@@ -126,20 +146,22 @@ impl<'de> Deserialize<'de> for Net {
 }
 
 /// One connection rule. Every key except `id` and `action` is optional; an omitted key matches anything.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub id: String,
-    /// Program file names (`smartwizz.exe`), case-insensitive. An unknown process matches no rule with programs.
-    #[serde(default)]
+    /// Programs: a file name (`smartwizz.exe`) or a full path (`C:\Tools\smartwizz.exe`), case-insensitive. WFP
+    /// matches full paths, so a file name is enforced for the paths it resolves to (see [`plan`]). An unknown
+    /// process matches no rule with programs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process: Vec<String>,
     /// Host names: exact or `*.suffix`. Enforced through the IPs these names were seen to resolve to.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host: Vec<String>,
     /// IP addresses or prefixes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ip: Vec<Net>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port: Vec<u16>,
     #[serde(default)]
     pub protocol: Protocol,
@@ -178,10 +200,17 @@ impl Rule {
         (dims, narrow)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for the approval prompt, next in #59")
+    )]
     fn matches(&self, c: &Connection<'_>) -> bool {
         let program_ok = self.process.is_empty()
-            || c.program
-                .is_some_and(|p| self.process.iter().any(|q| q.eq_ignore_ascii_case(p)));
+            || c.program.is_some_and(|p| {
+                self.process
+                    .iter()
+                    .any(|q| file_name(q).eq_ignore_ascii_case(file_name(p)))
+            });
         let address_ok = (self.host.is_empty() && self.ip.is_empty())
             || self
                 .host
@@ -192,6 +221,18 @@ impl Rule {
         let protocol_ok = self.protocol == Protocol::Any || self.protocol == c.protocol;
         program_ok && address_ok && port_ok && protocol_ok
     }
+}
+
+/// The file name of a program entry: `smartwizz.exe` for both `smartwizz.exe` and `C:\Tools\smartwizz.exe`.
+pub fn file_name(program: &str) -> &str {
+    program.rsplit(['\\', '/']).next().unwrap_or(program)
+}
+
+/// Whether a program entry is a full Windows path (`C:\...` or `\\server\...`) rather than a file name.
+pub fn is_full_path(program: &str) -> bool {
+    let b = program.as_bytes();
+    (b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || program.starts_with("\\\\")
 }
 
 /// Checks a rule list read from the config. `index` names the entry in errors, as `rules::validate` does.
@@ -215,13 +256,11 @@ pub fn validate(rules: &[Rule]) -> Result<(), String> {
         }) {
             return Err(format!("{at}.host: {bad:?} is not a host name or *.suffix"));
         }
-        if let Some(bad) = rule
-            .process
-            .iter()
-            .find(|p| p.is_empty() || p.contains(['\\', '/']))
-        {
+        if let Some(bad) = rule.process.iter().find(|p| {
+            p.is_empty() || file_name(p).is_empty() || (p.contains(['\\', '/']) && !is_full_path(p))
+        }) {
             return Err(format!(
-                "{at}.process: {bad:?} must be a program file name such as \"smartwizz.exe\""
+                "{at}.process: {bad:?} must be a file name such as \"smartwizz.exe\" or a full path"
             ));
         }
     }
@@ -229,6 +268,10 @@ pub fn validate(rules: &[Rule]) -> Result<(), String> {
 }
 
 /// One connection attempt, as the service sees it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 #[derive(Clone, Copy, Debug)]
 pub struct Connection<'a> {
     /// The program's file name, if known.
@@ -240,6 +283,10 @@ pub struct Connection<'a> {
     pub protocol: Protocol,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Allow,
@@ -248,6 +295,10 @@ pub enum Verdict {
     Ask,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub verdict: Verdict,
@@ -257,6 +308,10 @@ pub struct Decision {
 
 /// The rule for one connection. `own_program` is Gatewizz's file name, always allowed. `attached` says whether an
 /// approval window can ask: without one, `ask` blocks (fail closed).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 pub fn decide(
     c: &Connection<'_>,
     rules: &[Rule],
@@ -317,20 +372,25 @@ pub struct Filter {
     pub weight: u64,
 }
 
-/// Turns the active rules into filters. Host rules become one filter per IP that `resolved` reports for their names
-/// (from the DNS cache); a host rule with no known IP yet yields no filter, and the default filter decides until
-/// the name is seen. Gatewizz's own program gets the top-weight allow; a `block`/`ask` default gets a bottom-weight
+/// Turns the active rules into filters. WFP matches programs by full path and addresses by IP, so:
+/// - a program given as a file name becomes one filter per path `programs` resolves it to; a full path is used as is.
+///   A file name that resolves to nothing yields no filter for that rule, which [`unresolved`] reports.
+/// - a host becomes one filter per IP `resolved` reports for it (from the DNS cache); a host with no known IP yet
+///   yields no filter, and the default filter decides until the name is seen.
+///
+/// Gatewizz's own executable (`own_path`) gets the top-weight allow; a `block`/`ask` default gets a bottom-weight
 /// block.
 pub fn plan(
     rules: &[Rule],
     default: DefaultAction,
-    own_program: &str,
+    own_path: &str,
     now: SystemTime,
     resolved: impl Fn(&str) -> Vec<IpAddr>,
+    programs: impl Fn(&str) -> Vec<String>,
 ) -> Vec<Filter> {
     let mut out = vec![Filter {
         rule: SELF_RULE.into(),
-        program: Some(own_program.to_string()),
+        program: Some(own_path.to_string()),
         remote: None,
         port: None,
         protocol: Protocol::Any,
@@ -358,7 +418,14 @@ pub fn plan(
         } else {
             rule.process
                 .iter()
-                .map(|p| Some(p.to_ascii_lowercase()))
+                .flat_map(|p| {
+                    if is_full_path(p) {
+                        vec![p.clone()]
+                    } else {
+                        programs(p)
+                    }
+                })
+                .map(Some)
                 .collect()
         };
         let ports: Vec<Option<u16>> = if rule.port.is_empty() {
@@ -400,7 +467,30 @@ pub fn plan(
     out
 }
 
+/// Program file names in active rules that `programs` resolves to no path: those parts of the rules are not
+/// enforced until the program is found, so `firewall apply` says so.
+pub fn unresolved(
+    rules: &[Rule],
+    now: SystemTime,
+    programs: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = rules
+        .iter()
+        .filter(|r| r.active(now))
+        .flat_map(|r| r.process.iter())
+        .filter(|p| !is_full_path(p) && programs(p).is_empty())
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A blocked attempt the user may be asked about.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     pub program: String,
@@ -414,12 +504,20 @@ pub struct Notice {
 
 /// Folds repeated attempts by one program to one host and port into a single notice per window, so a retrying app
 /// produces one prompt, not dozens. Bounded: past `max` keys the oldest are forgotten.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 pub struct Coalescer {
     window: Duration,
     max: usize,
     notices: HashMap<(String, String, u16), Notice>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "for the approval prompt, next in #59")
+)]
 impl Coalescer {
     pub fn new(window: Duration, max: usize) -> Self {
         Self {
@@ -512,6 +610,11 @@ mod tests {
     }
 
     const OWN: &str = "gatewizz.exe";
+    const OWN_PATH: &str = r"C:\Users\u\AppData\Local\Programs\Gatewizz\gatewizz.exe";
+
+    fn no_paths(_: &str) -> Vec<String> {
+        Vec::new()
+    }
 
     fn decide_now(c: &Connection<'_>, rules: &[Rule], default: DefaultAction) -> Decision {
         decide(c, rules, default, OWN, true, SystemTime::now())
@@ -588,9 +691,59 @@ mod tests {
                 .contains(".host")
         );
         assert!(
-            bad("[[connection_rules]]\nid = \"a\"\nprocess = [\"C:\\\\x\\\\a.exe\"]\naction = \"block\"\n")
+            bad("[[connection_rules]]\nid = \"a\"\nprocess = [\"tools\\\\a.exe\"]\naction = \"block\"\n")
                 .contains("file name")
         );
+        // A full path is fine: WFP enforces it as is.
+        validate(
+            &parse("[[connection_rules]]\nid = \"a\"\nprocess = [\"C:\\\\Tools\\\\a.exe\"]\naction = \"block\"\n")
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn program_entries_are_names_or_full_paths() {
+        assert_eq!(file_name(r"C:\Tools\SmartWizz.exe"), "SmartWizz.exe");
+        assert_eq!(file_name("curl.exe"), "curl.exe");
+        assert!(is_full_path(r"C:\Tools\a.exe") && is_full_path(r"\\server\share\a.exe"));
+        assert!(
+            !is_full_path("a.exe") && !is_full_path(r"tools\a.exe") && !is_full_path("C:a.exe")
+        );
+        // A rule naming a full path matches the connection's program by file name.
+        let r = rules(
+            "[[connection_rules]]\nid = \"p\"\nprocess = [\"C:\\\\Tools\\\\curl.exe\"]\naction = \"block\"\n",
+        );
+        assert_eq!(
+            decide_now(
+                &conn("curl.exe", None, "1.1.1.1", 443),
+                &r,
+                DefaultAction::Allow
+            )
+            .rule,
+            "p"
+        );
+    }
+
+    #[test]
+    fn rules_round_trip_through_toml() {
+        #[derive(Deserialize, Serialize)]
+        struct File {
+            connection_rules: Vec<Rule>,
+        }
+        let text = r#"
+            [[connection_rules]]
+            id = "a"
+            process = ["curl.exe"]
+            ip = ["10.0.0.0/8", "1.2.3.4"]
+            port = [443]
+            protocol = "tcp"
+            action = "block"
+        "#;
+        let file: File = toml::from_str(text).unwrap();
+        let again: File = toml::from_str(&toml::to_string(&file).unwrap()).unwrap();
+        assert_eq!(again.connection_rules, file.connection_rules);
+        assert!(toml::to_string(&file).unwrap().contains("\"1.2.3.4\""));
     }
 
     #[test]
@@ -800,9 +953,16 @@ mod tests {
             "default"
         );
         assert!(
-            plan(&r, DefaultAction::Block, OWN, later, |_| Vec::new())
-                .iter()
-                .all(|f| f.rule != "once")
+            plan(
+                &r,
+                DefaultAction::Block,
+                OWN_PATH,
+                later,
+                |_| Vec::new(),
+                no_paths
+            )
+            .iter()
+            .all(|f| f.rule != "once")
         );
     }
 
@@ -833,20 +993,35 @@ mod tests {
             "api.example.com" => vec![ip("93.184.215.14"), ip("2606:2800::1")],
             _ => Vec::new(),
         };
-        let p = plan(&r, DefaultAction::Ask, OWN, SystemTime::now(), resolved);
+        let paths = |name: &str| match name {
+            "SmartWizz.exe" | "smartwizz.exe" => vec![
+                r"C:\Users\u\.dotnet\tools\smartwizz.exe".to_string(),
+                r"D:\wizz\smartwizz.exe".to_string(),
+            ],
+            "testwizz.exe" => vec![r"C:\Users\u\.dotnet\tools\testwizz.exe".to_string()],
+            _ => Vec::new(),
+        };
+        let p = plan(
+            &r,
+            DefaultAction::Ask,
+            OWN_PATH,
+            SystemTime::now(),
+            resolved,
+            paths,
+        );
         // Self first, default last.
         assert_eq!(p.first().unwrap().rule, SELF_RULE);
-        assert_eq!(p.first().unwrap().program.as_deref(), Some(OWN));
+        assert_eq!(p.first().unwrap().program.as_deref(), Some(OWN_PATH));
         let last = p.last().unwrap();
         assert_eq!(
             (last.rule.as_str(), last.action, last.weight),
             ("default", RuleAction::Block, 0)
         );
-        // 2 programs × 1 address × 1 port, 2 resolved IPs × 2 ports, 1 program-wide block.
+        // 3 program paths × 1 address × 1 port, 2 resolved IPs × 2 ports, 2 smartwizz paths.
         let count = |id: &str| p.iter().filter(|f| f.rule == id).count();
         assert_eq!(
             (count("wizz-to-proxy"), count("api"), count("wizz-blocked")),
-            (2, 4, 1)
+            (3, 4, 2)
         );
         // The unseen host has no IP yet, so it adds no filter: "api" has 4, all from the resolved name.
         assert!(
@@ -854,10 +1029,10 @@ mod tests {
                 .filter(|f| f.rule == "api")
                 .all(|f| f.remote.is_some())
         );
-        // Program names are normalized for WFP's app ID lookup.
+        // File names become the full paths WFP's app ID needs.
         assert!(
-            p.iter()
-                .any(|f| f.program.as_deref() == Some("smartwizz.exe") && f.rule == "wizz-blocked")
+            p.iter().any(|f| f.rule == "wizz-blocked"
+                && f.program.as_deref() == Some(r"D:\wizz\smartwizz.exe"))
         );
         // Weights mirror decide(): the narrow allow outranks the program-wide block.
         let weight = |id: &str| p.iter().find(|f| f.rule == id).unwrap().weight;
@@ -865,12 +1040,51 @@ mod tests {
         assert!(p.windows(2).all(|w| w[0].weight >= w[1].weight));
         // An allow default needs no catch-all filter.
         assert!(
-            plan(&r, DefaultAction::Allow, OWN, SystemTime::now(), |_| {
-                Vec::new()
-            })
+            plan(
+                &r,
+                DefaultAction::Allow,
+                OWN_PATH,
+                SystemTime::now(),
+                |_| Vec::new(),
+                no_paths
+            )
             .iter()
             .all(|f| f.rule != "default")
         );
+    }
+
+    #[test]
+    fn unresolved_programs_are_reported_and_add_no_filter() {
+        let r = rules(
+            r#"
+            [[connection_rules]]
+            id = "a"
+            process = ["missing.exe", "C:\\Tools\\full.exe", "found.exe"]
+            action = "block"
+            "#,
+        );
+        let paths = |name: &str| {
+            if name == "found.exe" {
+                vec![r"C:\x\found.exe".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        assert_eq!(unresolved(&r, SystemTime::now(), paths), ["missing.exe"]);
+        let p = plan(
+            &r,
+            DefaultAction::Allow,
+            OWN_PATH,
+            SystemTime::now(),
+            |_| Vec::new(),
+            paths,
+        );
+        let progs: Vec<_> = p
+            .iter()
+            .filter(|f| f.rule == "a")
+            .filter_map(|f| f.program.as_deref())
+            .collect();
+        assert_eq!(progs, [r"C:\Tools\full.exe", r"C:\x\found.exe"]);
     }
 
     #[test]
