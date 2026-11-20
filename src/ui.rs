@@ -322,7 +322,10 @@ mod app {
 
     fn metadata(ui: &mut egui::Ui, key: &str, value: &str) {
         ui.horizontal(|ui| {
-            ui.add_sized([92.0, 18.0], egui::Label::new(RichText::new(key).size(9.0).strong().color(MUTED)));
+            ui.add_sized(
+                [92.0, 18.0],
+                egui::Label::new(RichText::new(key).size(9.0).strong().color(MUTED)),
+            );
             ui.label(RichText::new(value).size(11.0));
         });
     }
@@ -397,7 +400,10 @@ mod app {
                 return;
             }
 
-            if !self.selected.is_some_and(|id| pending.iter().any(|p| p.0 == id)) {
+            if !self
+                .selected
+                .is_some_and(|id| pending.iter().any(|p| p.0 == id))
+            {
                 self.selected = pending.first().map(|p| p.0);
             }
             let state = TrayState::of(self.approvals.paused(), pending.len());
