@@ -104,12 +104,12 @@ mod app {
         proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
         let (quit, stop) = tokio::sync::oneshot::channel();
-        let proxy = std::thread::spawn(move || proxy(stop));
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("gatewizz: approval")
                 .with_inner_size([460.0, 300.0])
-                .with_resizable(false),
+                .with_resizable(false)
+                .with_visible(false),
             ..Default::default()
         };
         let ui = eframe::run_native(
@@ -123,7 +123,12 @@ mod app {
                     approvals,
                     quit,
                     proxy,
-                )))
+                )
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|error| {
+                    Box::new(std::io::Error::other(error))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })
             }),
         );
         // The app owns the stop signal and the thread; dropping it (on any exit) has stopped the proxy.
@@ -154,13 +159,12 @@ mod app {
     struct App {
         approvals: Arc<Approvals>,
         _window: Window,
-        tray: Option<TrayIcon>,
+        _tray: TrayIcon,
         items: Items,
         wake: mpsc::Receiver<Wake>,
         state: Option<TrayState>,
         waiting: usize,
         shown: bool,
-        first_frame: bool,
         minutes: u32,
         listen: SocketAddr,
         events_path: Option<PathBuf>,
@@ -175,8 +179,10 @@ mod app {
             events_path: Option<PathBuf>,
             approvals: Arc<Approvals>,
             quit: tokio::sync::oneshot::Sender<()>,
-            proxy: JoinHandle<Result<(), String>>,
-        ) -> Self {
+            proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String>
+            + Send
+            + 'static,
+        ) -> Result<Self, String> {
             setup_style(&cc.egui_ctx);
             let (tx, wake) = mpsc::channel();
             for kind in [true, false] {
@@ -219,35 +225,32 @@ mod app {
                 &PredefinedMenuItem::separator(),
                 &items.quit,
             ]);
-            let tray = built
-                .map_err(|e| e.to_string())
-                .and_then(|()| {
-                    TrayIconBuilder::new()
-                        .with_menu(Box::new(menu))
-                        .with_menu_on_left_click(false)
-                        .with_icon(icon(TrayState::Running))
-                        .with_tooltip(TrayState::Running.tooltip(0))
-                        .build()
-                        .map_err(|e| e.to_string())
-                })
-                .inspect_err(|e| eprintln!("gatewizz: no tray icon: {e}"))
-                .ok();
-            Self {
+            built.map_err(|e| format!("[ui] cannot build tray menu: {e}"))?;
+            let tray = TrayIconBuilder::new()
+                .with_menu(Box::new(menu))
+                .with_menu_on_left_click(false)
+                .with_icon(icon(TrayState::Running))
+                .with_tooltip(TrayState::Running.tooltip(0))
+                .build()
+                .map_err(|e| format!("[ui] cannot create tray icon: {e}"))?;
+            // Start the proxy only after the tray exists. A UI initialization failure must never leave an
+            // unmanageable proxy running in a detached worker thread.
+            let proxy = std::thread::spawn(move || proxy(stop));
+            Ok(Self {
                 _window: approvals.attach(),
                 approvals,
-                tray,
+                _tray: tray,
                 items,
                 wake,
                 state: None,
                 waiting: 0,
-                shown: true,
-                first_frame: true,
+                shown: false,
                 minutes: 15,
                 listen,
                 events_path,
                 quit: Some(quit),
                 proxy: Some(proxy),
-            }
+            })
         }
 
         fn show(&mut self, ctx: &egui::Context, visible: bool) {
@@ -261,6 +264,8 @@ mod app {
         }
 
         fn quit(&mut self, ctx: &egui::Context) {
+            // A shutdown withdraws every outstanding approval; nothing is restored on the next launch.
+            self.approvals.set_paused(true);
             if let Some(quit) = self.quit.take() {
                 let _ = quit.send(());
             }
@@ -341,10 +346,8 @@ mod app {
             let state = TrayState::of(self.approvals.paused(), waiting);
             if self.state != Some(state) {
                 self.state = Some(state);
-                if let Some(tray) = &self.tray {
-                    let _ = tray.set_icon(Some(icon(state)));
-                    let _ = tray.set_tooltip(Some(state.tooltip(waiting)));
-                }
+                let _ = self._tray.set_icon(Some(icon(state)));
+                let _ = self._tray.set_tooltip(Some(state.tooltip(waiting)));
             }
             // The proxy stopped on its own (Ctrl+C or an error): close the UI too.
             if self.proxy.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -354,10 +357,6 @@ mod app {
 
         fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             let ctx = ui.ctx().clone();
-            if std::mem::take(&mut self.first_frame) && self.waiting == 0 {
-                // ponytail: eframe shows the window after its first frame, so it flashes once at start.
-                self.show(&ctx, false);
-            }
             let pending = self.approvals.pending();
             if ctx.input(|i| i.viewport().close_requested()) && self.quit.is_some() {
                 // Closing the window denies what it shows and hides it; only Quit ends gatewizz.
