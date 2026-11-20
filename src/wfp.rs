@@ -646,7 +646,7 @@ mod tests {
         let filters = plan(
             &rules,
             DefaultAction::Allow,
-            &own,
+            &[own],
             SystemTime::now(),
             |_| Vec::new(),
             |_| Vec::new(),

@@ -18,6 +18,7 @@ mod firewall;
 mod process;
 mod proxy;
 mod rules;
+mod service;
 mod startup;
 mod tls;
 mod ui;
@@ -51,9 +52,10 @@ Usage:
   gatewizz startup install [--config <path>]   start Gatewizz automatically at user login
   gatewizz startup remove                     remove automatic startup
   gatewizz startup status                     show automatic startup configuration
+  gatewizz firewall install [--config <path>]  install the firewall service that keeps the rules current (elevated)
   gatewizz firewall apply [--config <path>]   enforce [[connection_rules]] with Windows filters (elevated)
-  gatewizz firewall remove                    remove every Gatewizz firewall filter (elevated)
-  gatewizz firewall status                    show whether Gatewizz firewall filters are installed
+  gatewizz firewall remove                    remove the service and every Gatewizz firewall filter (elevated)
+  gatewizz firewall status                    show the firewall filters and service
   gatewizz --version | --help
 
 Options:
@@ -81,9 +83,11 @@ enum Command {
     StartupInstall(Option<PathBuf>),
     StartupRemove,
     StartupStatus,
+    FirewallInstall(Option<PathBuf>),
     FirewallApply(Option<PathBuf>),
     FirewallRemove,
     FirewallStatus,
+    FirewallService,
     Version,
     Help,
 }
@@ -111,6 +115,17 @@ fn parse(args: &[String]) -> Result<Command, String> {
         [startup, ..] if startup == "startup" => {
             return Err("[usage] startup needs install [--config <path>], remove or status".into());
         }
+        [fw, action] if fw == "firewall" && action == "install" => {
+            return Ok(Command::FirewallInstall(None));
+        }
+        [fw, action, flag, path]
+            if fw == "firewall" && action == "install" && flag == "--config" =>
+        {
+            return Ok(Command::FirewallInstall(Some(PathBuf::from(path))));
+        }
+        [fw, action] if fw == "firewall" && action == "service" => {
+            return Ok(Command::FirewallService);
+        }
         [fw, action] if fw == "firewall" && action == "apply" => {
             return Ok(Command::FirewallApply(None));
         }
@@ -124,7 +139,9 @@ fn parse(args: &[String]) -> Result<Command, String> {
             return Ok(Command::FirewallStatus);
         }
         [fw, ..] if fw == "firewall" => {
-            return Err("[usage] firewall needs apply [--config <path>], remove or status".into());
+            return Err(
+                "[usage] firewall needs install [--config <path>], apply [--config <path>], remove or status".into(),
+            );
         }
         _ => {}
     }
@@ -306,17 +323,11 @@ fn run(command: Command) -> Result<ExitCode, String> {
             Some(command) => println!("Gatewizz starts at user login: {command}"),
             None => println!("Gatewizz is not registered for automatic startup."),
         },
-        Command::FirewallApply(path) => println!("{}", firewall_apply(&load(path)?)?),
-        Command::FirewallRemove => {
-            let removed = wfp::remove(wfp::KEYS)?;
-            println!(
-                "Removed {removed} Gatewizz firewall filter(s). Gatewizz no longer filters connections."
-            );
-        }
-        Command::FirewallStatus => match wfp::installed(wfp::KEYS)? {
-            Some(n) => println!("The Gatewizz firewall is installed with {n} filter(s)."),
-            None => println!("The Gatewizz firewall is not installed."),
-        },
+        Command::FirewallInstall(path) => println!("{}", service::install(path.as_deref())?),
+        Command::FirewallApply(path) => println!("{}", service::apply(path.as_deref())?),
+        Command::FirewallRemove => println!("{}", service::uninstall()?),
+        Command::FirewallStatus => println!("{}", service::describe()?),
+        Command::FirewallService => service::run()?,
         Command::CheckConfig(path) => {
             let config = load(path)?;
             config.event_target()?;
@@ -338,79 +349,6 @@ fn run(command: Command) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Turns `[[connection_rules]]` into WFP filters and installs them, replacing the previous set. Host names are
-/// resolved now, and program file names to the paths on `PATH` or of running processes; what cannot be resolved is
-/// reported, since those parts of the rules are not enforced.
-// ponytail: names are resolved once, at apply time. A program installed later or a host whose IPs change needs
-// another `firewall apply` until the service (#59) keeps the filters current.
-fn firewall_apply(config: &Config) -> Result<String, String> {
-    use std::net::ToSocketAddrs;
-    let rules = &config.connection_rules;
-    let now = std::time::SystemTime::now();
-    let own = std::env::current_exe()
-        .map_err(|e| format!("[firewall] cannot locate gatewizz.exe: {e}"))?
-        .to_string_lossy()
-        .into_owned();
-    let hosts = |host: &str| -> Vec<std::net::IpAddr> {
-        if host.starts_with("*.") {
-            return Vec::new();
-        }
-        let mut ips: Vec<_> = (host, 0)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|a| a.ip()).collect())
-            .unwrap_or_default();
-        ips.sort();
-        ips.dedup();
-        ips
-    };
-    let filters = firewall::plan(
-        rules,
-        config.firewall.default,
-        &own,
-        now,
-        hosts,
-        wfp::program_paths,
-    );
-    let applied = wfp::apply(wfp::KEYS, &filters)?;
-
-    let mut out = format!(
-        "Applied {} Windows filter(s) for {} connection rule(s); connections no rule matches are {}.",
-        applied.filters,
-        rules.len(),
-        match config.firewall.default {
-            firewall::DefaultAction::Allow => "allowed",
-            firewall::DefaultAction::Block => "blocked",
-            firewall::DefaultAction::Ask =>
-                "blocked (\"ask\" blocks until the approval prompt exists)",
-        }
-    );
-    for program in firewall::unresolved(rules, now, wfp::program_paths) {
-        out.push_str(&format!(
-            "\nwarning: {program} is neither on PATH nor running, so its rules are not enforced. Use its full path \
-             in `process`, or run `firewall apply` again while it runs."
-        ));
-    }
-    let mut unresolved_hosts: Vec<&str> = rules
-        .iter()
-        .flat_map(|r| r.host.iter())
-        .map(String::as_str)
-        .filter(|h| hosts(h).is_empty())
-        .collect();
-    unresolved_hosts.dedup();
-    for host in unresolved_hosts {
-        out.push_str(&format!(
-            "\nwarning: {host} has no IP address now (wildcards never do), so its rules are not enforced. Use `ip` \
-             for addresses that must be covered."
-        ));
-    }
-    for path in &applied.skipped {
-        out.push_str(&format!(
-            "\nwarning: {path} does not exist; its filters were skipped."
-        ));
-    }
-    Ok(out)
 }
 
 /// Without a console of its own, gatewizz writes to the console it was started from. Output that is already
@@ -513,6 +451,18 @@ mod tests {
         assert_eq!(
             parse(&args(&["firewall", "apply"])),
             Ok(Command::FirewallApply(None))
+        );
+        assert_eq!(
+            parse(&args(&["firewall", "install", "--config", "g.toml"])),
+            Ok(Command::FirewallInstall(Some("g.toml".into())))
+        );
+        assert_eq!(
+            parse(&args(&["firewall", "install"])),
+            Ok(Command::FirewallInstall(None))
+        );
+        assert_eq!(
+            parse(&args(&["firewall", "service"])),
+            Ok(Command::FirewallService)
         );
         assert_eq!(
             parse(&args(&["firewall", "apply", "--config", "g.toml"])),

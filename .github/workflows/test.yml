@@ -63,3 +63,7 @@ jobs:
             foreach ($e in $errors) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
           }
           if ($failed) { exit 1 }
+      # The firewall service end to end, elevated as GitHub's runners are: install, apply, restart, remove (#59).
+      - name: Firewall service smoke test
+        shell: pwsh
+        run: .github/scripts/windows-firewall-smoke.ps1 -Exe target\release\gatewizz.exe
