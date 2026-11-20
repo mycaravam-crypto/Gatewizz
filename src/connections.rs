@@ -436,10 +436,11 @@ pub fn start(
                             snapshot,
                             crate::process::describe_pid,
                             |ip, pid| {
-                                if dns.lookup(ip, pid, now).is_none()
-                                    && dns_read
-                                        .is_none_or(|at| now.duration_since(at) >= DNS_REFRESH)
-                                {
+                                let refresh_allowed = match dns_read {
+                                    None => true,
+                                    Some(at) => now.duration_since(at) >= DNS_REFRESH,
+                                };
+                                if dns.lookup(ip, pid, now).is_none() && refresh_allowed {
                                     dns_read = Some(now);
                                     // ponytail: a failed read leaves the address unnamed until the next refresh.
                                     let _ = crate::dns::refresh(&mut dns, now);
