@@ -486,40 +486,6 @@ mod app {
         rows
     }
 
-    #[cfg(test)]
-    mod history_tests {
-        use super::*;
-
-        #[test]
-        fn bounded_tail_survives_offset_inside_utf8_character() {
-            let event = br#"{"time":"2026-11-20T11:00:00Z","host":"example.com","status":200,"action":"allow","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#;
-            let total_len = MAX_HISTORY_FILE_BYTES as usize + 3;
-            let prefix_len = total_len - event.len() - 1;
-            let mut bytes = vec![b'a'; prefix_len];
-            bytes[1..4].copy_from_slice("€".as_bytes());
-            bytes.push(b'\n');
-            bytes.extend_from_slice(event);
-            assert_eq!(bytes.len(), total_len);
-
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is after UNIX epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "gatewizz-history-{}-{unique}.jsonl",
-                std::process::id()
-            ));
-            std::fs::write(&path, bytes).expect("write test event log");
-
-            let rows = load_history(&path);
-            let _ = std::fs::remove_file(&path);
-
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].host, "example.com");
-            assert_eq!(rows[0].process_name(), "curl.exe");
-        }
-    }
-
     fn icon(state: TrayState) -> Icon {
         Icon::from_rgba(icon_rgba(state.rgb(), 32), 32, 32).expect("32x32 RGBA is a valid icon")
     }
@@ -880,6 +846,40 @@ mod app {
             *APP_RESULT.lock().expect("result poisoned") = result;
         }
     }
+    #[cfg(test)]
+    mod history_tests {
+        use super::*;
+
+        #[test]
+        fn bounded_tail_survives_offset_inside_utf8_character() {
+            let event = br#"{"time":"2026-11-20T11:00:00Z","host":"example.com","status":200,"action":"allow","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#;
+            let total_len = MAX_HISTORY_FILE_BYTES as usize + 3;
+            let prefix_len = total_len - event.len() - 1;
+            let mut bytes = vec![b'a'; prefix_len];
+            bytes[1..4].copy_from_slice("€".as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(event);
+            assert_eq!(bytes.len(), total_len);
+
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after UNIX epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "gatewizz-history-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).expect("write test event log");
+
+            let rows = load_history(&path);
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "example.com");
+            assert_eq!(rows[0].process_name(), "curl.exe");
+        }
+    }
+
 }
 
 #[cfg(test)]
