@@ -19,7 +19,7 @@ $repo = "mycaravam-crypto/Gatewizz"
 $installDir = Join-Path $env:LOCALAPPDATA "Programs\Gatewizz"
 $configDir = Join-Path $env:LOCALAPPDATA "gatewizz"
 $configPath = Join-Path $configDir "gatewizz.toml"
-$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("gatewizz-" + [guid]::NewGuid().ToString("N"))
+$tempDir = Join-Path $installDir (".install-" + [guid]::NewGuid().ToString("N"))
 
 try {
     New-Item -ItemType Directory -Force -Path $installDir, $configDir, $tempDir | Out-Null
@@ -54,7 +54,31 @@ try {
     Write-Host "SHA-256 verified."
 
     $exePath = Join-Path $installDir "gatewizz.exe"
-    Move-Item -LiteralPath $downloadExe -Destination $exePath -Force
+    $backupPath = $null
+
+    # Stop only the Gatewizz process running from this installation directory.
+    $runningInstances = Get-Process -Name "gatewizz" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Path -and [System.IO.Path]::GetFullPath($_.Path) -ieq [System.IO.Path]::GetFullPath($exePath)
+        }
+
+    foreach ($instance in $runningInstances) {
+        Stop-Process -Id $instance.Id -ErrorAction Stop
+        Wait-Process -Id $instance.Id -Timeout 10 -ErrorAction SilentlyContinue
+        if (Get-Process -Id $instance.Id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $instance.Id -Force -ErrorAction Stop
+        }
+    }
+
+    # The staging directory is on the same volume as the destination, allowing
+    # Windows to replace the executable atomically and retain a rollback copy.
+    if (Test-Path -LiteralPath $exePath) {
+        $backupPath = Join-Path $tempDir "gatewizz.previous.exe"
+        [System.IO.File]::Replace($downloadExe, $exePath, $backupPath, $true)
+    }
+    else {
+        [System.IO.File]::Move($downloadExe, $exePath)
+    }
 
     if (-not (Test-Path -LiteralPath $configPath)) {
         $configUrl = "https://raw.githubusercontent.com/$repo/$($release.tag_name)/config/gatewizz.example.toml"
@@ -70,10 +94,24 @@ try {
         throw "Configuration validation failed. Review $configPath before starting Gatewizz."
     }
 
+    if ($backupPath -and (Test-Path -LiteralPath $backupPath)) {
+        Remove-Item -LiteralPath $backupPath -Force
+    }
+
     Write-Host ""
     Write-Host "Gatewizz $($release.tag_name) installed successfully."
     Write-Host "Executable: $exePath"
     Write-Host "Config:     $configPath"
+}
+catch {
+    # Restore the previous executable if post-install validation fails.
+    if ($backupPath -and (Test-Path -LiteralPath $backupPath)) {
+        if (Test-Path -LiteralPath $exePath) {
+            Remove-Item -LiteralPath $exePath -Force
+        }
+        [System.IO.File]::Move($backupPath, $exePath)
+    }
+    throw
 }
 finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
