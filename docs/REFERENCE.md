@@ -162,6 +162,16 @@ An approval entry shows the requesting program, PID, user, host, rule, finding k
 
 Timeout, closing the last approval window, a full queue or pausing the proxy blocks the request. Closing one of multiple windows does not withdraw requests while another remains open. Ctrl+C in the console stops gatewizz.
 
+## Activity history
+
+The Gatewizz window has two tabs: **Overview** (summary counts and pending approvals) and **Activity history**. The history tab shows recent decisions read back from the event log. It shows only the metadata the log already holds, never request content.
+
+- **Source:** the current event file and up to five rotated files (`events.jsonl.1` to `.5`). From each file only the last 1 MiB is read, and at most 500 events are shown, newest first. The list refreshes every two seconds. If `[events].path = "-"` (stdout), there is no file to read and the tab says that persistent history is disabled.
+- **Summary:** counts of recent, blocked and other events.
+- **Filters:** a text filter that matches the host or the program name, ignoring case, and a decision filter (all, allowed, blocked, approval). Both filters must match.
+- **Details:** selecting a row shows time, method, status, destination, path (or "CONNECT tunnel"), inspection coverage, the deciding rule, the AI model and the proxy's reason.
+- **Copy CSV:** copies the rows currently shown to the clipboard as CSV with CRLF line endings and every field quoted. Columns: `time_utc, process, host, port, method, path, decision, status, coverage, rule, reason, model`. Nothing is written to disk.
+
 ## Events and privacy
 
 Events are written as JSON Lines. The default path is `%LOCALAPPDATA%\gatewizz\events.jsonl`; configure `[events].path` to change it or use `-` for stdout. Files rotate at the configured size and retain a bounded number of previous files.
