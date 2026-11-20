@@ -40,6 +40,14 @@ impl TrayState {
             Self::Waiting => format!("gatewizz: {waiting} approval(s) waiting"),
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "PROTECTED",
+            Self::Paused => "PAUSED",
+            Self::Waiting => "ACTION REQUIRED",
+        }
+    }
 }
 
 /// A filled circle in the state's colour on a transparent square, RGBA.
@@ -80,7 +88,7 @@ mod app {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use eframe::egui::{self, Color32, RichText, ViewportCommand};
+    use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, ViewportCommand};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -94,6 +102,9 @@ mod app {
     const TEXT: Color32 = Color32::from_rgb(0xc8, 0xcc, 0xd4);
     const MUTED: Color32 = Color32::from_rgb(0x7a, 0x80, 0x8c);
     const WARN: Color32 = Color32::from_rgb(0xf0, 0xb0, 0x40);
+    const GREEN: Color32 = Color32::from_rgb(0x55, 0xd6, 0x91);
+    const RED: Color32 = Color32::from_rgb(0xf0, 0x6b, 0x73);
+    const BLUE: Color32 = Color32::from_rgb(0x75, 0xa9, 0xff);
 
     /// Starts the proxy on its own thread with a stop signal, shows the tray, and returns the proxy's result once it
     /// has stopped: after Quit, Ctrl+C or a proxy error.
