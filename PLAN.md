@@ -44,6 +44,7 @@ Dependencies are added by the issue that first needs them, not before.
 
 ```
 src/
+├── approve.rs   # approval queue: hold, allow once/deny/allow for N min; timeout, full, no window, pause block (#34)
 ├── ca.rs        # local CA: generation, leaf issuance and cache, DPAPI key file, CurrentUser Root store (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
@@ -51,7 +52,8 @@ src/
 ├── process.rs   # client process of a loopback connection via IP Helper, keyed by (pid, start) (#5)
 ├── rules.rs     # allow/block rules: pure decide(), block beats allow, fail closed on unknown facts (#21)
 ├── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
-└── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
+├── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
+└── ui.rs        # tray icon and approval window (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35)
 ```
 
 Request framing is parsed by hyper alone and re-framed towards the upstream, so client and upstream cannot disagree
