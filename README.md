@@ -11,8 +11,11 @@ gatewizz is a loopback proxy for developer tools and coding agents. It attribute
 Download `gatewizz-vX.Y.Z-windows-x64.exe` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/mycaravam-crypto/Gatewizz/releases/latest). Verify the download in PowerShell:
 
 ```powershell
-Get-FileHash .\gatewizz-vX.Y.Z-windows-x64.exe -Algorithm SHA256
-Get-Content .\SHA256SUMS.txt
+$line = Get-Content .\SHA256SUMS.txt | Where-Object { $_ -match 'gatewizz-vX.Y.Z-windows-x64\.exe' }
+$expected = ($line -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash .\gatewizz-vX.Y.Z-windows-x64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 verification failed" }
+"SHA-256 verified"
 ```
 
 The release is a single executable for Windows 10/11 x64. No runtime installation is required.
