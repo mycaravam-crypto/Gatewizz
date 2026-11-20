@@ -286,6 +286,7 @@ mod app {
             let (history_tx, history_rx) = mpsc::channel();
             let (history_stop, stop_history) = mpsc::channel();
             let history_path = events_path.clone();
+            let history_ctx = cc.egui_ctx.clone();
             let history_worker = std::thread::Builder::new()
                 .name("activity-history".into())
                 .spawn(move || {
@@ -294,6 +295,7 @@ mod app {
                             if history_tx.send(load_history(path)).is_err() {
                                 break;
                             }
+                            history_ctx.request_repaint();
                         }
                         match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
                             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
