@@ -64,6 +64,13 @@ function Say([string] $Text) { Write-Host "  > $Text" -ForegroundColor White }
 
 function Quote([string] $Value) { '"' + $Value + '"' }
 
+# Start-Process hands -ArgumentList to the new process as one command line: array items are joined with spaces and
+# are not quoted (Windows PowerShell 5.1 and PowerShell 7 alike). So every call below builds that line here, where
+# the quoting is visible, and passes a single string.
+function Join-CommandLine([string[]] $Arguments) {
+    ($Arguments | ForEach-Object { if ($_ -match '[\s"]') { Quote ($_ -replace '"', '\"') } else { $_ } }) -join ' '
+}
+
 function Invoke-Gatewizz([string[]] $Arguments) {
     $ErrorActionPreference = 'Continue'   # usage errors on stderr are expected
     $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" } | Out-String
@@ -93,7 +100,7 @@ function Write-Config([string] $Name, [string] $Body) {
 }
 
 function Start-Gatewizz([string] $Config) {
-    $p = Start-Process -FilePath $Exe -ArgumentList @('--config', (Quote $Config)) -PassThru
+    $p = Start-Process -FilePath $Exe -ArgumentList (Join-CommandLine @('--config', $Config)) -PassThru
     if (-not (Wait-Until { Test-Port } 20)) { throw "Gatewizz did not start listening on $proxy (config $Config)." }
     $p
 }
@@ -110,9 +117,7 @@ $script:curlTls = @()
 function Invoke-Curl([string[]] $Arguments, [switch] $Background) {
     $out = Join-Path $work ('curl-' + [guid]::NewGuid().ToString('N') + '.txt')
     $all = @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '90', '-x', $proxy) + $script:curlTls + $Arguments
-    # Start-Process joins arguments with spaces and does not quote them itself.
-    $all = $all | ForEach-Object { if ($_ -match '\s') { Quote $_ } else { $_ } }
-    $p = Start-Process -FilePath curl.exe -ArgumentList $all -NoNewWindow -PassThru -RedirectStandardOutput $out -Wait:(-not $Background)
+    $p = Start-Process -FilePath curl.exe -ArgumentList (Join-CommandLine $all) -NoNewWindow -PassThru -RedirectStandardOutput $out -Wait:(-not $Background)
     [pscustomobject]@{ Process = $p; Pid = $p.Id; Out = $out }
 }
 
@@ -184,7 +189,7 @@ Ask 36 'Explorer shows the embedded icon' 'An Explorer window opened on gatewizz
 Ask 36 'tray shows the icon' 'Is the Gatewizz icon in the notification area (check the ^ overflow too)?'
 Ask 36 'no window flash on start' 'Did Gatewizz start without showing or flashing its window?'
 
-$second = Start-Process -FilePath $Exe -ArgumentList @('--config', (Quote $plain)) -PassThru -Wait
+$second = Start-Process -FilePath $Exe -ArgumentList (Join-CommandLine @('--config', $plain)) -PassThru -Wait
 $instances = @(Get-Process -Name gatewizz -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe })
 $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 Check 36 'second launch exits 0 and leaves one process and one listener' (
@@ -428,7 +433,7 @@ if ($SkipMonitor) {
     $null = Start-Gatewizz $monitorConfig
     # Straight out, not through the proxy: only the monitor can see this one. The page is ~1.2 KB, so 500 B/s keeps
     # the connection open for a couple of seconds, well over the sampling interval.
-    $direct = Start-Process -FilePath curl.exe -ArgumentList @('-s', '-o', 'NUL', '--limit-rate', '500', '--noproxy', '*', 'https://example.com/') -NoNewWindow -PassThru -Wait
+    $direct = Start-Process -FilePath curl.exe -ArgumentList (Join-CommandLine @('-s', '-o', 'NUL', '--limit-rate', '500', '--noproxy', '*', 'https://example.com/')) -NoNewWindow -PassThru -Wait
     $c = Find-GwEvent { $_.PSObject.Properties['kind'] -and $_.kind -eq 'connection' -and $_.state -eq 'opened' -and
         $_.process.PSObject.Properties['known'] -and $_.process.known.pid -eq $direct.Id } 10
     Check 57 'a direct (unproxied) curl.exe connection is logged with its PID and image' (
