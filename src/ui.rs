@@ -214,7 +214,9 @@ mod app {
     #[derive(Debug, Clone, Default, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     enum HistoryProcess {
-        Known { image: String },
+        Known {
+            image: String,
+        },
         Unknown(String),
         #[default]
         Unavailable,
@@ -450,7 +452,11 @@ mod app {
                 continue;
             }
             let mut contents = String::new();
-            if file.take(MAX_HISTORY_FILE_BYTES).read_to_string(&mut contents).is_err() {
+            if file
+                .take(MAX_HISTORY_FILE_BYTES)
+                .read_to_string(&mut contents)
+                .is_err()
+            {
                 continue;
             }
             // A bounded tail can begin halfway through a JSON line. Discard that partial record.
