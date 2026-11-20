@@ -27,11 +27,11 @@ Linux/WSL cross-build instructions are in the [reference](docs/REFERENCE.md#buil
 
 ## Quick start
 
-Install the local CA for HTTPS inspection, create a configuration and validate it:
+Download the [example configuration](config/gatewizz.example.toml) alongside the executable, install the local CA for HTTPS inspection, then validate and start the proxy:
 
 ```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/mycaravam-crypto/Gatewizz/main/config/gatewizz.example.toml -OutFile .\gatewizz.toml
 gatewizz ca install
-Copy-Item .\config\gatewizz.example.toml .\gatewizz.toml
 # Set [tls].intercept = true in gatewizz.toml when content inspection is required.
 gatewizz --config .\gatewizz.toml --check-config
 gatewizz --config .\gatewizz.toml
