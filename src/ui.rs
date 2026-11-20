@@ -127,6 +127,35 @@ fn process_ids(list: &[&crate::connections::LiveConnection]) -> Vec<u32> {
     pids
 }
 
+/// Where a blocked connection went, as the prompt shows it: `93.184.215.14:443 tcp`, `[2001:db8::1]:53 udp`.
+fn destination(remote: std::net::IpAddr, port: u16, protocol: crate::firewall::Protocol) -> String {
+    let protocol = match protocol {
+        crate::firewall::Protocol::Tcp => "tcp",
+        crate::firewall::Protocol::Udp => "udp",
+        crate::firewall::Protocol::Any => "ip",
+    };
+    match remote {
+        std::net::IpAddr::V6(ip) => format!("[{ip}]:{port} {protocol}"),
+        std::net::IpAddr::V4(ip) => format!("{ip}:{port} {protocol}"),
+    }
+}
+
+/// What a rule from the prompt will cover, in words, for the scope the user picked.
+fn prompt_scope(
+    program: &str,
+    remote: std::net::IpAddr,
+    port: u16,
+    any_host: bool,
+    any_port: bool,
+) -> String {
+    match (any_host, any_port) {
+        (false, false) => format!("{program} connecting to {remote} on port {port}"),
+        (true, false) => format!("{program} connecting to any address on port {port}"),
+        (false, true) => format!("{program} connecting to {remote} on any port"),
+        (true, true) => format!("{program} connecting anywhere"),
+    }
+}
+
 #[cfg(windows)]
 pub use app::run;
 
@@ -151,11 +180,15 @@ mod app {
     };
 
     use super::{
-        TrayState, countdown, duration_label, icon_rgba, network_groups, process_ids, program,
+        TrayState, countdown, destination, duration_label, icon_rgba, network_groups, process_ids,
+        program, prompt_scope,
     };
     use crate::approve::{Approvals, Held, Verdict, Window};
     use crate::connections::{Direction, Live};
+    use crate::firewall::RuleAction;
+    use crate::pipe;
     use crate::process::Process;
+    use crate::prompt::{Decision, Inbox, Lasting, Message, Notice};
     use crate::rules::Action;
 
     // Design tokens: one dark theme. Surfaces step up in lightness; status colours are used for meaning only.
@@ -176,6 +209,14 @@ mod app {
     const SEMIBOLD: &str = "semibold";
     /// How long "Copied" confirmations stay visible.
     const FEEDBACK: Duration = Duration::from_secs(2);
+    /// Blocked connections the queue keeps waiting at most; the oldest goes first.
+    const INBOX_MAX: usize = 64;
+    /// The duration the prompt's "Allow for" starts with, one of `prompt::PRESETS`.
+    const NOTICE_MINUTES: u32 = 15;
+    /// How often a hidden app wakes while notices wait, so expired ones leave the queue.
+    const INBOX_TICK: Duration = Duration::from_secs(5);
+    /// How long the service's answer to a decision stays in the status bar.
+    const RESULT_SHOWN: Duration = Duration::from_secs(8);
 
     /// Starts the proxy on its own thread with a stop signal, shows the tray, and returns the proxy's result once it
     /// has stopped: after Quit, Ctrl+C or a proxy error.
@@ -272,6 +313,21 @@ mod app {
         /// The connection monitor's live list, when `[monitor] enabled` (#57).
         network: Option<Arc<Live>>,
         network_filter: String,
+        /// The firewall service's prompt (#59): connections blocked by an `ask` rule, answered over the pipe. The
+        /// client keeps connecting while the app runs; without the service there is simply nothing to ask.
+        firewall: pipe::Client,
+        firewall_events: Receiver<pipe::Event>,
+        firewall_connected: bool,
+        inbox: Inbox,
+        notice_selected: Option<u64>,
+        /// The scope and duration picked for the shown notice. The scope belongs to `scope_for`, the notice it was
+        /// picked for: any other notice starts from the narrowest scope.
+        any_host: bool,
+        any_port: bool,
+        scope_for: Option<u64>,
+        notice_minutes: u32,
+        /// The service's answer to the last decision, shown in the status bar for a while.
+        firewall_result: Option<(Instant, bool, String)>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -428,6 +484,16 @@ mod app {
                 .with_tooltip(TrayState::Running.tooltip(0))
                 .build()
                 .map_err(|e| format!("[ui] cannot create tray icon: {e}"))?;
+            let (firewall_tx, firewall_events) = mpsc::channel();
+            let firewall_ctx = cc.egui_ctx.clone();
+            // Only the running service is trusted as the pipe's server: anyone can create a pipe of that name while
+            // the service is stopped.
+            let firewall = pipe::connect(
+                pipe::NAME,
+                |server| crate::service::pid() == Some(server),
+                firewall_tx,
+                move || firewall_ctx.request_repaint(),
+            )?;
             // Attach before starting the proxy so an immediate approval cannot race window registration.
             let window = approvals.attach();
             // Start the proxy only after the tray exists. A UI initialization failure must never leave an
@@ -460,6 +526,16 @@ mod app {
                 csv_copied: None,
                 network,
                 network_filter: String::new(),
+                firewall,
+                firewall_events,
+                firewall_connected: false,
+                inbox: Inbox::new(INBOX_MAX),
+                notice_selected: None,
+                any_host: false,
+                any_port: false,
+                scope_for: None,
+                notice_minutes: NOTICE_MINUTES,
+                firewall_result: None,
             })
         }
 
@@ -1057,6 +1133,27 @@ mod app {
                         self.open_log();
                     }
                 }
+                if self.firewall_connected {
+                    ui.add_space(8.0);
+                    dot(ui, GREEN, 4.0);
+                    ui.label(RichText::new("Firewall prompt on").size(12.5).color(MUTED))
+                        .on_hover_text("Connected to the Gatewizz firewall service");
+                }
+                if let Some((at, ok, message)) = &self.firewall_result {
+                    let shown = RESULT_SHOWN;
+                    if at.elapsed() < shown {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("Firewall: {message}"))
+                                    .size(12.5)
+                                    .color(if *ok { GREEN } else { RED }),
+                            )
+                            .truncate(),
+                        );
+                        ui.ctx().request_repaint_after(shown - at.elapsed());
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add(quiet_button("Hide to tray"))
@@ -1110,7 +1207,7 @@ mod app {
 
         fn overview(&mut self, ui: &mut egui::Ui, pending: &[(u64, Held, Duration)]) {
             // While requests wait, the decision gets the space; the summary returns once the queue is clear.
-            if pending.is_empty() {
+            if pending.is_empty() && self.inbox.is_empty() {
                 let recent = self.history.len();
                 let blocked = self
                     .history
@@ -1157,9 +1254,14 @@ mod app {
             let selected = self
                 .selected
                 .and_then(|id| pending.iter().find(|p| p.0 == id));
-            match selected {
-                Some((id, held, left)) => self.request(ui, *id, held, *left),
-                None => self.latest_activity(ui),
+            let notice = self
+                .notice_selected
+                .and_then(|id| self.inbox.get(id))
+                .cloned();
+            match (selected, notice) {
+                (Some((id, held, left)), _) => self.request(ui, *id, held, *left),
+                (None, Some(notice)) => self.connection(ui, &notice),
+                (None, None) => self.latest_activity(ui),
             }
         }
 
@@ -1168,14 +1270,14 @@ mod app {
                 caption(ui, "APPROVAL QUEUE");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(pending.len().to_string())
+                        RichText::new((pending.len() + self.inbox.len()).to_string())
                             .font(semibold(12.0))
                             .color(MUTED),
                     );
                 });
             });
             ui.add_space(4.0);
-            if pending.is_empty() {
+            if pending.is_empty() && self.inbox.is_empty() {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.vertical_centered(|ui| {
@@ -1188,9 +1290,13 @@ mod app {
                                 .color(TEXT),
                         );
                         ui.label(
-                            RichText::new("Held requests appear here and open this window.")
-                                .size(12.0)
-                                .color(MUTED),
+                            RichText::new(if self.firewall_connected {
+                                "Held requests and blocked connections appear here and open this window."
+                            } else {
+                                "Held requests appear here and open this window."
+                            })
+                            .size(12.0)
+                            .color(MUTED),
                         );
                         ui.add_space(14.0);
                     });
@@ -1246,7 +1352,252 @@ mod app {
                         }
                         ui.add_space(4.0);
                     }
+                    let notices: Vec<Notice> = self.inbox.notices().cloned().collect();
+                    for notice in &notices {
+                        let active =
+                            self.selected.is_none() && self.notice_selected == Some(notice.id);
+                        let response = egui::Frame::new()
+                            .fill(if active { RAISED } else { SURFACE })
+                            .stroke(Stroke::new(
+                                if active { 1.5 } else { 1.0 },
+                                if active { BLUE } else { BORDER },
+                            ))
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&notice.program)
+                                                .font(semibold(14.0))
+                                                .color(TEXT),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        badge(ui, "Blocked", RED);
+                                    });
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(destination(
+                                            notice.remote,
+                                            notice.port,
+                                            notice.protocol,
+                                        ))
+                                        .font(mono(12.5))
+                                        .color(MUTED),
+                                    )
+                                    .truncate(),
+                                );
+                                let attempts = match notice.count {
+                                    1 => "Connection · 1 attempt".to_string(),
+                                    n => format!("Connection · {n} attempts"),
+                                };
+                                ui.label(RichText::new(attempts).size(12.0).color(SUBTLE));
+                            })
+                            .response
+                            .interact(Sense::click())
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        if response.clicked() {
+                            self.selected = None;
+                            self.notice_selected = Some(notice.id);
+                        }
+                        ui.add_space(4.0);
+                    }
                 });
+        }
+
+        /// A connection the firewall blocked and asks about. Unlike a held request it has no timer: it is blocked
+        /// already, and the app retries once a rule allows it.
+        fn connection(&mut self, ui: &mut egui::Ui, notice: &Notice) {
+            // A widening picked for one notice never carries over to another (another selection, an expiry, or a
+            // repeat folding in under a new id).
+            if self.scope_for != Some(notice.id) {
+                self.scope_for = Some(notice.id);
+                self.any_host = false;
+                self.any_port = false;
+            }
+            let mut decision = None;
+            egui::Panel::bottom("connection_decision")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(Margin {
+                    top: 12,
+                    ..Margin::ZERO
+                }))
+                .show(ui, |ui| {
+                    decision = self.connection_decision(ui, notice);
+                });
+            let protocol = destination(notice.remote, notice.port, notice.protocol);
+            let protocol = protocol.rsplit(' ').next().unwrap_or_default().to_string();
+            card().inner_margin(Margin::same(20)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(ui.available_height());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            caption(ui, "CONNECTION BLOCKED");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                badge(ui, "Firewall", RED);
+                            });
+                        });
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&notice.program).font(semibold(22.0)).color(TEXT),
+                            )
+                            .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(destination(notice.remote, notice.port, notice.protocol))
+                                    .font(mono(14.0))
+                                    .color(BLUE),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(14.0);
+                        caption(ui, "WHY IT WAS BLOCKED");
+                        ui.label(
+                            RichText::new(
+                                "No connection rule allows this, and the firewall asks about it. The first attempt \
+                                 has failed; most programs retry once a rule allows them.",
+                            )
+                            .size(13.0)
+                            .color(MUTED),
+                        );
+                        ui.add_space(14.0);
+                        caption(ui, "CONNECTION");
+                        let (address, port, attempts) = (
+                            notice.remote.to_string(),
+                            notice.port.to_string(),
+                            notice.count.to_string(),
+                        );
+                        details(
+                            ui,
+                            "blocked_connection",
+                            &[
+                                ("Program", &notice.path),
+                                ("Address", &address),
+                                ("Port", &port),
+                                ("Protocol", &protocol),
+                                ("Attempts", &attempts),
+                            ],
+                        );
+                    });
+            });
+            if let Some(decision) = decision {
+                let sent = self.firewall.send(&Message::Decision(decision));
+                self.inbox.take(notice.id);
+                self.notice_selected = None;
+                if !sent {
+                    self.firewall_result = Some((
+                        Instant::now(),
+                        false,
+                        "the firewall service is not connected; the connection stays blocked"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        /// Deny always, allow once, for one of the service's durations, or always; scoped to this address and port
+        /// unless widened.
+        fn connection_decision(&mut self, ui: &mut egui::Ui, notice: &Notice) -> Option<Decision> {
+            let mut answer = None;
+            card().inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let deny = button("Deny always", tint(RED), RED)
+                        .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
+                        .min_size(egui::vec2(width, 38.0));
+                    if ui
+                        .add(deny)
+                        .on_hover_text("Keep blocking, and stop asking")
+                        .clicked()
+                    {
+                        answer = Some((RuleAction::Block, Lasting::Always));
+                    }
+                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE)
+                        .min_size(egui::vec2(width, 38.0));
+                    if ui
+                        .add(allow)
+                        .on_hover_text(
+                            "Allow for two minutes, long enough for the program to retry",
+                        )
+                        .clicked()
+                    {
+                        answer = Some((RuleAction::Allow, Lasting::Once));
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Or allow for").size(12.5).color(MUTED));
+                    // Only the service's durations: it refuses any other.
+                    for minutes in crate::prompt::PRESETS {
+                        if chip(ui, &duration_label(minutes), self.notice_minutes == minutes)
+                            .clicked()
+                        {
+                            self.notice_minutes = minutes;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let grant = button(
+                        &format!("Allow for {}", duration_label(self.notice_minutes)),
+                        RAISED,
+                        TEXT,
+                    )
+                    .stroke(Stroke::new(1.0, BORDER_STRONG))
+                    .min_size(egui::vec2(150.0, 32.0));
+                    if ui.add(grant).clicked() {
+                        answer = Some((RuleAction::Allow, Lasting::Minutes(self.notice_minutes)));
+                    }
+                    let always = button("Allow always", RAISED, TEXT)
+                        .stroke(Stroke::new(1.0, BORDER_STRONG))
+                        .min_size(egui::vec2(120.0, 32.0));
+                    if ui
+                        .add(always)
+                        .on_hover_text("Add a permanent rule to the firewall configuration")
+                        .clicked()
+                    {
+                        answer = Some((RuleAction::Allow, Lasting::Always));
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.any_host, "Any address");
+                    ui.checkbox(&mut self.any_port, "Any port");
+                });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "The rule covers only {}. Closing the window keeps it blocked.",
+                            prompt_scope(
+                                &notice.program,
+                                notice.remote,
+                                notice.port,
+                                self.any_host,
+                                self.any_port,
+                            )
+                        ))
+                        .size(12.0)
+                        .color(SUBTLE),
+                    )
+                    .wrap(),
+                );
+            });
+            answer.map(|(action, lasting)| Decision {
+                id: notice.id,
+                action,
+                lasting,
+                any_host: self.any_host,
+                any_port: self.any_port,
+            })
         }
 
         fn request(&mut self, ui: &mut egui::Ui, id: u64, held: &Held, left: Duration) {
@@ -1845,8 +2196,31 @@ mod app {
                     Wake::Menu(event) => self.on_menu(ctx, &event),
                 }
             }
-            let waiting = self.approvals.pending().len();
-            // A newly held request opens the window.
+            while let Ok(event) = self.firewall_events.try_recv() {
+                match event {
+                    pipe::Event::Connected => self.firewall_connected = true,
+                    pipe::Event::Disconnected => {
+                        // A restarted service does not know these ids; the connections stay blocked.
+                        self.firewall_connected = false;
+                        self.inbox.clear();
+                    }
+                    // Paused means nothing is asked: the connection stays blocked (fail closed).
+                    pipe::Event::Message(Message::Notice(notice)) if !self.approvals.paused() => {
+                        self.inbox.add(notice, Instant::now());
+                    }
+                    pipe::Event::Message(Message::Result { ok, message, .. }) => {
+                        self.firewall_result = Some((Instant::now(), ok, message));
+                    }
+                    pipe::Event::Message(_) => {}
+                }
+            }
+            self.inbox.expire(Instant::now());
+            if !self.inbox.is_empty() {
+                // Expiry needs a frame now and then, also while hidden.
+                ctx.request_repaint_after(INBOX_TICK);
+            }
+            let waiting = self.approvals.pending().len() + self.inbox.len();
+            // A newly held request or blocked connection opens the window.
             if waiting > self.waiting {
                 self.show(ctx, true);
             }
@@ -1873,18 +2247,34 @@ mod app {
                 for (id, _, _) in &pending {
                     self.approvals.answer(*id, Verdict::Deny);
                 }
+                // Blocked connections stay blocked; they are only no longer asked about.
+                self.inbox.clear();
                 self.selected = None;
+                self.notice_selected = None;
                 self.show(&ctx, false);
                 return;
             }
 
+            // One item is shown: the held request or the blocked connection the user picked, else the first held
+            // request (their timers run), else the first blocked connection.
+            let notice_shown = self
+                .notice_selected
+                .is_some_and(|id| self.inbox.get(id).is_some());
             if !self
                 .selected
                 .is_some_and(|id| pending.iter().any(|p| p.0 == id))
             {
-                self.selected = pending.first().map(|p| p.0);
+                self.selected = if notice_shown {
+                    None
+                } else {
+                    pending.first().map(|p| p.0)
+                };
             }
-            let state = TrayState::of(self.approvals.paused(), pending.len());
+            if self.selected.is_none() && !notice_shown {
+                self.notice_selected = self.inbox.notices().next().map(|n| n.id);
+            }
+            let waiting = pending.len() + self.inbox.len();
+            let state = TrayState::of(self.approvals.paused(), waiting);
 
             egui::Panel::top("header")
                 .show_separator_line(false)
@@ -1894,7 +2284,7 @@ mod app {
                     top: 16,
                     bottom: 0,
                 }))
-                .show(ui, |ui| self.header(ui, state, pending.len()));
+                .show(ui, |ui| self.header(ui, state, waiting));
             egui::Panel::bottom("status_bar")
                 .frame(
                     egui::Frame::new()
@@ -2165,6 +2555,32 @@ mod tests {
         assert_eq!(alpha(16, 16), 255);
         assert_eq!(alpha(0, 0), 0);
         assert_eq!(&rgba[(16 * 32 + 16) * 4..][..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn prompt_destinations_and_scopes_read_naturally() {
+        use crate::firewall::Protocol;
+        let v4: std::net::IpAddr = "93.184.215.14".parse().unwrap();
+        let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(destination(v4, 443, Protocol::Tcp), "93.184.215.14:443 tcp");
+        assert_eq!(destination(v6, 53, Protocol::Udp), "[2001:db8::1]:53 udp");
+        assert_eq!(destination(v4, 0, Protocol::Any), "93.184.215.14:0 ip");
+        assert_eq!(
+            prompt_scope("curl.exe", v4, 443, false, false),
+            "curl.exe connecting to 93.184.215.14 on port 443"
+        );
+        assert_eq!(
+            prompt_scope("curl.exe", v4, 443, true, false),
+            "curl.exe connecting to any address on port 443"
+        );
+        assert_eq!(
+            prompt_scope("curl.exe", v4, 443, false, true),
+            "curl.exe connecting to 93.184.215.14 on any port"
+        );
+        assert_eq!(
+            prompt_scope("curl.exe", v4, 443, true, true),
+            "curl.exe connecting anywhere"
+        );
     }
 
     #[test]

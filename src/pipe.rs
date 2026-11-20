@@ -31,7 +31,7 @@ pub fn device_to_dos(device_path: &str, drives: &[(String, String)]) -> Option<S
 }
 
 #[cfg(windows)]
-pub use sys::{Server, drives, serve};
+pub use sys::{Client, Event, Server, connect, drives, serve};
 
 #[cfg(windows)]
 mod sys {
@@ -55,8 +55,8 @@ mod sys {
         QueryDosDeviceW,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -288,32 +288,57 @@ mod sys {
     /// How long the client loop waits when there is nothing to read or write.
     const POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-    /// Serves one connected client until it disconnects or the server stops. This thread does all of the pipe's
-    /// I/O: it writes what `send` queued, then reads only what `PeekNamedPipe` says is there, so no read ever
-    /// blocks a write. Decisions go to `decisions`; bad lines are answered, never acted on.
+    /// Serves one connected client until it disconnects or the server stops. Decisions go to `decisions`; bad
+    /// lines are answered, never acted on.
     fn serve_client(
         handle: HANDLE,
         client: &Mutex<Option<VecDeque<String>>>,
         decisions: &Sender<prompt::Decision>,
         stopping: &AtomicBool,
     ) {
-        // The server loop owns `handle` and closes it; ManuallyDrop makes sure this File never does, also when
+        pump(handle, client, stopping, |line| {
+            let refusal = match line {
+                Ok(Message::Decision(d)) => {
+                    let _ = decisions.send(d);
+                    return None;
+                }
+                Ok(_) => "only decisions are accepted".to_string(),
+                Err(err) => err,
+            };
+            Some(Message::Result {
+                id: 0,
+                ok: false,
+                message: refusal,
+            })
+        });
+    }
+
+    /// Runs one pipe connection, either end, until the other end goes away or `stopping` is set. This thread does
+    /// all of the pipe's I/O: it writes what was queued in `outbox`, then reads only what `PeekNamedPipe` says is
+    /// there, so no read ever blocks a write (synchronous I/O on one pipe is serialized). Each line read goes to
+    /// `on_line`, whose answer, if any, is queued. `outbox` is `Some` while the connection runs.
+    fn pump(
+        handle: HANDLE,
+        outbox: &Mutex<Option<VecDeque<String>>>,
+        stopping: &AtomicBool,
+        mut on_line: impl FnMut(Result<Message, String>) -> Option<Message>,
+    ) {
+        // The caller owns `handle` and closes it; ManuallyDrop makes sure this File never does, also when
         // unwinding. I/O goes through `&File`.
         let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(handle as _) });
         let mut io = &*file;
-        *client.lock().unwrap_or_else(|e| e.into_inner()) = Some(VecDeque::new());
+        *outbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(VecDeque::new());
         let mut pending: Vec<u8> = Vec::new();
-        let reply = |message: String| {
-            if let Some(outbox) = client.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                outbox.push_back(prompt::encode(&Message::Result {
-                    id: 0,
-                    ok: false,
-                    message,
-                }));
+        let queue = |message: Option<Message>| {
+            if let (Some(message), Some(q)) = (
+                message,
+                outbox.lock().unwrap_or_else(|e| e.into_inner()).as_mut(),
+            ) {
+                q.push_back(prompt::encode(&message));
             }
         };
-        'serve: while !stopping.load(Ordering::SeqCst) {
-            let outgoing: Vec<String> = client
+        'run: while !stopping.load(Ordering::SeqCst) {
+            let outgoing: Vec<String> = outbox
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_mut()
@@ -321,7 +346,7 @@ mod sys {
                 .unwrap_or_default();
             for line in &outgoing {
                 if io.write_all(line.as_bytes()).is_err() {
-                    break 'serve;
+                    break 'run;
                 }
             }
             let mut available = 0u32;
@@ -336,7 +361,7 @@ mod sys {
                 )
             };
             if ok == 0 {
-                // The client went away.
+                // The other end went away.
                 break;
             }
             if available == 0 {
@@ -352,21 +377,155 @@ mod sys {
             }
             while let Some(end) = pending.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = pending.drain(..=end).collect();
-                match prompt::decode(&String::from_utf8_lossy(&line)) {
-                    Ok(Message::Decision(d)) => {
-                        let _ = decisions.send(d);
-                    }
-                    Ok(_) => reply("only decisions are accepted".into()),
-                    Err(err) => reply(err),
-                }
+                queue(on_line(prompt::decode(&String::from_utf8_lossy(&line))));
             }
-            // Bounded: a client that never sends a newline cannot make the service buffer without limit.
+            // Bounded: a peer that never sends a newline cannot make this end buffer without limit.
             if pending.len() > prompt::MAX_LINE {
-                reply(format!("message longer than {} bytes", prompt::MAX_LINE));
+                queue(on_line(Err(format!(
+                    "message longer than {} bytes",
+                    prompt::MAX_LINE
+                ))));
                 break;
             }
         }
-        *client.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // A last answer (the refusal of an overlong line) still goes out before the connection closes.
+        let last: Vec<String> = outbox
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default();
+        for line in &last {
+            if io.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// What the tray app's [`Client`] reports.
+    #[derive(Debug, PartialEq)]
+    pub enum Event {
+        /// Connected to the service: notices may follow.
+        Connected,
+        /// The service went away (stopped, restarted or removed). Notices it sent can no longer be answered, since
+        /// a restarted service starts its ids again.
+        Disconnected,
+        /// A notice or the result of a decision.
+        Message(Message),
+    }
+
+    /// How long the client waits before trying the pipe again, when the service is not running.
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The tray app's end of the pipe: it keeps connecting to the service while it runs, and reports what arrives.
+    pub struct Client {
+        /// Queued lines for the service, `None` while not connected. Only the client thread touches the pipe.
+        outbox: Arc<Mutex<Option<VecDeque<String>>>>,
+        stopping: Arc<AtomicBool>,
+        thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl Client {
+        /// Queues a message for the service. `false` when not connected (or the queue is full): the decision is
+        /// lost, and the connection stays blocked.
+        pub fn send(&self, message: &Message) -> bool {
+            let mut outbox = self.outbox.lock().unwrap_or_else(|e| e.into_inner());
+            match outbox.as_mut() {
+                Some(q) if q.len() < OUTBOX_MAX => {
+                    q.push_back(prompt::encode(message));
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Stops connecting and returns once the client thread is done. Safe to call more than once.
+        pub fn stop(&self) {
+            self.stopping.store(true, Ordering::SeqCst);
+            let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for Client {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    /// Connects to the pipe `name` whenever it exists, and keeps doing so after each disconnect, until stopped.
+    /// `trusted` gets the pipe server's process id and decides whether to talk to it: anyone may create a pipe
+    /// of that name while the service is not running, and such a squatter must not be shown as the firewall.
+    /// Every event goes to `events`, followed by a call to `wake`.
+    pub fn connect(
+        name: &str,
+        trusted: impl Fn(u32) -> bool + Send + 'static,
+        events: Sender<Event>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Client, String> {
+        let outbox: Arc<Mutex<Option<VecDeque<String>>>> = Arc::default();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (thread_outbox, thread_stopping, name) =
+            (outbox.clone(), stopping.clone(), name.to_string());
+        let thread = std::thread::Builder::new()
+            .name("prompt-pipe".into())
+            .spawn(move || {
+                let report = |event: Event| {
+                    let _ = events.send(event);
+                    wake();
+                };
+                while !thread_stopping.load(Ordering::SeqCst) {
+                    let handle = unsafe {
+                        CreateFileW(
+                            wide(&name).as_ptr(),
+                            GENERIC_READ | GENERIC_WRITE,
+                            0,
+                            null(),
+                            OPEN_EXISTING,
+                            0,
+                            null_mut(),
+                        )
+                    };
+                    if handle == INVALID_HANDLE_VALUE {
+                        wait(&thread_stopping, RETRY);
+                        continue;
+                    }
+                    let mut server = 0u32;
+                    let known = unsafe { GetNamedPipeServerProcessId(handle, &mut server) } != 0;
+                    if !known || !trusted(server) {
+                        unsafe { CloseHandle(handle) };
+                        wait(&thread_stopping, RETRY);
+                        continue;
+                    }
+                    report(Event::Connected);
+                    pump(handle, &thread_outbox, &thread_stopping, |line| {
+                        if let Ok(message @ (Message::Notice(_) | Message::Result { .. })) = line {
+                            report(Event::Message(message));
+                        }
+                        // Anything else from the service is ignored: the tray app never answers it.
+                        None
+                    });
+                    unsafe { CloseHandle(handle) };
+                    report(Event::Disconnected);
+                    wait(&thread_stopping, RETRY);
+                }
+            })
+            .map_err(|e| format!("[ui] cannot start the firewall prompt client: {e}"))?;
+        Ok(Client {
+            outbox,
+            stopping,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    /// Sleeps up to `total`, in short steps so a stop is noticed quickly.
+    fn wait(stopping: &AtomicBool, total: std::time::Duration) {
+        let deadline = std::time::Instant::now() + total;
+        while !stopping.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(POLL * 5);
+        }
     }
 }
 
@@ -552,5 +711,75 @@ mod tests {
         assert!(line.contains("\"result\""), "{line}");
         drop(client);
         server.stop();
+    }
+
+    /// The tray app's client: it talks only to a trusted server, gets notices, sends decisions, and notices when
+    /// the server goes away.
+    #[cfg(windows)]
+    #[test]
+    fn the_client_talks_only_to_a_trusted_server() {
+        use std::time::Duration;
+        let name = format!(r"\\.\pipe\gatewizz-fw-client-{}", std::process::id());
+        let (decisions_tx, decisions) = std::sync::mpsc::channel();
+        let server = serve(&name, SDDL, decisions_tx).unwrap();
+
+        // A server it does not trust is never reported, and it leaves the pipe free for the next client.
+        let (tx, untrusted_events) = std::sync::mpsc::channel();
+        let untrusted = connect(&name, |_| false, tx, || {}).unwrap();
+        assert!(
+            untrusted_events
+                .recv_timeout(Duration::from_secs(1))
+                .is_err()
+        );
+        untrusted.stop();
+
+        let me = std::process::id();
+        let (tx, events) = std::sync::mpsc::channel();
+        let client = connect(&name, move |pid| pid == me, tx, || {}).unwrap();
+        // The untrusted client's connection may still be closing; the server takes the next one after it.
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Event::Connected
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.connected() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let notice = crate::prompt::Notice {
+            id: 3,
+            program: "curl.exe".into(),
+            path: r"C:\tools\curl.exe".into(),
+            remote: "192.0.2.2".parse().unwrap(),
+            port: 9,
+            protocol: crate::firewall::Protocol::Tcp,
+            count: 1,
+        };
+        assert!(server.send(&crate::prompt::Message::Notice(notice.clone())));
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Message(crate::prompt::Message::Notice(notice))
+        );
+        let decision = crate::prompt::Decision {
+            id: 3,
+            action: crate::firewall::RuleAction::Allow,
+            lasting: crate::prompt::Lasting::Once,
+            any_host: false,
+            any_port: true,
+        };
+        assert!(client.send(&crate::prompt::Message::Decision(decision.clone())));
+        assert_eq!(
+            decisions.recv_timeout(Duration::from_secs(5)).unwrap(),
+            decision
+        );
+        server.stop();
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Disconnected
+        );
+        assert!(
+            !client.send(&crate::prompt::Message::Decision(decision)),
+            "nothing to send to"
+        );
+        client.stop();
     }
 }

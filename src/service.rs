@@ -623,6 +623,13 @@ fn blocked_line(d: &wfp::Dropped) -> String {
     )
 }
 
+/// The firewall service's process id while it runs. The tray app checks the prompt pipe's server against it, so
+/// another program that created a pipe of the same name is never trusted.
+#[cfg(windows)]
+pub fn pid() -> Option<u32> {
+    sys::pid()
+}
+
 /// `gatewizz firewall service`: the entry point Windows starts. Not for interactive use.
 #[cfg(windows)]
 pub fn run() -> Result<(), String> {
@@ -731,6 +738,28 @@ mod sys {
             return Err(last_error(&format!("query the service {NAME}")));
         }
         Ok(status.dwCurrentState)
+    }
+
+    /// The running service's process id, `None` when it is not installed or not running. Needs only
+    /// `SERVICE_QUERY_STATUS`, which every signed-in user has.
+    pub fn pid() -> Option<u32> {
+        use windows_sys::Win32::System::Services::{
+            QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+        };
+        let service = open(SERVICE_QUERY_STATUS).ok()??;
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0u32;
+        let ok = unsafe {
+            QueryServiceStatusEx(
+                service.0,
+                SC_STATUS_PROCESS_INFO,
+                (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+                size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            )
+        };
+        (ok != 0 && status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId != 0)
+            .then_some(status.dwProcessId)
     }
 
     pub fn state() -> Result<Option<&'static str>, String> {

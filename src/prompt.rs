@@ -245,6 +245,81 @@ pub fn rule_toml(rule: &Rule) -> String {
     format!("\n# Added from the firewall prompt.\n{body}")
 }
 
+/// The tray app forgets a notice this much before the service does, so an answer never arrives just too late.
+pub const INBOX_TTL: Duration = Duration::from_secs(NOTICE_TTL.as_secs() - 60);
+
+/// The tray app's side: the notices waiting for an answer, newest last. Notices for the same program path,
+/// address, port and protocol fold into one, which answers with the newest id and adds up the attempts.
+pub struct Inbox {
+    max: usize,
+    waiting: Vec<(Instant, Notice)>,
+}
+
+impl Inbox {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max: max.max(1),
+            waiting: Vec::new(),
+        }
+    }
+
+    /// Adds a notice; `true` when it is new rather than folded into one already waiting.
+    pub fn add(&mut self, notice: Notice, now: Instant) -> bool {
+        self.expire(now);
+        let same = |n: &Notice| {
+            n.path.eq_ignore_ascii_case(&notice.path)
+                && n.remote == notice.remote
+                && n.port == notice.port
+                && n.protocol == notice.protocol
+        };
+        if let Some(at) = self.waiting.iter().position(|(_, n)| same(n)) {
+            let (_, old) = self.waiting.remove(at);
+            let count = old.count.saturating_add(notice.count);
+            self.waiting.push((now, Notice { count, ..notice }));
+            return false;
+        }
+        if self.waiting.len() >= self.max {
+            self.waiting.remove(0);
+        }
+        self.waiting.push((now, notice));
+        true
+    }
+
+    /// Forgets the notices the service no longer remembers.
+    pub fn expire(&mut self, now: Instant) {
+        self.waiting
+            .retain(|(at, _)| now.duration_since(*at) < INBOX_TTL);
+    }
+
+    /// Takes a notice out to answer it.
+    pub fn take(&mut self, id: u64) -> Option<Notice> {
+        let at = self.waiting.iter().position(|(_, n)| n.id == id)?;
+        Some(self.waiting.remove(at).1)
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Notice> {
+        self.notices().find(|n| n.id == id)
+    }
+
+    /// Oldest first.
+    pub fn notices(&self) -> impl Iterator<Item = &Notice> {
+        self.waiting.iter().map(|(_, n)| n)
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+
+    /// Forgets everything: the service went away, and a restarted one does not know these ids.
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +514,43 @@ mod tests {
                 .connection_rules;
             assert_eq!(rules.len(), 1, "{combined}");
         }
+    }
+
+    #[test]
+    fn the_inbox_folds_repeats_and_forgets_in_time() {
+        let now = Instant::now();
+        let (mut o, first, _) = sent();
+        let mut inbox = Inbox::new(2);
+        assert!(inbox.add(first.clone(), now));
+        // The same program, address and port again, as the service sends it after its coalescing window.
+        let again = o.add(
+            "curl.exe",
+            &PATH.to_ascii_uppercase(),
+            first.remote,
+            first.port,
+            first.protocol,
+            now,
+        );
+        assert!(!inbox.add(again.clone(), now + Duration::from_secs(61)));
+        assert_eq!(inbox.len(), 1);
+        let folded = inbox.get(again.id).unwrap();
+        assert_eq!(folded.count, 2, "attempts add up");
+        assert!(inbox.get(first.id).is_none(), "the newest id answers");
+
+        // Another port is another notice; the oldest goes when full.
+        let other = |port| Notice {
+            id: u64::from(port),
+            port,
+            ..first.clone()
+        };
+        assert!(inbox.add(other(1), now));
+        assert!(inbox.add(other(2), now));
+        assert_eq!(inbox.notices().map(|n| n.port).collect::<Vec<_>>(), [1, 2]);
+
+        assert_eq!(inbox.take(1).unwrap().port, 1);
+        assert!(inbox.take(1).is_none());
+        inbox.expire(now + INBOX_TTL);
+        assert!(inbox.is_empty());
+        assert!(INBOX_TTL < NOTICE_TTL);
     }
 }

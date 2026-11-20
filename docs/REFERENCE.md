@@ -169,7 +169,7 @@ Timeout, a full queue or pausing approvals blocks the request. All approvals sha
 
 ## Activity history
 
-The Gatewizz window has three tabs: **Overview** (summary counts and pending approvals), **Activity history** and **Network** (see [Connection monitor](#connection-monitor)). The history tab shows recent decisions read back from the event log. It shows only the metadata the log already holds, never request content.
+The Gatewizz window has three tabs: **Overview** (summary counts, pending approvals and, with the connection firewall, blocked connections to decide), **Activity history** and **Network** (see [Connection monitor](#connection-monitor)). The history tab shows recent decisions read back from the event log. It shows only the metadata the log already holds, never request content.
 
 - **Source:** the current event file and up to five rotated files (`events.jsonl.1` to `.5`). From each file only the last 1 MiB is read, and at most 500 events are shown, newest first. The list refreshes every two seconds. If `[events].path = "-"` (stdout), there is no file to read and the tab says that persistent history is disabled.
 - **Summary:** counts of recent, blocked and other events.
@@ -242,7 +242,10 @@ gatewizz firewall remove                           # remove the service, every f
   - **Where the rules go:** "always" rules are appended to the protected configuration as `[[connection_rules]]` (your text and comments stay) and validated first. Timed rules stay in the service's memory until they expire.
   - **The service only asks:** with no client connected, nothing is asked and the connection stays blocked.
 
-Not yet: the prompt itself in the tray app, which is the client of this pipe. That is the next step of #59. Until then, `ask` blocks without asking.
+- **The prompt in the tray app:** while it runs, the tray app connects to the pipe, retrying every 2 seconds. It talks only to the running `gatewizz-fw` service, which it checks by comparing the pipe server's process id with the service's, so another program that created a pipe of the same name is ignored. The status bar shows **Firewall prompt on** while connected.
+  - Each notice appears in the Overview's approval queue and opens the window, like a held request. Repeats for the same program, address, port and protocol fold into one entry, which counts the attempts.
+  - The choices are **Allow once**, **Allow for** 5 or 15 minutes, 1 or 8 hours, **Allow always** and **Deny always**. **Any address** and **Any port** widen the rule; by default it covers only that program, address and port. The service's answer (the rule it added, or why it refused) shows in the status bar.
+  - Unlike a held request, a blocked connection has no timer: it has failed already, and the program retries once a rule allows it. Closing the window, pausing approvals, or the service restarting drops the waiting notices, and those connections stay blocked. A notice that is not answered within 9 minutes is dropped too, since the service forgets it after 10.
 
 ## Events and privacy
 
