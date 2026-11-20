@@ -87,6 +87,7 @@ mod app {
     use std::sync::mpsc;
     use std::thread::JoinHandle;
     use std::time::Duration;
+    use std::fs;
 
     use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, ViewportCommand};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -179,7 +180,12 @@ mod app {
         events_path: Option<PathBuf>,
         quit: Option<tokio::sync::oneshot::Sender<()>>,
         proxy: Option<JoinHandle<Result<(), String>>>,
+        tab: Tab,
+        history_filter: String,
     }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Tab { Overview, Activity }
 
     impl App {
         fn new(
@@ -263,6 +269,8 @@ mod app {
                 events_path,
                 quit: Some(quit),
                 proxy: Some(proxy),
+                tab: Tab::Overview,
+                history_filter: String::new(),
             })
         }
 
@@ -320,6 +328,14 @@ mod app {
         }
     }
 
+    fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(105.0);
+            ui.label(RichText::new(value).size(21.0).strong().color(color));
+            ui.label(RichText::new(label).size(9.0).strong().color(MUTED));
+        });
+    }
+
     fn metadata(ui: &mut egui::Ui, key: &str, value: &str) {
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -328,6 +344,34 @@ mod app {
             );
             ui.label(RichText::new(value).size(11.0));
         });
+    }
+
+    /// Reads a bounded metadata-only view of the active log and its rotations.
+    fn history_rows(path: Option<&PathBuf>) -> Vec<serde_json::Value> {
+        let Some(path) = path else { return Vec::new() };
+        let mut rows = Vec::new();
+        for suffix in (0..=5).rev() {
+            let candidate = if suffix == 0 { path.clone() } else {
+                let mut name = path.as_os_str().to_owned();
+                name.push(format!(".{suffix}"));
+                PathBuf::from(name)
+            };
+            let Ok(contents) = fs::read_to_string(candidate) else { continue };
+            for line in contents.lines().rev() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    rows.push(value);
+                    if rows.len() >= 500 { return rows; }
+                }
+            }
+        }
+        rows
+    }
+
+    fn event_process(value: &serde_json::Value) -> String {
+        if let Some(image) = value.pointer("/process/known/image").and_then(|v| v.as_str()) {
+            return image.rsplit(['\\\\', '/']).next().unwrap_or(image).to_string();
+        }
+        value.get("process").map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())
     }
 
     fn icon(state: TrayState) -> Icon {
@@ -431,6 +475,67 @@ mod app {
                     .size(11.0).color(MUTED));
                 ui.add_space(10.0);
                 ui.separator();
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let overview = ui.selectable_label(self.tab == Tab::Overview, "  Overview  ");
+                    if overview.clicked() { self.tab = Tab::Overview; }
+                    let activity = ui.selectable_label(self.tab == Tab::Activity, "  Activity history  ");
+                    if activity.clicked() { self.tab = Tab::Activity; }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{} pending", pending.len())).size(10.0).color(AMBER));
+                    });
+                });
+                ui.separator();
+                if self.tab == Tab::Activity {
+                    let rows = history_rows(self.events_path.as_ref());
+                    let blocked = rows.iter().filter(|r| r.get("status").and_then(|v| v.as_u64()).is_some_and(|n| n == 403)).count();
+                    let allowed = rows.len().saturating_sub(blocked);
+                    ui.horizontal(|ui| {
+                        stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
+                        stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
+                        stat_card(ui, "OTHER", &allowed.to_string(), GREEN);
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("ACTIVITY").strong().size(11.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.history_filter).hint_text("Filter host or process...").desired_width(220.0));
+                        });
+                    });
+                    ui.add_space(5.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        egui::Grid::new("activity_grid").striped(true).num_columns(5).show(ui, |ui| {
+                            for heading in ["TIME (UTC)", "APPLICATION", "DESTINATION", "DECISION", "STATUS"] {
+                                ui.label(RichText::new(heading).size(9.0).strong().color(MUTED));
+                            }
+                            ui.end_row();
+                            let filter = self.history_filter.to_lowercase();
+                            for row in rows.iter().filter(|r| {
+                                let hay = format!("{} {}", r.get("host").and_then(|v| v.as_str()).unwrap_or(""), event_process(r)).to_lowercase();
+                                filter.is_empty() || hay.contains(&filter)
+                            }) {
+                                let time = row.get("time").and_then(|v| v.as_str()).unwrap_or("-");
+                                let host = row.get("host").and_then(|v| v.as_str()).unwrap_or("-");
+                                let status = row.get("status").map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+                                let decision = row.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+                                let color = if status == "403" { RED } else { GREEN };
+                                ui.label(RichText::new(time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
+                                ui.label(RichText::new(event_process(row)).size(10.0));
+                                ui.label(RichText::new(host).size(10.0).color(BLUE));
+                                ui.label(RichText::new(decision).size(10.0));
+                                ui.label(RichText::new(status).size(10.0).strong().color(color));
+                                ui.end_row();
+                            }
+                        });
+                        if rows.is_empty() {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("No events recorded yet. Requests appear here as metadata only.").color(MUTED));
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("History contains request metadata only. Bodies, header values and query strings are never stored.").size(10.0).color(MUTED));
+                    return;
+                }
                 ui.add_space(8.0);
 
                 ui.columns(2, |columns| {
