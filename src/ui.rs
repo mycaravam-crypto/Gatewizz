@@ -846,6 +846,7 @@ mod app {
             *APP_RESULT.lock().expect("result poisoned") = result;
         }
     }
+
     #[cfg(test)]
     mod history_tests {
         use super::*;
