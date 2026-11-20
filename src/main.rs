@@ -253,6 +253,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::StartupInstall(path) => {
             let config = load(path.clone())?;
             config.event_target()?;
+            proxy_settings(&config, config::data_dir())?;
             println!("{}", startup::install(path.as_deref())?);
         }
         Command::StartupRemove => println!("{}", startup::remove()?),
