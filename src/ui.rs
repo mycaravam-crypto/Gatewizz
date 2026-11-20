@@ -287,25 +287,26 @@ mod app {
             });
             let (history_tx, history_rx) = mpsc::channel();
             let (history_stop, stop_history) = mpsc::channel();
-            let history_path = events_path.clone();
-            let history_ctx = cc.egui_ctx.clone();
-            let history_worker = std::thread::Builder::new()
-                .name("activity-history".into())
-                .spawn(move || {
-                    loop {
-                        if let Some(path) = history_path.as_ref() {
-                            if history_tx.send(load_history(path)).is_err() {
+            let history_worker = if let Some(history_path) = events_path.clone() {
+                let history_ctx = cc.egui_ctx.clone();
+                Some(
+                    std::thread::Builder::new()
+                        .name("activity-history".into())
+                        .spawn(move || loop {
+                            if history_tx.send(load_history(&history_path)).is_err() {
                                 break;
                             }
                             history_ctx.request_repaint();
-                        }
-                        match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
-                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        }
-                    }
-                })
-                .map_err(|e| format!("[ui] cannot start activity history worker: {e}"))?;
+                            match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
+                                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            }
+                        })
+                        .map_err(|e| format!("[ui] cannot start activity history worker: {e}"))?,
+                )
+            } else {
+                None
+            };
 
             let items = Items {
                 pause: MenuItem::new("Pause", true, None),
@@ -354,7 +355,7 @@ mod app {
                 history: Vec::new(),
                 history_rx,
                 history_stop,
-                history_worker: Some(history_worker),
+                history_worker,
             })
         }
 
