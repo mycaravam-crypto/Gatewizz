@@ -435,7 +435,7 @@ mod app {
         let mut rows = Vec::new();
         for suffix in 0..=MAX_LOG_ROTATIONS {
             let candidate = if suffix == 0 {
-                path.clone()
+                path.to_path_buf()
             } else {
                 let mut name = path.as_os_str().to_owned();
                 name.push(format!(".{suffix}"));
