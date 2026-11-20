@@ -81,12 +81,13 @@ pub use app::run;
 
 #[cfg(windows)]
 mod app {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread::JoinHandle;
-    use std::fs;
     use std::time::Duration;
 
     use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, ViewportCommand};
@@ -98,6 +99,7 @@ mod app {
     use super::{TrayState, icon_rgba, program};
     use crate::approve::{Approvals, Verdict, Window};
     use crate::process::Process;
+    use crate::rules::Action;
 
     const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x18);
     const PANEL: Color32 = Color32::from_rgb(0x15, 0x1b, 0x25);
@@ -182,12 +184,63 @@ mod app {
         proxy: Option<JoinHandle<Result<(), String>>>,
         tab: Tab,
         history_filter: String,
+        history: Vec<HistoryEvent>,
+        history_rx: Receiver<Vec<HistoryEvent>>,
+        history_stop: Sender<()>,
+        history_worker: Option<JoinHandle<()>>,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Tab {
         Overview,
         Activity,
+    }
+
+    const MAX_LOG_ROTATIONS: usize = 5;
+    const MAX_HISTORY_ROWS: usize = 500;
+    const MAX_HISTORY_FILE_BYTES: u64 = 1024 * 1024;
+    const HISTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+    #[derive(Debug, Clone, Default, serde::Deserialize)]
+    #[serde(default)]
+    struct HistoryEvent {
+        time: String,
+        host: String,
+        status: u16,
+        action: Option<Action>,
+        process: HistoryProcess,
+    }
+
+    #[derive(Debug, Clone, Default, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum HistoryProcess {
+        Known { image: String },
+        Unknown(String),
+        #[default]
+        Unavailable,
+    }
+
+    impl HistoryEvent {
+        fn process_name(&self) -> String {
+            match &self.process {
+                HistoryProcess::Known { image } => image
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(image)
+                    .to_string(),
+                HistoryProcess::Unknown(reason) => format!("unknown ({reason})"),
+                HistoryProcess::Unavailable => "unknown".into(),
+            }
+        }
+
+        fn decision(&self) -> &'static str {
+            match self.action {
+                Some(Action::Allow) => "allow",
+                Some(Action::Block) => "block",
+                Some(Action::Approve) => "approve",
+                None => "-",
+            }
+        }
     }
 
     impl App {
@@ -230,6 +283,26 @@ mod app {
                     }
                 });
             });
+            let (history_tx, history_rx) = mpsc::channel();
+            let (history_stop, stop_history) = mpsc::channel();
+            let history_path = events_path.clone();
+            let history_worker = std::thread::Builder::new()
+                .name("activity-history".into())
+                .spawn(move || {
+                    loop {
+                        if let Some(path) = history_path.as_ref() {
+                            if history_tx.send(load_history(path)).is_err() {
+                                break;
+                            }
+                        }
+                        match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                })
+                .map_err(|e| format!("[ui] cannot start activity history worker: {e}"))?;
+
             let items = Items {
                 pause: MenuItem::new("Pause", true, None),
                 open_log: MenuItem::new("Open event log", events_path.is_some(), None),
@@ -274,6 +347,10 @@ mod app {
                 proxy: Some(proxy),
                 tab: Tab::Overview,
                 history_filter: String::new(),
+                history: Vec::new(),
+                history_rx,
+                history_stop,
+                history_worker: Some(history_worker),
             })
         }
 
@@ -349,11 +426,10 @@ mod app {
         });
     }
 
-    /// Reads a bounded metadata-only view of the active log and its rotations.
-    fn history_rows(path: Option<&PathBuf>) -> Vec<serde_json::Value> {
-        let Some(path) = path else { return Vec::new() };
+    /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
+    fn load_history(path: &PathBuf) -> Vec<HistoryEvent> {
         let mut rows = Vec::new();
-        for suffix in 0..=5 {
+        for suffix in 0..=MAX_LOG_ROTATIONS {
             let candidate = if suffix == 0 {
                 path.clone()
             } else {
@@ -361,36 +437,37 @@ mod app {
                 name.push(format!(".{suffix}"));
                 PathBuf::from(name)
             };
-            let Ok(contents) = fs::read_to_string(candidate) else {
+            let Ok(mut file) = File::open(candidate) else {
                 continue;
             };
+            let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+                continue;
+            };
+            let offset = length.saturating_sub(MAX_HISTORY_FILE_BYTES);
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut contents = String::new();
+            if file.take(MAX_HISTORY_FILE_BYTES).read_to_string(&mut contents).is_err() {
+                continue;
+            }
+            // A bounded tail can begin halfway through a JSON line. Discard that partial record.
+            if offset > 0 {
+                let Some(newline) = contents.find('\\n') else {
+                    continue;
+                };
+                contents.drain(..=newline);
+            }
             for line in contents.lines().rev() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                    rows.push(value);
-                    if rows.len() >= 500 {
+                if let Ok(event) = serde_json::from_str::<HistoryEvent>(line) {
+                    rows.push(event);
+                    if rows.len() >= MAX_HISTORY_ROWS {
                         return rows;
                     }
                 }
             }
         }
         rows
-    }
-
-    fn event_process(value: &serde_json::Value) -> String {
-        if let Some(image) = value
-            .pointer("/process/known/image")
-            .and_then(|v| v.as_str())
-        {
-            return image
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or(image)
-                .to_string();
-        }
-        value
-            .get("process")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown".into())
     }
 
     fn icon(state: TrayState) -> Icon {
@@ -419,8 +496,9 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Keep activity history fresh while the window is open without busy-looping.
-            ctx.request_repaint_after(Duration::from_secs(1));
+            while let Ok(history) = self.history_rx.try_recv() {
+                self.history = history;
+            }
             while let Ok(wake) = self.wake.try_recv() {
                 match wake {
                     Wake::Tray(TrayIconEvent::Click {
@@ -508,8 +586,8 @@ mod app {
                 });
                 ui.separator();
                 if self.tab == Tab::Activity {
-                    let rows = history_rows(self.events_path.as_ref());
-                    let blocked = rows.iter().filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("block")).count();
+                    let rows = &self.history;
+                    let blocked = rows.iter().filter(|event| event.action == Some(Action::Block)).count();
                     let allowed = rows.len().saturating_sub(blocked);
                     ui.horizontal(|ui| {
                         stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
@@ -531,20 +609,21 @@ mod app {
                             }
                             ui.end_row();
                             let filter = self.history_filter.to_lowercase();
-                            for row in rows.iter().filter(|r| {
-                                let hay = format!("{} {}", r.get("host").and_then(|v| v.as_str()).unwrap_or(""), event_process(r)).to_lowercase();
+                            for event in rows.iter().filter(|event| {
+                                let hay = format!("{} {}", event.host, event.process_name()).to_lowercase();
                                 filter.is_empty() || hay.contains(&filter)
                             }) {
-                                let time = row.get("time").and_then(|v| v.as_str()).unwrap_or("-");
-                                let host = row.get("host").and_then(|v| v.as_str()).unwrap_or("-");
-                                let status = row.get("status").map(|v| v.to_string()).unwrap_or_else(|| "-".into());
-                                let decision = row.get("action").and_then(|v| v.as_str()).unwrap_or("-");
-                                let color = if decision == "block" { RED } else if decision == "approve" { AMBER } else { GREEN };
-                                ui.label(RichText::new(time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
-                                ui.label(RichText::new(event_process(row)).size(10.0));
-                                ui.label(RichText::new(host).size(10.0).color(BLUE));
+                                let decision = event.decision();
+                                let color = match event.action {
+                                    Some(Action::Block) => RED,
+                                    Some(Action::Approve) => AMBER,
+                                    _ => GREEN,
+                                };
+                                ui.label(RichText::new(event.time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
+                                ui.label(RichText::new(event.process_name()).size(10.0));
+                                ui.label(RichText::new(&event.host).size(10.0).color(BLUE));
                                 ui.label(RichText::new(decision).size(10.0));
-                                ui.label(RichText::new(status).size(10.0).strong().color(color));
+                                ui.label(RichText::new(event.status.to_string()).size(10.0).strong().color(color));
                                 ui.end_row();
                             }
                         });
@@ -558,8 +637,8 @@ mod app {
                     ui.label(RichText::new("History contains request metadata only. Bodies, header values and query strings are never stored.").size(10.0).color(MUTED));
                     return;
                 }
-                let recent = history_rows(self.events_path.as_ref());
-                let blocked = recent.iter().filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("block")).count();
+                let recent = &self.history;
+                let blocked = recent.iter().filter(|event| event.action == Some(Action::Block)).count();
                 let allowed = recent.len().saturating_sub(blocked);
                 ui.horizontal(|ui| {
                     stat_card(ui, "RECENT REQUESTS", &recent.len().to_string(), BLUE);
@@ -736,6 +815,10 @@ mod app {
         }
 
         fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+            let _ = self.history_stop.send(());
+            if let Some(worker) = self.history_worker.take() {
+                let _ = worker.join();
+            }
             self.approvals.set_paused(true);
             if let Some(quit) = self.quit.take() {
                 let _ = quit.send(());
