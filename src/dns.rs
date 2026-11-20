@@ -198,7 +198,8 @@ mod sys {
         addr.map(|a| unsafe { std::mem::transmute::<usize, GetCacheDataTable>(a) })
     }
 
-    pub fn answers() -> Result<Vec<Answer>, String> {
+    /// Every (name, record type) the DNS Client cache lists, names NUL-terminated.
+    pub fn cached_names() -> Result<Vec<(Vec<u16>, u16)>, String> {
         let table =
             get_cache_data_table().ok_or("[monitor] dnsapi.dll has no DnsGetCacheDataTable")?;
         let mut head: *mut CacheEntry = null_mut();
@@ -210,7 +211,7 @@ mod sys {
         let mut entry = head;
         while !entry.is_null() {
             let e = unsafe { &*entry };
-            if (e.kind == DNS_TYPE_A || e.kind == DNS_TYPE_AAAA) && !e.name.is_null() {
+            if !e.name.is_null() {
                 names.push((wide_to_vec(e.name), e.kind));
             }
             let next = e.next;
@@ -222,9 +223,15 @@ mod sys {
             }
             entry = next;
         }
+        Ok(names)
+    }
+
+    pub fn answers() -> Result<Vec<Answer>, String> {
         let mut out = Vec::new();
-        for (name, kind) in names {
-            query_cache(&name, kind, &mut out);
+        for (name, kind) in cached_names()? {
+            if kind == DNS_TYPE_A || kind == DNS_TYPE_AAAA {
+                query_cache(&name, kind, &mut out);
+            }
         }
         Ok(out)
     }
@@ -421,12 +428,28 @@ mod tests {
         };
         let addrs: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
         let answers = system_answers().unwrap();
-        assert!(
-            answers
+        let found = answers
+            .iter()
+            .any(|a| a.name.eq_ignore_ascii_case("example.com") && addrs.contains(&a.ip));
+        if !found {
+            // Say which step lost it: the cache listing, the cache-only query, or the cache itself.
+            let listed: Vec<String> = sys::cached_names()
+                .unwrap()
                 .iter()
-                .any(|a| a.name.eq_ignore_ascii_case("example.com") && addrs.contains(&a.ip)),
-            "example.com {addrs:?} not in {} cached answers",
-            answers.len()
-        );
+                .map(|(n, k)| format!("{}/{k}", String::from_utf16_lossy(&n[..n.len() - 1])))
+                .collect();
+            let displaydns = std::process::Command::new("ipconfig")
+                .arg("/displaydns")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let shown: Vec<&str> = displaydns
+                .lines()
+                .filter(|l| l.to_ascii_lowercase().contains("example"))
+                .collect();
+            panic!(
+                "example.com {addrs:?} not in cached answers {answers:?}\nlisted: {listed:?}\nipconfig /displaydns: {shown:?}"
+            );
+        }
     }
 }
