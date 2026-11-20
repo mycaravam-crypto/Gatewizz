@@ -359,6 +359,84 @@ pub fn uninstall() -> Result<String, String> {
     ))
 }
 
+/// How long repeated drops of one program to one host and port fold into a single notice.
+const NOTICE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The drop-event subscription and the thread that turns Gatewizz's drops into notices.
+#[cfg(windows)]
+struct DropWatch {
+    subscription: wfp::Subscription,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+impl DropWatch {
+    /// Unsubscribes, which closes the channel and ends the thread.
+    fn stop(self) {
+        drop(self.subscription);
+        let _ = self.thread.join();
+    }
+}
+
+/// Watches WFP drop events and logs one "blocked" notice per program, host and port and [`NOTICE_WINDOW`]. Only
+/// drops by Gatewizz's own filters count; their ids change on every apply, so an unknown id re-reads them (at most
+/// once a second).
+// ponytail: the notices only reach the log so far; the pipe to the tray and the prompt are the next #59 step.
+#[cfg(windows)]
+fn watch_drops() -> Result<DropWatch, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<wfp::Dropped>();
+    let subscription = wfp::subscribe_drops(tx)?;
+    let thread = std::thread::Builder::new()
+        .name("drops".into())
+        .spawn(move || {
+            let mut notices = firewall::Coalescer::new(NOTICE_WINDOW, 1024);
+            let mut ids = wfp::filter_ids(wfp::KEYS).unwrap_or_default();
+            let mut ids_read = std::time::Instant::now();
+            for dropped in rx {
+                if !ids.contains(&dropped.filter_id) && ids_read.elapsed() >= Duration::from_secs(1)
+                {
+                    ids = wfp::filter_ids(wfp::KEYS).unwrap_or_default();
+                    ids_read = std::time::Instant::now();
+                }
+                if !ids.contains(&dropped.filter_id) {
+                    continue;
+                }
+                let host = dropped.remote.to_string();
+                if notices.push(
+                    dropped.program(),
+                    &host,
+                    dropped.port,
+                    std::time::Instant::now(),
+                ) {
+                    log(&blocked_line(&dropped));
+                }
+            }
+        })
+        .map_err(|e| format!("[firewall] cannot start the drop watcher: {e}"))?;
+    Ok(DropWatch {
+        subscription,
+        thread,
+    })
+}
+
+/// The log line for a blocked connection: program, destination and the program's full (device) path.
+fn blocked_line(d: &wfp::Dropped) -> String {
+    let protocol = match d.protocol {
+        6 => "tcp",
+        17 => "udp",
+        _ => "ip",
+    };
+    let destination = match d.remote {
+        IpAddr::V6(ip) => format!("[{ip}]:{}", d.port),
+        IpAddr::V4(ip) => format!("{ip}:{}", d.port),
+    };
+    format!(
+        "blocked: {} -> {destination} {protocol} ({})",
+        d.program(),
+        d.app
+    )
+}
+
 /// `gatewizz firewall service`: the entry point Windows starts. Not for interactive use.
 #[cfg(windows)]
 pub fn run() -> Result<(), String> {
@@ -395,7 +473,7 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use super::{NAME, REFRESH, RELOAD, log, refresh};
+    use super::{NAME, REFRESH, RELOAD, log, refresh, watch_drops};
     use std::path::Path;
     use std::ptr::{null, null_mut};
     use std::sync::Mutex;
@@ -647,8 +725,19 @@ mod sys {
         log("starting");
         // Apply before reporting "running", so `firewall install` returns with the rules in force.
         refresh_and_log();
+        // Blocked connections are reported from here on; the firewall works without them.
+        let drops = watch_drops()
+            .inspect_err(|err| {
+                log(&format!(
+                    "error: {err}; blocked connections are not reported"
+                ))
+            })
+            .ok();
         report(handle, SERVICE_RUNNING, 0);
         serve(&rx);
+        if let Some(drops) = drops {
+            drops.stop();
+        }
         log("stopped; the filters stay in force");
         report(handle, SERVICE_STOPPED, 0);
     }
@@ -804,6 +893,27 @@ mod tests {
         assert_eq!(content, "second");
         assert!(!tmp_left);
         assert!(blocked.unwrap_err().contains("blocked.toml"));
+    }
+
+    #[test]
+    fn blocked_lines_name_program_destination_and_path() {
+        let d = wfp::Dropped {
+            app: r"\device\harddiskvolume3\tools\curl.exe".into(),
+            remote: "93.184.215.14".parse().unwrap(),
+            port: 443,
+            protocol: 6,
+            filter_id: 7,
+        };
+        assert_eq!(
+            blocked_line(&d),
+            r"blocked: curl.exe -> 93.184.215.14:443 tcp (\device\harddiskvolume3\tools\curl.exe)"
+        );
+        let v6 = wfp::Dropped {
+            remote: "2001:db8::1".parse().unwrap(),
+            protocol: 17,
+            ..d
+        };
+        assert!(blocked_line(&v6).contains("-> [2001:db8::1]:443 udp"));
     }
 
     #[test]

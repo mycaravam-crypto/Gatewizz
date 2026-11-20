@@ -25,6 +25,33 @@ pub const KEYS: Keys = Keys {
     sublayer: 0x8e43_d2a6_1f7b_4c95_b3e8_07a1_5c6d_f924,
 };
 
+/// A connection attempt WFP dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    /// The program's path as WFP reports it: a device path (`\device\harddiskvolume3\...\app.exe`), lower case.
+    pub app: String,
+    pub remote: std::net::IpAddr,
+    pub port: u16,
+    /// IP protocol number: 6 TCP, 17 UDP.
+    pub protocol: u8,
+    /// The runtime id of the filter that dropped it.
+    pub filter_id: u64,
+}
+
+impl Dropped {
+    /// The program's file name, for display and for matching rules.
+    pub fn program(&self) -> &str {
+        crate::firewall::file_name(&self.app)
+    }
+}
+
+/// An active drop-event subscription; dropping it unsubscribes.
+pub struct Subscription {
+    /// Held only for its `Drop`, which unsubscribes.
+    #[cfg(windows)]
+    _inner: sys::Subscription,
+}
+
 /// What [`apply`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
@@ -49,6 +76,21 @@ pub fn remove(keys: Keys) -> Result<usize, String> {
 #[cfg(windows)]
 pub fn installed(keys: Keys) -> Result<Option<usize>, String> {
     sys::installed(keys)
+}
+
+/// The runtime ids of the installed filters. A drop event names the filter that dropped the connection by this id,
+/// which tells Gatewizz's drops from everyone else's. Ids change on every apply.
+#[cfg(windows)]
+pub fn filter_ids(keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+    sys::filter_ids(keys)
+}
+
+/// Delivers every connection WFP drops to `tx` until the returned subscription is dropped. Turns on WFP's net event
+/// collection, which Windows keeps in memory only (no disk log). The receiver keeps the drops whose
+/// `filter_id` is one of [`filter_ids`].
+#[cfg(windows)]
+pub fn subscribe_drops(tx: std::sync::mpsc::Sender<Dropped>) -> Result<Subscription, String> {
+    sys::subscribe_drops(tx)
 }
 
 /// The full paths a program file name stands for: matches on `PATH` and running processes with that name. WFP needs
@@ -86,6 +128,16 @@ pub fn installed(_keys: Keys) -> Result<Option<usize>, String> {
 }
 
 #[cfg(not(windows))]
+pub fn filter_ids(_keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+    Err(UNSUPPORTED.into())
+}
+
+#[cfg(not(windows))]
+pub fn subscribe_drops(_tx: std::sync::mpsc::Sender<Dropped>) -> Result<Subscription, String> {
+    Err(UNSUPPORTED.into())
+}
+
+#[cfg(not(windows))]
 pub fn program_paths(_name: &str) -> Vec<String> {
     Vec::new()
 }
@@ -107,17 +159,22 @@ mod sys {
     };
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
         FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_BYTE_BLOB_TYPE,
-        FWP_FILTER_ENUM_OVERLAPPING, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_UINT64,
-        FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK,
-        FWPM_CONDITION_ALE_APP_ID, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
-        FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0,
-        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
-        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT,
-        FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
-        FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0,
-        FwpmFilterEnum0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0, FwpmProviderAdd0,
-        FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+        FWP_FILTER_ENUM_OVERLAPPING, FWP_IP_VERSION_V4, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16,
+        FWP_UINT32, FWP_UINT64, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK,
+        FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0, FWPM_CONDITION_ALE_APP_ID,
+        FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
+        FWPM_CONDITION_IP_REMOTE_PORT, FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_FILTER_CONDITION0,
+        FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT_FLAG_APP_ID_SET,
+        FWPM_NET_EVENT_FLAG_IP_VERSION_SET, FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET,
+        FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET, FWPM_NET_EVENT_SUBSCRIPTION0,
+        FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_NET_EVENT2, FWPM_PROVIDER_FLAG_PERSISTENT,
+        FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
+        FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
+        FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
+        FwpmGetAppIdFromFileName0, FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0,
+        FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
         FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -231,6 +288,15 @@ mod sys {
 
         /// Keys of every filter of this provider in this sublayer, on both connect layers.
         fn filter_keys(&self, keys: Keys) -> Result<Vec<GUID>, String> {
+            Ok(self
+                .filters(keys)?
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect())
+        }
+
+        /// (key, runtime id) of every filter of this provider in this sublayer, on both connect layers.
+        fn filters(&self, keys: Keys) -> Result<Vec<(GUID, u64)>, String> {
             let mut out = Vec::new();
             let mut provider = GUID::from_u128(keys.provider);
             let sublayer = GUID::from_u128(keys.sublayer);
@@ -258,7 +324,7 @@ mod sys {
                         for i in 0..n as usize {
                             let filter = unsafe { &**entries.add(i) };
                             if same(&filter.subLayerKey, &sublayer) {
-                                out.push(filter.filterKey);
+                                out.push((filter.filterKey, filter.filterId));
                             }
                         }
                         if !entries.is_null() {
@@ -506,6 +572,118 @@ mod sys {
         })
     }
 
+    pub fn filter_ids(keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+        let engine = Engine::open()?;
+        Ok(engine
+            .filters(keys)?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect())
+    }
+
+    /// Keeps the engine session and the callback's sender alive for as long as the subscription runs.
+    pub struct Subscription {
+        engine: Engine,
+        handle: HANDLE,
+        sender: *mut std::sync::Mutex<std::sync::mpsc::Sender<super::Dropped>>,
+    }
+
+    // The raw sender pointer is only dereferenced by the callback, behind its mutex, and freed after unsubscribing.
+    unsafe impl Send for Subscription {}
+
+    impl Drop for Subscription {
+        fn drop(&mut self) {
+            // Unsubscribe waits for running callbacks, so the sender is unused once it returns.
+            unsafe { FwpmNetEventUnsubscribe0(self.engine.0, self.handle) };
+            drop(unsafe { Box::from_raw(self.sender) });
+        }
+    }
+
+    /// `FwpmNetEventSubscribe1` delivers `FWPM_NET_EVENT2` (Windows 8 and later). Only header fields (address,
+    /// port, protocol, app id) and the classify-drop filter id are read, which every event version has.
+    unsafe extern "system" fn on_event(context: *mut c_void, event: *const FWPM_NET_EVENT2) {
+        let (Some(event), false) = (unsafe { event.as_ref() }, context.is_null()) else {
+            return;
+        };
+        if event.r#type != FWPM_NET_EVENT_TYPE_CLASSIFY_DROP {
+            return;
+        }
+        let drop_info = unsafe { event.Anonymous.classifyDrop };
+        let Some(drop_info) = (unsafe { drop_info.as_ref() }) else {
+            return;
+        };
+        let h = &event.header;
+        let needed = FWPM_NET_EVENT_FLAG_APP_ID_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET
+            | FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET
+            | FWPM_NET_EVENT_FLAG_IP_VERSION_SET;
+        if h.flags & needed != needed || h.appId.data.is_null() {
+            return;
+        }
+        let remote = if h.ipVersion == FWP_IP_VERSION_V4 {
+            IpAddr::from(std::net::Ipv4Addr::from(unsafe {
+                h.Anonymous2.remoteAddrV4
+            }))
+        } else {
+            IpAddr::from(unsafe { h.Anonymous2.remoteAddrV6.byteArray16 })
+        };
+        // The app id is a NUL-terminated UTF-16 device path.
+        let words = unsafe {
+            std::slice::from_raw_parts(h.appId.data.cast::<u16>(), h.appId.size as usize / 2)
+        };
+        let end = words.iter().position(|&w| w == 0).unwrap_or(words.len());
+        let dropped = super::Dropped {
+            app: String::from_utf16_lossy(&words[..end]).to_lowercase(),
+            remote,
+            port: h.remotePort,
+            protocol: h.ipProtocol,
+            filter_id: drop_info.filterId,
+        };
+        let sender = unsafe {
+            &*context.cast::<std::sync::Mutex<std::sync::mpsc::Sender<super::Dropped>>>()
+        };
+        if let Ok(tx) = sender.lock() {
+            let _ = tx.send(dropped);
+        }
+    }
+
+    pub fn subscribe_drops(
+        tx: std::sync::mpsc::Sender<super::Dropped>,
+    ) -> Result<super::Subscription, String> {
+        let engine = Engine::open()?;
+        let value = FWP_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_VALUE0_0 { uint32: 1 },
+        };
+        check(
+            unsafe { FwpmEngineSetOption0(engine.0, FWPM_ENGINE_COLLECT_NET_EVENTS, &value) },
+            "turn on WFP net event collection",
+        )?;
+        let sender = Box::into_raw(Box::new(std::sync::Mutex::new(tx)));
+        let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
+        let mut handle: HANDLE = null_mut();
+        let rc = unsafe {
+            FwpmNetEventSubscribe1(
+                engine.0,
+                &subscription,
+                Some(on_event),
+                sender.cast_const().cast(),
+                &mut handle,
+            )
+        };
+        if let Err(err) = check(rc, "subscribe to WFP drop events") {
+            drop(unsafe { Box::from_raw(sender) });
+            return Err(err);
+        }
+        Ok(super::Subscription {
+            _inner: Subscription {
+                engine,
+                handle,
+                sender,
+            },
+        })
+    }
+
     pub fn installed(keys: Keys) -> Result<Option<usize>, String> {
         use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
             FWPM_SUBLAYER0 as Sublayer, FwpmSubLayerGetByKey0,
@@ -656,11 +834,34 @@ mod tests {
         // The self allow goes to both layers; the block only to IPv4.
         assert_eq!(applied.filters, 3);
         assert_eq!(installed(TEST_KEYS).unwrap(), Some(3));
+        // Watch for the drop the blocked connect causes.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscription = subscribe_drops(tx).unwrap();
         assert_eq!(
             child_connects(ip),
             3,
             "the block filter must stop the child"
         );
+        // The drop event names the child's program, the address and port, and one of the test's own filters.
+        let ours = filter_ids(TEST_KEYS).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut seen = Vec::new();
+        let found = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(d) if d.remote == ip && d.port == 80 && ours.contains(&d.filter_id) => {
+                    break Some(d);
+                }
+                Ok(other) => seen.push(other),
+                Err(_) => break None,
+            }
+        };
+        drop(subscription);
+        let found = found.unwrap_or_else(|| {
+            panic!("no drop event by our filter for {ip}:80 within 15 s; other drops: {seen:?}")
+        });
+        assert_eq!(found.program(), "powershell.exe", "{found:?}");
+        assert_eq!(found.protocol, 6);
 
         // Applying again replaces, never duplicates.
         assert_eq!(apply(TEST_KEYS, &filters).unwrap().filters, 3);

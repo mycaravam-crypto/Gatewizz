@@ -216,6 +216,7 @@ gatewizz firewall remove                           # remove the service, every f
   - It starts automatically at boot, before anyone signs in.
   - It runs as LocalSystem, so it never runs or reads anything a normal user can write. `install` copies `gatewizz.exe` and the validated configuration into `%ProgramFiles%\Gatewizz`, which only administrators can change, and the service runs from that copy. `firewall apply` updates the copy, again from an elevated prompt. Editing your own configuration file changes nothing until you run `apply`.
   - It writes each refresh, and any error, to `%ProgramFiles%\Gatewizz\service.log`. That file rotates at 256 KiB.
+  - It logs each connection Gatewizz's filters block: `blocked: <program> -> <address>:<port> <protocol> (<program path>)`. Retries of the same program, host and port within a minute count as one. Drops by other firewalls are not logged. The service turns on WFP's net event collection for this, which Windows keeps in memory only.
   - When a refresh fails, or the service stops, the last filters stay in force (fail closed).
 - **Without the service:** `firewall apply` installs the filters once, with names resolved at that moment.
 
@@ -235,7 +236,7 @@ gatewizz firewall remove                           # remove the service, every f
   - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
   - `ask` blocks for now. It will prompt for unknown connections once the background service and approval prompt exist (#59).
 
-Not yet: the approval prompt for blocked connections and rules added from it. Those are the next steps of #59; they need the service to report blocked connections to the tray app.
+Not yet: the approval prompt for blocked connections, and rules added from it. The service already detects and logs the blocked connections. Sending them to the tray app and the prompt are the next steps of #59.
 
 ## Events and privacy
 
