@@ -158,7 +158,7 @@ impl SingleInstance {
             .collect();
         // CreateMutexW only documents a last-error value for the already-exists case.
         unsafe { SetLastError(0) };
-        let handle = unsafe { CreateMutexW(None, 0, name.as_ptr()) };
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(format!(
                 "[startup] cannot create single-instance mutex (Windows error {})",
