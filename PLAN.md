@@ -78,4 +78,4 @@ cargo test --locked
 bash .github/scripts/semver-next.test.sh
 ```
 
-**Performance budget:** under 5 ms added p50 for requests without a body, measured with powerwizz (from M1).
+**Performance budget:** under 5 ms added p50 for requests without a body (from M1). `proxy::tests::bodyless_requests_stay_within_the_latency_budget` checks it on every CI run (direct vs proxied keep-alive GETs on loopback; print the numbers with `cargo test --release latency -- --nocapture`). Real-world overhead is measured with powerwizz.
