@@ -40,7 +40,7 @@ const USAGE: &str = "\
 gatewizz: a local HTTPS gate for code sent to AI models
 
 Usage:
-  gatewizz [--config <path>]                  run the proxy until Ctrl+C
+  gatewizz [--config <path>]                  run the proxy and tray until Quit or Ctrl+C
   gatewizz [--config <path>] --check-config   validate the config and print the effective values
   gatewizz ca install                         create the local CA if missing and trust it for the current user
   gatewizz ca remove                          untrust every gatewizz CA and delete its files
