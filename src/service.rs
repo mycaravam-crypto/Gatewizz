@@ -265,8 +265,13 @@ static TEMPORARY: std::sync::Mutex<Vec<firewall::Rule>> = std::sync::Mutex::new(
 /// The temporary rules still in force, forgetting the expired ones.
 fn temporary_rules(now: SystemTime) -> Vec<firewall::Rule> {
     let mut rules = TEMPORARY.lock().unwrap_or_else(|e| e.into_inner());
-    rules.retain(|r| r.expires.is_none_or(|at| now < at));
+    keep_unexpired(&mut rules, now);
     rules.clone()
+}
+
+/// Drops the rules whose expiry has passed; a rule without one never expires.
+fn keep_unexpired(rules: &mut Vec<firewall::Rule>, now: SystemTime) {
+    rules.retain(|r| r.expires.is_none_or(|at| now < at));
 }
 
 /// Appends a permanent rule from the prompt to the protected configuration, keeping the user's text, and refuses
@@ -1063,6 +1068,45 @@ mod tests {
             ..d
         };
         assert!(blocked_line(&v6).contains("-> [2001:db8::1]:443 udp"));
+    }
+
+    #[test]
+    fn temporary_rules_expire_and_join_the_applied_rules() {
+        let now = SystemTime::now();
+        let rule = |id: &str, expires: Option<SystemTime>| firewall::Rule {
+            id: id.into(),
+            process: vec![r"C:\Tools\curl.exe".into()],
+            host: Vec::new(),
+            ip: Vec::new(),
+            port: vec![443],
+            protocol: firewall::Protocol::Tcp,
+            action: firewall::RuleAction::Allow,
+            expires,
+        };
+        let mut rules = vec![
+            rule("once", Some(now + Duration::from_secs(120))),
+            rule("gone", Some(now - Duration::from_secs(1))),
+            rule("edge", Some(now)),
+            rule("kept", None),
+        ];
+        keep_unexpired(&mut rules, now);
+        let ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["once", "kept"], "expired at or before now is gone");
+        // Two minutes on, "once" is gone too.
+        keep_unexpired(&mut rules, now + Duration::from_secs(120));
+        assert_eq!(rules.len(), 1);
+
+        // The applied set is the configured rules plus the temporary ones.
+        let mut config =
+            Config::parse("[[connection_rules]]\nid = \"cfg\"\nport = [80]\naction = \"block\"\n")
+                .unwrap();
+        config.connection_rules.extend(rules);
+        let ids: Vec<&str> = config
+            .connection_rules
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, ["cfg", "kept"]);
     }
 
     #[test]

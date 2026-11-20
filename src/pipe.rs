@@ -158,10 +158,13 @@ mod sys {
             if h != INVALID_HANDLE_VALUE {
                 unsafe { CloseHandle(h) };
             }
-            // Disconnecting the instance ends the server thread's blocked read on a connected client.
-            let current = *self.current.lock().unwrap_or_else(|e| e.into_inner());
-            if current != 0 {
-                unsafe { DisconnectNamedPipe(current as HANDLE) };
+            // Disconnecting the instance ends the server thread's blocked read on a connected client. Done under the
+            // lock: the server thread takes it to close the handle, so this never touches a closed (or reused) one.
+            {
+                let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != 0 {
+                    unsafe { DisconnectNamedPipe(*current as HANDLE) };
+                }
             }
             let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(thread) = thread {
