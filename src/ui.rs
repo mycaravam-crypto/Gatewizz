@@ -453,14 +453,17 @@ mod app {
             if file.seek(SeekFrom::Start(offset)).is_err() {
                 continue;
             }
-            let mut contents = String::new();
+            let mut bytes = Vec::new();
             if file
                 .take(MAX_HISTORY_FILE_BYTES)
-                .read_to_string(&mut contents)
+                .read_to_end(&mut bytes)
                 .is_err()
             {
                 continue;
             }
+            // The bounded offset may land inside a UTF-8 code point. Decode lossily so one
+            // partial character cannot discard otherwise valid recent log records.
+            let mut contents = String::from_utf8_lossy(&bytes).into_owned();
             // A bounded tail can begin halfway through a JSON line. Discard that partial record.
             if offset > 0 {
                 let Some(newline) = contents.find('\n') else {
