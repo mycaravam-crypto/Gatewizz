@@ -28,7 +28,7 @@ toml = "1.2.1"
 [target."cfg(windows)".dependencies]
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 tray-icon = { version = "0.26.1", default-features = false }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Rpc", "Win32_System_Services", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_Dns", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_Rpc", "Win32_System_Services", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 pki_types = { version = "1.16.0", package = "rustls-pki-types", features = ["std"] }
