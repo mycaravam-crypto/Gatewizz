@@ -279,10 +279,42 @@ fn keep_unexpired(rules: &mut Vec<firewall::Rule>, now: SystemTime) {
 fn append_rule(rule: &firewall::Rule) -> Result<(), String> {
     let path = protected_config();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let combined = format!("{text}{}", crate::prompt::rule_toml(rule));
-    Config::parse(&combined)
+    match with_rule(&text, rule)? {
+        Added::Appended(new) => write_atomic(&path, &new),
+        Added::Rewritten(new) => {
+            // The rewrite drops comments and layout, so the original is kept next to it.
+            write_atomic(&path.with_extension("toml.bak"), &text)?;
+            write_atomic(&path, &new)
+        }
+    }
+}
+
+/// A configuration text with one more connection rule.
+#[derive(Debug, PartialEq)]
+enum Added {
+    /// The rule appended as a `[[connection_rules]]` table: the user's text and comments stay as they are.
+    Appended(String),
+    /// Appending would not parse (the file writes `connection_rules = [...]` inline), so the whole configuration
+    /// was serialized again with the rule added.
+    Rewritten(String),
+}
+
+fn with_rule(text: &str, rule: &firewall::Rule) -> Result<Added, String> {
+    let appended = format!("{text}{}", crate::prompt::rule_toml(rule));
+    if Config::parse(&appended).is_ok() {
+        return Ok(Added::Appended(appended));
+    }
+    let mut config = Config::parse(text)
+        .map_err(|e| format!("[firewall] the protected configuration is not valid: {e}"))?;
+    config.connection_rules.push(rule.clone());
+    let rewritten = format!(
+        "# Rewritten by the firewall prompt to add {}; the previous file is firewall.toml.bak.\n{}",
+        rule.id,
+        config.effective()
+    );
+    Config::parse(&rewritten)
         .map_err(|e| format!("[firewall] the prompt's rule would not be valid: {e}"))?;
-    write_atomic(&path, &combined)
+    Ok(Added::Rewritten(rewritten))
 }
 
 /// `firewall apply`: with the service installed, update its protected configuration and ask it to reload, then apply
@@ -1111,6 +1143,49 @@ mod tests {
             .map(|r| r.id.as_str())
             .collect();
         assert_eq!(ids, ["cfg", "kept"]);
+    }
+
+    #[test]
+    fn prompt_rules_append_and_fall_back_to_a_rewrite() {
+        let rule = firewall::Rule {
+            id: "prompt-allow-curl.exe-1-1".into(),
+            process: vec![r"C:\Tools\curl.exe".into()],
+            host: Vec::new(),
+            ip: Vec::new(),
+            port: vec![443],
+            protocol: firewall::Protocol::Tcp,
+            action: firewall::RuleAction::Allow,
+            expires: None,
+        };
+        // Usual files, ending in any table: appended, the user's text kept.
+        for text in [
+            "",
+            "# mine\n[firewall]\ndefault = \"ask\"\n",
+            "[[connection_rules]]\nid = \"a\"\naction = \"block\"\n[monitor]\nenabled = true",
+        ] {
+            let Added::Appended(new) = with_rule(text, &rule).unwrap() else {
+                panic!("expected an append for {text:?}");
+            };
+            assert!(new.starts_with(text));
+            let rules = Config::parse(&new).unwrap().connection_rules;
+            assert_eq!(rules.last().unwrap().id, rule.id);
+        }
+        // An inline `connection_rules = [...]` cannot take a [[connection_rules]] table: rewritten instead, with
+        // every rule kept.
+        let inline = "connection_rules = [{ id = \"a\", action = \"block\" }]\n";
+        let Added::Rewritten(new) = with_rule(inline, &rule).unwrap() else {
+            panic!("expected a rewrite");
+        };
+        let ids: Vec<String> = Config::parse(&new)
+            .unwrap()
+            .connection_rules
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["a", rule.id.as_str()]);
+        assert!(new.starts_with("# Rewritten by the firewall prompt"));
+        // A broken protected configuration is refused, never overwritten.
+        assert!(with_rule("[firewall\n", &rule).is_err());
     }
 
     #[test]

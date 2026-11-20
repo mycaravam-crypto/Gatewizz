@@ -193,7 +193,7 @@ mod sys {
         let current: Arc<Mutex<usize>> = Arc::default();
         let stopping = Arc::new(AtomicBool::new(false));
         // Handles cross into the server thread as integers: HANDLE is a raw pointer.
-        let first = create(name, &descriptor, true)? as usize;
+        let first = create(name, &descriptor)? as usize;
         let (thread_client, thread_stopping, thread_name) =
             (client.clone(), stopping.clone(), name.to_string());
         let thread_current = current.clone();
@@ -221,7 +221,8 @@ mod sys {
                     if thread_stopping.load(Ordering::SeqCst) {
                         return;
                     }
-                    match create(&thread_name, &descriptor, false) {
+                    // FIRST_PIPE_INSTANCE again: ours is closed now, so if the name exists, someone squatted it.
+                    match create(&thread_name, &descriptor) {
                         Ok(next) => {
                             handle = next;
                             set_current(handle);
@@ -243,7 +244,9 @@ mod sys {
         })
     }
 
-    fn create(name: &str, descriptor: &Descriptor, first: bool) -> Result<HANDLE, String> {
+    /// Always with FILE_FLAG_FIRST_PIPE_INSTANCE: there is only ever one instance, ours, so an existing pipe of the
+    /// same name belongs to someone else and must not be served.
+    fn create(name: &str, descriptor: &Descriptor) -> Result<HANDLE, String> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -252,12 +255,7 @@ mod sys {
         let h = unsafe {
             CreateNamedPipeW(
                 wide(name).as_ptr(),
-                PIPE_ACCESS_DUPLEX
-                    | if first {
-                        FILE_FLAG_FIRST_PIPE_INSTANCE
-                    } else {
-                        0
-                    },
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 64 * 1024,
@@ -282,17 +280,14 @@ mod sys {
         client: &Mutex<Option<File>>,
         decisions: &Sender<prompt::Decision>,
     ) {
-        // Two Files over one handle: the reader owns nothing (forgotten below), the writer lives in `client`.
-        let reader_file = unsafe { File::from_raw_handle(handle as _) };
-        let writer = match reader_file.try_clone() {
-            Ok(w) => w,
-            Err(_) => {
-                std::mem::forget(reader_file);
-                return;
-            }
+        // The server loop owns `handle` and closes it. ManuallyDrop makes sure this File never does, also when
+        // unwinding; reads go through `&File`. The writer is a duplicate handle, owned by `client`.
+        let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(handle as _) });
+        let Ok(writer) = file.try_clone() else {
+            return;
         };
         *client.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
-        let mut reader = BufReader::new(reader_file);
+        let mut reader = BufReader::new(&*file);
         let mut line = String::new();
         loop {
             line.clear();
@@ -330,8 +325,6 @@ mod sys {
             }
         }
         *client.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The handle is closed by the server loop, not by this File.
-        std::mem::forget(reader.into_inner());
     }
 }
 
