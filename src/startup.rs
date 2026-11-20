@@ -39,7 +39,15 @@ pub fn install(config: Option<&Path>) -> Result<String, String> {
     }
 
     let output = Command::new(reg_exe()?)
-        .args(["add", &format!("HKCU\\{RUN_KEY}"), "/v", RUN_VALUE, "/t", "REG_SZ", "/d"])
+        .args([
+            "add",
+            &format!("HKCU\\{RUN_KEY}"),
+            "/v",
+            RUN_VALUE,
+            "/t",
+            "REG_SZ",
+            "/d",
+        ])
         .arg(&command)
         .arg("/f")
         .output()
