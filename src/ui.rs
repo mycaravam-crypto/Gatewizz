@@ -292,14 +292,16 @@ mod app {
                 Some(
                     std::thread::Builder::new()
                         .name("activity-history".into())
-                        .spawn(move || loop {
-                            if history_tx.send(load_history(&history_path)).is_err() {
-                                break;
-                            }
-                            history_ctx.request_repaint();
-                            match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
-                                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        .spawn(move || {
+                            loop {
+                                if history_tx.send(load_history(&history_path)).is_err() {
+                                    break;
+                                }
+                                history_ctx.request_repaint();
+                                match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
+                                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                }
                             }
                         })
                         .map_err(|e| format!("[ui] cannot start activity history worker: {e}"))?,
