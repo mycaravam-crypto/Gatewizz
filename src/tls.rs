@@ -194,8 +194,13 @@ mod tests {
     }
 
     fn leaf(ca: &TestCa, host: &str) -> Arc<CertifiedKey> {
+        leaf_for(ca, &[host])
+    }
+
+    fn leaf_for(ca: &TestCa, hosts: &[&str]) -> Arc<CertifiedKey> {
         let key = KeyPair::generate().unwrap();
-        let cert = CertificateParams::new(vec![host.to_string()])
+        let names: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let cert = CertificateParams::new(names)
             .unwrap()
             .signed_by(&key, &ca.issuer)
             .unwrap();
@@ -288,9 +293,16 @@ mod tests {
 
     /// Sends `CONNECT localhost:<port>` and returns the stream plus the proxy's status line.
     async fn connect(proxy: SocketAddr, port: u16) -> (tokio::net::TcpStream, String) {
+        connect_to(proxy, "localhost", port).await
+    }
+
+    async fn connect_to(
+        proxy: SocketAddr,
+        host: &str,
+        port: u16,
+    ) -> (tokio::net::TcpStream, String) {
         let mut tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
-        let request =
-            format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n");
+        let request = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
         tcp.write_all(request.as_bytes()).await.unwrap();
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
@@ -315,9 +327,23 @@ mod tests {
         ),
         std::io::Error,
     > {
+        handshake_as(tcp, trust, "localhost").await
+    }
+
+    async fn handshake_as(
+        tcp: tokio::net::TcpStream,
+        trust: &TestCa,
+        name: &str,
+    ) -> Result<
+        (
+            hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+            Option<Vec<u8>>,
+        ),
+        std::io::Error,
+    > {
         let mut config = trusting(trust);
         config.alpn_protocols = vec![b"h2".to_vec(), ALPN_HTTP1.to_vec()];
-        let name = ServerName::try_from("localhost").unwrap();
+        let name = ServerName::try_from(name.to_string()).unwrap();
         let tls = TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
             .await?;
@@ -353,6 +379,202 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// Every file below `dir`, rotated events and CA files included.
+    fn files_below(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(files_below(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    /// M2 acceptance (#22): an OpenAI-compatible chat request whose diff holds a fake API key is decrypted with the
+    /// local CA, blocked with a 403 naming the allowlist rule for a host outside the allowlist, with nothing sent
+    /// upstream, and passed for the allowlisted host. Afterwards no file the run wrote contains the key.
+    #[tokio::test]
+    async fn m2_secret_reaches_only_the_allowlisted_model_host() {
+        use crate::config::EventTarget;
+        use crate::rules::{Action, Match, Rule, Severity};
+
+        let dir = std::env::temp_dir().join(format!("gatewizz-m2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The local CA as `gatewizz ca install` creates it; on Windows it is also stored (DPAPI) under `dir`.
+        let ca = Arc::new(Ca::generate().unwrap());
+        #[cfg(windows)]
+        ca.save(&dir).unwrap();
+        let client_trust = TestCa {
+            cert: CertificateDer::from(ca.cert().to_vec()),
+            issuer: Issuer::new(CertificateParams::default(), KeyPair::generate().unwrap()),
+        };
+        // One model upstream that answers as "localhost" (allowlisted) and as "127.0.0.1" (not allowlisted).
+        let origin = test_ca("model host");
+        let (port, mut seen) =
+            upstream(leaf_for(&origin, &["localhost", "127.0.0.1"]), false).await;
+
+        // Small files, so the run rotates the event log and the scan covers rotated files too.
+        let (events, writer) =
+            crate::event::spawn(EventTarget::File(dir.join("events.jsonl")), 4096, 3, 64).unwrap();
+        let settings = Settings {
+            allowed_connect_ports: vec![port],
+            tls: Some(Arc::new(Interceptor::new(
+                leaf_issuer(ca),
+                trusting(&origin),
+                Vec::new(),
+            ))),
+            // The README's allowlist: secrets go only to the approved model host.
+            rules: vec![Rule {
+                id: "secrets-only-to-approved-models".into(),
+                description: "Secrets may only be sent to the approved model host".into(),
+                matches: Match {
+                    finding: Some("secret.*".into()),
+                    not_host: Some(vec!["localhost".into()]),
+                    ..Match::default()
+                },
+                action: Action::Block,
+                severity: Severity::Critical,
+            }],
+            ..Settings::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, settings, events, std::future::pending()));
+
+        // A clearly fake GitHub token in a diff, as a review tool would send it; JSON-escaped newlines included.
+        let key = format!(
+            "{}a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+            ["gh", "p_"].concat()
+        );
+        let body: &'static str = Box::leak(
+            serde_json::json!({
+                "model": "gpt-test",
+                "messages": [{
+                    "role": "user",
+                    "content": format!("Review this diff:\n+const TOKEN = \"{key}\";\n")
+                }]
+            })
+            .to_string()
+            .into_boxed_str(),
+        );
+        let path = "/v1/chat/completions";
+
+        // Not allowlisted: 403 naming the rule, and the upstream sees no request.
+        let (tcp, status) = connect_to(proxy, "127.0.0.1", port).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (mut sender, _) = handshake_as(tcp, &client_trust, "127.0.0.1").await.unwrap();
+        let (status, text) = send(
+            &mut sender,
+            "POST",
+            path,
+            &format!("127.0.0.1:{port}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, 403, "{text}");
+        assert!(
+            text.contains("blocked by rule \"secrets-only-to-approved-models\" (critical)"),
+            "{text}"
+        );
+        assert!(
+            timeout(Duration::from_millis(300), seen.recv())
+                .await
+                .is_err(),
+            "the blocked request must not reach the upstream"
+        );
+
+        // Allowlisted: passes, decrypted and inspected. Several requests so the event log rotates.
+        let (tcp, status) = connect(proxy, port).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (mut sender, _) = handshake(tcp, &client_trust).await.unwrap();
+        let allowed = 16;
+        for _ in 0..allowed {
+            let (status, text) = send(
+                &mut sender,
+                "POST",
+                path,
+                &format!("localhost:{port}"),
+                body,
+            )
+            .await;
+            assert_eq!(status, 200, "{text}");
+            assert!(
+                seen.recv()
+                    .await
+                    .unwrap()
+                    .starts_with("POST /v1/chat/completions")
+            );
+        }
+
+        // Events are written one unbuffered line at a time; wait until all are on disk.
+        let lines = || -> Vec<serde_json::Value> {
+            let mut files: Vec<_> = files_below(&dir)
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("events.jsonl")
+                })
+                .collect();
+            files.sort();
+            files
+                .iter()
+                .flat_map(|p| {
+                    std::fs::read_to_string(p)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|line| serde_json::from_str(&line).ok())
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lines().len() < 1 + allowed && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = lines();
+        assert_eq!(events.len(), 1 + allowed, "{events:?}");
+        assert!(
+            dir.join("events.jsonl.1").exists(),
+            "the run must rotate the log"
+        );
+
+        let blocked = events.iter().find(|e| e["status"] == 403).unwrap();
+        assert_eq!(blocked["host"], "127.0.0.1");
+        assert_eq!(blocked["rule"], "secrets-only-to-approved-models");
+        assert_eq!(blocked["coverage"], "blocked");
+        assert_eq!(blocked["model"], "gpt-test");
+        assert_eq!(blocked["findings"][0]["kind"], "secret.github_token");
+        let passed: Vec<_> = events.iter().filter(|e| e["status"] == 200).collect();
+        assert_eq!(passed.len(), allowed);
+        assert!(passed.iter().all(|e| e["host"] == "localhost"
+            && e["coverage"] == "inspected"
+            && e["findings"][0]["kind"] == "secret.github_token"));
+
+        // The key appears nowhere on disk: not in events, rotated events or CA files.
+        let files = files_below(&dir);
+        assert!(files.len() >= 2, "{files:?}");
+        for file in &files {
+            let bytes = std::fs::read(file).unwrap();
+            for needle in [key.as_bytes(), &key.as_bytes()[4..]] {
+                assert!(
+                    !bytes.windows(needle.len()).any(|w| w == needle),
+                    "{} holds the key",
+                    file.display()
+                );
+            }
+        }
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
