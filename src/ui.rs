@@ -184,6 +184,8 @@ mod app {
         proxy: Option<JoinHandle<Result<(), String>>>,
         tab: Tab,
         history_filter: String,
+        history_decision: String,
+        history_selected: Option<usize>,
         history: Vec<HistoryEvent>,
         history_rx: Receiver<Vec<HistoryEvent>>,
         history_stop: Sender<()>,
@@ -209,6 +211,13 @@ mod app {
         status: u16,
         action: Option<Action>,
         process: HistoryProcess,
+        method: String,
+        port: u16,
+        path: String,
+        coverage: String,
+        rule: Option<String>,
+        reason: Option<String>,
+        model: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -354,6 +363,8 @@ mod app {
                 proxy: Some(proxy),
                 tab: Tab::Overview,
                 history_filter: String::new(),
+                history_decision: "all".into(),
+                history_selected: None,
                 history: Vec::new(),
                 history_rx,
                 history_stop,
@@ -486,6 +497,43 @@ mod app {
         rows
     }
 
+    /// CSV-escapes one metadata field. Quotes are doubled and the field is always quoted.
+    fn csv_field(value: &str) -> String {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+
+    /// Exports only the same metadata fields already persisted in the event log.
+    fn history_csv(events: &[&HistoryEvent]) -> String {
+        let mut csv = String::from(
+            "time_utc,process,host,port,method,path,decision,status,coverage,rule,reason,model\r\n",
+        );
+        for event in events {
+            let fields = [
+                event.time.clone(),
+                event.process_name(),
+                event.host.clone(),
+                event.port.to_string(),
+                event.method.clone(),
+                event.path.clone(),
+                event.decision().to_string(),
+                event.status.to_string(),
+                event.coverage.clone(),
+                event.rule.clone().unwrap_or_default(),
+                event.reason.clone().unwrap_or_default(),
+                event.model.clone().unwrap_or_default(),
+            ];
+            csv.push_str(
+                &fields
+                    .iter()
+                    .map(|field| csv_field(field))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            csv.push_str("\r\n");
+        }
+        csv
+    }
+
     fn icon(state: TrayState) -> Icon {
         Icon::from_rgba(icon_rgba(state.rgb(), 32), 32, 32).expect("32x32 RGBA is a valid icon")
     }
@@ -604,38 +652,69 @@ mod app {
                 if self.tab == Tab::Activity {
                     let rows = &self.history;
                     let blocked = rows.iter().filter(|event| event.action == Some(Action::Block)).count();
-                    let allowed = rows.len().saturating_sub(blocked);
+                    let other = rows.len().saturating_sub(blocked);
                     ui.horizontal(|ui| {
                         stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
                         stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
-                        stat_card(ui, "OTHER", &allowed.to_string(), GREEN);
+                        stat_card(ui, "OTHER", &other.to_string(), GREEN);
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    let filtered = ui
+                        .horizontal(|ui| {
                         ui.label(RichText::new("ACTIVITY").strong().size(11.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add(egui::TextEdit::singleline(&mut self.history_filter).hint_text("Filter host or process...").desired_width(220.0));
-                        });
-                    });
+                        ui.add(egui::TextEdit::singleline(&mut self.history_filter)
+                            .hint_text("Filter host or process...")
+                            .desired_width(205.0));
+                        egui::ComboBox::from_id_salt("history_decision")
+                            .selected_text(match self.history_decision.as_str() {
+                                "allow" => "Allowed",
+                                "block" => "Blocked",
+                                "approve" => "Approval",
+                                _ => "All decisions",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.history_decision, "all".into(), "All decisions");
+                                ui.selectable_value(&mut self.history_decision, "allow".into(), "Allowed");
+                                ui.selectable_value(&mut self.history_decision, "block".into(), "Blocked");
+                                ui.selectable_value(&mut self.history_decision, "approve".into(), "Approval");
+                            });
+                        let filtered: Vec<&HistoryEvent> = rows.iter().filter(|event| {
+                            let hay = format!("{} {}", event.host, event.process_name()).to_lowercase();
+                            let text_match = self.history_filter.is_empty()
+                                || hay.contains(&self.history_filter.to_lowercase());
+                            let decision_match = self.history_decision == "all"
+                                || event.decision() == self.history_decision;
+                            text_match && decision_match
+                        }).collect();
+                        if ui.button("Copy CSV").on_hover_text("Copy filtered metadata to the clipboard").clicked() {
+                            copy_to_clipboard(&history_csv(&filtered));
+                        }
+                        ui.label(RichText::new(format!("{} shown", filtered.len())).size(10.0).color(MUTED));
+                        ui.add_space(4.0);
+                        filtered
+                    })
+                        .inner;
                     ui.add_space(5.0);
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let mut selected = self.history_selected;
+                    egui::ScrollArea::vertical().max_height(310.0).auto_shrink([false, false]).show(ui, |ui| {
                         egui::Grid::new("activity_grid").striped(true).num_columns(5).show(ui, |ui| {
                             for heading in ["TIME (UTC)", "APPLICATION", "DESTINATION", "DECISION", "STATUS"] {
                                 ui.label(RichText::new(heading).size(9.0).strong().color(MUTED));
                             }
                             ui.end_row();
-                            let filter = self.history_filter.to_lowercase();
-                            for event in rows.iter().filter(|event| {
-                                let hay = format!("{} {}", event.host, event.process_name()).to_lowercase();
-                                filter.is_empty() || hay.contains(&filter)
-                            }) {
+                            for event in &filtered {
+                                let index = rows.iter().position(|row| std::ptr::eq(row, *event)).unwrap_or(usize::MAX);
+                                let active = selected == Some(index);
                                 let decision = event.decision();
                                 let color = match event.action {
                                     Some(Action::Block) => RED,
                                     Some(Action::Approve) => AMBER,
                                     _ => GREEN,
                                 };
-                                ui.label(RichText::new(event.time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
+                                let time = event.time.replace('T', " ").trim_end_matches('Z').to_string();
+                                if ui.selectable_label(active, RichText::new(time).size(10.0).color(MUTED)).clicked() {
+                                    selected = Some(index);
+                                }
                                 ui.label(RichText::new(event.process_name()).size(10.0));
                                 ui.label(RichText::new(&event.host).size(10.0).color(BLUE));
                                 ui.label(RichText::new(decision).size(10.0));
@@ -647,10 +726,31 @@ mod app {
                             ui.add_space(12.0);
                             let message = if self.events_path.is_some() { "No events recorded yet. New requests will appear here automatically." } else { "Persistent history is disabled because events are sent to stdout." };
                             ui.label(RichText::new(message).color(MUTED));
+                        } else if filtered.is_empty() {
+                            ui.label(RichText::new("No events match these filters.").color(MUTED));
                         }
                     });
+                    self.history_selected = selected.filter(|index| *index < rows.len());
+                    if let Some(event) = self.history_selected.and_then(|index| rows.get(index)) {
+                        ui.add_space(7.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.label(RichText::new("EVENT DETAILS").size(10.0).strong().color(MUTED));
+                            ui.horizontal(|ui| {
+                                metadata(ui, "TIME (UTC)", &event.time);
+                                metadata(ui, "METHOD", &event.method);
+                                metadata(ui, "STATUS", &event.status.to_string());
+                            });
+                            metadata(ui, "DESTINATION", &format!("{}:{}", event.host, event.port));
+                            metadata(ui, "PATH", if event.path.is_empty() { "(CONNECT tunnel)" } else { &event.path });
+                            metadata(ui, "COVERAGE", &event.coverage);
+                            metadata(ui, "RULE", event.rule.as_deref().unwrap_or("default / unavailable"));
+                            if let Some(model) = &event.model { metadata(ui, "MODEL", model); }
+                            if let Some(reason) = &event.reason { metadata(ui, "PROXY REASON", reason); }
+                        });
+                    }
                     ui.add_space(8.0);
-                    ui.label(RichText::new("History contains request metadata only. Bodies, header values and query strings are never stored.").size(10.0).color(MUTED));
+                    ui.label(RichText::new("Metadata only. Request bodies, header values, query strings and secret values are never stored or exported.")
+                        .size(10.0).color(MUTED));
                     return;
                 }
                 let recent = &self.history;
@@ -878,6 +978,25 @@ mod app {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].host, "example.com");
             assert_eq!(rows[0].process_name(), "curl.exe");
+        }
+
+        #[test]
+        fn csv_uses_crlf_rows_and_quotes_every_field() {
+            let event: HistoryEvent = serde_json::from_str(
+                r#"{"time":"2026-11-20T11:00:00Z","host":"api.example.com","port":443,"status":403,"action":"block","process":{"known":{"image":"C:\\Tools\\curl.exe"}},"reason":"say \"no\""}"#,
+            )
+            .expect("parse test event");
+
+            let csv = history_csv(&[&event]);
+            let lines: Vec<&str> = csv.split("\r\n").collect();
+
+            assert!(!csv.contains("\\r\\n"));
+            assert_eq!(lines.len(), 3, "header, one row, trailing empty: {csv:?}");
+            assert!(lines[0].starts_with("time_utc,process,host,"));
+            assert!(lines[1].contains("\"curl.exe\",\"api.example.com\",\"443\""));
+            assert!(lines[1].contains("\"block\",\"403\""));
+            assert!(lines[1].contains("\"say \"\"no\"\"\""));
+            assert_eq!(lines[2], "");
         }
     }
 }
