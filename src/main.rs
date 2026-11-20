@@ -7,6 +7,7 @@ mod event;
 mod process;
 mod proxy;
 mod tls;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -142,8 +143,15 @@ fn proxy_settings(
     Ok(settings)
 }
 
-/// Runs until cancelled, then drains, flushes the events and returns.
-fn run_proxy(config: &Config) -> Result<(), String> {
+/// How long a request waits for an answer, and how many may wait.
+// ponytail: fixed until the [approval] config keys arrive with the approve action (#34).
+#[cfg(windows)]
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const APPROVAL_QUEUE: usize = 16;
+
+/// Runs until `stop` completes, then drains, flushes the events and returns.
+fn run_proxy(config: &Config, stop: impl std::future::Future<Output = ()>) -> Result<(), String> {
     let settings = proxy_settings(config, config::data_dir())?;
     let target = config.event_target()?;
     let (events, writer) = event::spawn(
@@ -162,7 +170,7 @@ fn run_proxy(config: &Config) -> Result<(), String> {
             .await
             .map_err(|err| format!("[network] cannot listen on {listen}: {err}"))?;
         eprintln!("gatewizz {VERSION} listening on {listen}");
-        proxy::serve(listener, settings, events, cancelled())
+        proxy::serve(listener, settings, events, stop)
             .await
             .map_err(|err| format!("[network] {err}"))
     });
@@ -174,6 +182,30 @@ fn run_proxy(config: &Config) -> Result<(), String> {
         .map_err(|_| "[events] writer panicked".to_string())
         .and_then(|result| result);
     served.and(flushed)
+}
+
+/// On Windows the tray and approval window own the main thread; Quit, Ctrl+C or console close stop the proxy.
+#[cfg(windows)]
+fn run_with_ui(config: Config) -> Result<(), String> {
+    let approvals = std::sync::Arc::new(approve::Approvals::new(APPROVAL_TIMEOUT, APPROVAL_QUEUE));
+    let events_path = match config.event_target()? {
+        config::EventTarget::File(path) => Some(path),
+        config::EventTarget::Stdout => None,
+    };
+    ui::run(config.general.listen, events_path, approvals, move |quit| {
+        run_proxy(&config, async move {
+            tokio::select! {
+                () = cancelled() => {}
+                _ = quit => {}
+            }
+        })
+    })
+}
+
+/// Elsewhere gatewizz is a console proxy that runs until Ctrl+C.
+#[cfg(not(windows))]
+fn run_with_ui(config: Config) -> Result<(), String> {
+    run_proxy(&config, cancelled())
 }
 
 fn run(command: Command) -> Result<ExitCode, String> {
@@ -188,7 +220,8 @@ fn run(command: Command) -> Result<ExitCode, String> {
             print!("{}", config.effective());
         }
         Command::Run(path) => {
-            run_proxy(&load(path)?)?;
+            let config = load(path)?;
+            run_with_ui(config)?;
             eprintln!("gatewizz: stopped");
             return Ok(ExitCode::from(EXIT_CANCELLED));
         }

@@ -55,6 +55,17 @@ gets `421`, so a tunnel to an allowed host cannot reach a different site behind 
 the gatewizz certificate is logged, never silently passed through. Without `ca install`, `intercept = true` stops
 gatewizz at startup instead of falling back to blind tunnels.
 
+## Tray and approvals
+
+On Windows, `gatewizz` shows a tray icon while it runs. Its colour shows the state: green when running, grey when paused,
+amber when an approval is waiting. Clicking the icon opens the approval window. The right-click menu offers **Pause /
+Resume**, **Open event log**, **Copy proxy address** and **Quit**.
+
+When a rule holds a request for approval (the `approve` action, M3), the window opens and shows the program, PID, user,
+host, rule and finding kinds, never content, with the time left. **Allow once**, **Deny**, or **Allow <program> for N
+min** (that program and host, without asking again). A timeout, closing the window, a full queue or **Pause** all block
+the request. Ctrl+C in the console still stops gatewizz.
+
 ## Use with the wizz tools
 
 Start gatewizz in one terminal, then run the tool in another with the proxy set for that shell only:
