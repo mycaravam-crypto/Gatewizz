@@ -116,19 +116,12 @@ mod app {
             "gatewizz",
             options,
             Box::new(move |cc| {
-                Ok(Box::new(App::new(
-                    cc,
-                    listen,
-                    events_path,
-                    approvals,
-                    quit,
-                    proxy,
-                )
-                .map(|app| Box::new(app) as Box<dyn eframe::App>)
-                .map_err(|error| {
-                    Box::new(std::io::Error::other(error))
-                        as Box<dyn std::error::Error + Send + Sync>
-                })
+                App::new(cc, listen, events_path, approvals, quit, proxy)
+                    .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                    .map_err(|error| {
+                        Box::new(std::io::Error::other(error))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })
             }),
         );
         // The app owns the stop signal and the thread; dropping it (on any exit) has stopped the proxy.
@@ -443,6 +436,7 @@ mod app {
         }
 
         fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+            self.approvals.set_paused(true);
             if let Some(quit) = self.quit.take() {
                 let _ = quit.send(());
             }
