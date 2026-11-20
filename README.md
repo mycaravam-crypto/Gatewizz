@@ -89,9 +89,13 @@ try {
         Write-Host "Keeping existing configuration: $configPath"
     }
 
-    & $exePath --config $configPath --check-config
-    if ($LASTEXITCODE -ne 0) {
-        throw "Configuration validation failed. Review $configPath before starting Gatewizz."
+    # This is a Windows GUI-subsystem executable. Start-Process reliably
+    # exposes its process exit code; $LASTEXITCODE is not populated here.
+    $validation = Start-Process -FilePath $exePath `
+        -ArgumentList @("--config", "`"$configPath`"", "--check-config") `
+        -Wait -PassThru -NoNewWindow
+    if ($validation.ExitCode -ne 0) {
+        throw "Configuration validation failed (exit code $($validation.ExitCode)). Review $configPath before starting Gatewizz."
     }
 
     if ($backupPath -and (Test-Path -LiteralPath $backupPath)) {
@@ -104,14 +108,22 @@ try {
     Write-Host "Config:     $configPath"
 }
 catch {
-    # Restore the previous executable if post-install validation fails.
+    # Rollback is best-effort and must never hide the original install error.
+    $installError = $_
     if ($backupPath -and (Test-Path -LiteralPath $backupPath)) {
-        if (Test-Path -LiteralPath $exePath) {
-            Remove-Item -LiteralPath $exePath -Force
+        try {
+            if (Test-Path -LiteralPath $exePath) {
+                [System.IO.File]::Delete($exePath)
+            }
+            [System.IO.File]::Move($backupPath, $exePath)
+            Write-Warning "Restored the previous Gatewizz executable."
         }
-        [System.IO.File]::Move($backupPath, $exePath)
+        catch {
+            Write-Warning "Could not restore the previous executable: $($_.Exception.Message)"
+            Write-Warning "Rollback copy remains at: $backupPath"
+        }
     }
-    throw
+    throw $installError
 }
 finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
