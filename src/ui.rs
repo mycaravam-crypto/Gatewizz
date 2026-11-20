@@ -435,6 +435,7 @@ mod app {
 
     /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
     /// Accepts a borrowed path so callers do not need to allocate a `PathBuf`.
+    /// `path` comes from the local events.path configuration, which intentionally supports custom locations.
     fn load_history(path: &Path) -> Vec<HistoryEvent> {
         let mut rows = Vec::new();
         for suffix in 0..=MAX_LOG_ROTATIONS {
@@ -483,6 +484,40 @@ mod app {
             }
         }
         rows
+    }
+
+    #[cfg(test)]
+    mod history_tests {
+        use super::*;
+
+        #[test]
+        fn bounded_tail_survives_offset_inside_utf8_character() {
+            let event = br#"{"time":"2026-11-20T11:00:00Z","host":"example.com","status":200,"action":"allow","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#;
+            let total_len = MAX_HISTORY_FILE_BYTES as usize + 3;
+            let prefix_len = total_len - event.len() - 1;
+            let mut bytes = vec![b'a'; prefix_len];
+            bytes[1..4].copy_from_slice("€".as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(event);
+            assert_eq!(bytes.len(), total_len);
+
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after UNIX epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "gatewizz-history-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).expect("write test event log");
+
+            let rows = load_history(&path);
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "example.com");
+            assert_eq!(rows[0].process_name(), "curl.exe");
+        }
     }
 
     fn icon(state: TrayState) -> Icon {
