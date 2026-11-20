@@ -12,8 +12,28 @@ and allows, blocks or holds it for approval before any byte goes upstream. Every
 **Out until a concrete need:** system-wide proxy, Windows service, WFP/transparent capture, HTTP/2, QUIC, database,
 web UI or API, AI analysis, Linux.
 
-**Connection firewall (#56):** Phase 1, a read-only, no-admin connection monitor (`[monitor]`, #57), is in. A Windows
-service and WFP stay out until Phase 2 (#59) is taken up. That decision gets recorded here when it is made.
+**Connection firewall (#56):** Phase 1, a read-only, no-admin connection monitor (`[monitor]`, #57), is in.
+
+**Decision (2026-11-20, #59): a Windows service and WFP move from out to in, as an optional, elevated step.**
+- **Why:** the proxy only governs tools that opt in through `HTTPS_PROXY`. Enforcing "the AI tools reach the network
+  only through Gatewizz" needs per-app connection filters, and only the Windows Filtering Platform (WFP) can set
+  those without a kernel driver. Managing WFP filters needs elevation, and only a service can hold that while the
+  user's app stays unprivileged.
+- **Shape:** an optional service, `gatewizz-fw` (LocalSystem), installed and removed with
+  `gatewizz firewall install/remove` behind a UAC prompt.
+  - It owns one WFP provider and sublayer, the connection rules and the blocked-connection events.
+  - The per-user tray app keeps every UI, because a service has no desktop (Session 0). The two talk over a named
+    pipe whose ACL admits only the interactive user and SYSTEM.
+  - The service validates every rule change it receives.
+- **What stays as it was:** the proxy, the monitor and the no-admin install are unchanged. Without
+  `firewall install`, nothing runs elevated.
+- **Fail closed:** WFP filters are persistent, so they keep enforcing when the service is down. `default = "ask"`
+  blocks when no window can ask. Gatewizz's own program is always allowed, and that rule can't be edited.
+- **Still out:** our own kernel driver and packet interception. Holding a connection while the user decides is
+  Phase 3 (#60), decided separately.
+- **Order:** the pure rule core lands first (`firewall.rs`, every OS). Then come the service, WFP and the pipe
+  (Windows CI runs elevated), then the prompt and config write-back. The `[firewall]` and `[[connection_rules]]`
+  keys arrive with the service, so no accepted key ever does nothing.
 
 ## 2. YAGNI and engineering rules
 
@@ -52,6 +72,7 @@ src/
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
 ├── connections.rs # connection monitor: TCP table sampling, snapshot diff, rate limit, live list (#57)
 ├── dns.rs       # IP → hostname cache for the monitor, filled from the Windows DNS Client cache (#57)
+├── firewall.rs  # connection rules: matching, precedence, expiry, WFP filter plan, notice coalescing (pure; #59)
 ├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
 ├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
@@ -74,6 +95,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
 | **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
 | **F1: See every connection** (#56 Phase 1) | Read-only connection monitor: TCP tables per process, DNS-cache hostnames, `connection` events, Network tab | Every outgoing TCP connection is visible with its process and, where the DNS cache knows it, its hostname, without admin rights | implemented (#57); Windows CI test for the sampler; manual acceptance and overhead measurement pending |
+| **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); service, WFP, pipe and prompt next (#59) |
 
 ## 6. Quality gates
 
