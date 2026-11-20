@@ -65,8 +65,9 @@ pub fn remove() -> Result<String, String> {
     if status()?.is_none() {
         return Ok("Gatewizz was not registered for automatic startup.".into());
     }
+    let key = format!("HKCU\\{RUN_KEY}");
     let output = Command::new(reg_exe()?)
-        .args(["delete", &format!("HKCU\\{RUN_KEY}"), "/v", RUN_VALUE, "/f"])
+        .args(["delete", key.as_str(), "/v", RUN_VALUE, "/f"])
         .output()
         .map_err(|error| format!("[startup] cannot run reg.exe: {error}"))?;
     if !output.status.success() {
@@ -87,8 +88,9 @@ pub fn remove() -> Result<String, String> {
 pub fn status() -> Result<Option<String>, String> {
     use std::process::Command;
 
+    let key = format!("HKCU\\{RUN_KEY}");
     let output = Command::new(reg_exe()?)
-        .args(["query", &format!("HKCU\\{RUN_KEY}"), "/v", RUN_VALUE])
+        .args(["query", key.as_str(), "/v", RUN_VALUE])
         .output()
         .map_err(|error| format!("[startup] cannot run reg.exe: {error}"))?;
     if !output.status.success() {
