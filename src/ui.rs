@@ -504,7 +504,9 @@ mod app {
 
     /// Exports only the same metadata fields already persisted in the event log.
     fn history_csv(events: &[&HistoryEvent]) -> String {
-        let mut csv = String::from("time_utc,process,host,port,method,path,decision,status,coverage,rule,reason,model\\r\\n");
+        let mut csv = String::from(
+            "time_utc,process,host,port,method,path,decision,status,coverage,rule,reason,model\r\n",
+        );
         for event in events {
             let fields = [
                 event.time.clone(),
@@ -520,8 +522,14 @@ mod app {
                 event.reason.clone().unwrap_or_default(),
                 event.model.clone().unwrap_or_default(),
             ];
-            csv.push_str(&fields.iter().map(|field| csv_field(field)).collect::<Vec<_>>().join(","));
-            csv.push_str("\\r\\n");
+            csv.push_str(
+                &fields
+                    .iter()
+                    .map(|field| csv_field(field))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            csv.push_str("\r\n");
         }
         csv
     }
@@ -651,7 +659,8 @@ mod app {
                         stat_card(ui, "OTHER", &other.to_string(), GREEN);
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    let filtered = ui
+                        .horizontal(|ui| {
                         ui.label(RichText::new("ACTIVITY").strong().size(11.0));
                         ui.add(egui::TextEdit::singleline(&mut self.history_filter)
                             .hint_text("Filter host or process...")
@@ -682,7 +691,9 @@ mod app {
                         }
                         ui.label(RichText::new(format!("{} shown", filtered.len())).size(10.0).color(MUTED));
                         ui.add_space(4.0);
-                    });
+                        filtered
+                    })
+                        .inner;
                     ui.add_space(5.0);
                     let mut selected = self.history_selected;
                     egui::ScrollArea::vertical().max_height(310.0).auto_shrink([false, false]).show(ui, |ui| {
@@ -692,7 +703,7 @@ mod app {
                             }
                             ui.end_row();
                             for event in &filtered {
-                                let index = rows.iter().position(|row| std::ptr::eq(*row, *event)).unwrap_or(usize::MAX);
+                                let index = rows.iter().position(|row| std::ptr::eq(row, *event)).unwrap_or(usize::MAX);
                                 let active = selected == Some(index);
                                 let decision = event.decision();
                                 let color = match event.action {
@@ -967,6 +978,25 @@ mod app {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].host, "example.com");
             assert_eq!(rows[0].process_name(), "curl.exe");
+        }
+
+        #[test]
+        fn csv_uses_crlf_rows_and_quotes_every_field() {
+            let event: HistoryEvent = serde_json::from_str(
+                r#"{"time":"2026-11-20T11:00:00Z","host":"api.example.com","port":443,"status":403,"action":"block","process":{"known":{"image":"C:\\Tools\\curl.exe"}},"reason":"say \"no\""}"#,
+            )
+            .expect("parse test event");
+
+            let csv = history_csv(&[&event]);
+            let lines: Vec<&str> = csv.split("\r\n").collect();
+
+            assert!(!csv.contains("\\r\\n"));
+            assert_eq!(lines.len(), 3, "header, one row, trailing empty: {csv:?}");
+            assert!(lines[0].starts_with("time_utc,process,host,"));
+            assert!(lines[1].contains("\"curl.exe\",\"api.example.com\",\"443\""));
+            assert!(lines[1].contains("\"block\",\"403\""));
+            assert!(lines[1].contains("\"say \"\"no\"\"\""));
+            assert_eq!(lines[2], "");
         }
     }
 }
