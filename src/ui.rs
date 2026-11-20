@@ -369,7 +369,7 @@ mod app {
 
     fn event_process(value: &serde_json::Value) -> String {
         if let Some(image) = value.pointer("/process/known/image").and_then(|v| v.as_str()) {
-            return image.rsplit(['\\\\', '/']).next().unwrap_or(image).to_string();
+            return image.rsplit(['\\', '/']).next().unwrap_or(image).to_string();
         }
         value.get("process").map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())
     }
@@ -400,6 +400,8 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // Keep activity history fresh while the window is open without busy-looping.
+            ctx.request_repaint_after(Duration::from_secs(1));
             while let Ok(wake) = self.wake.try_recv() {
                 match wake {
                     Wake::Tray(TrayIconEvent::Click {
@@ -488,7 +490,7 @@ mod app {
                 ui.separator();
                 if self.tab == Tab::Activity {
                     let rows = history_rows(self.events_path.as_ref());
-                    let blocked = rows.iter().filter(|r| r.get("status").and_then(|v| v.as_u64()).is_some_and(|n| n == 403)).count();
+                    let blocked = rows.iter().filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("block")).count();
                     let allowed = rows.len().saturating_sub(blocked);
                     ui.horizontal(|ui| {
                         stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
@@ -518,7 +520,7 @@ mod app {
                                 let host = row.get("host").and_then(|v| v.as_str()).unwrap_or("-");
                                 let status = row.get("status").map(|v| v.to_string()).unwrap_or_else(|| "-".into());
                                 let decision = row.get("action").and_then(|v| v.as_str()).unwrap_or("-");
-                                let color = if status == "403" { RED } else { GREEN };
+                                let color = if decision == "block" { RED } else if decision == "approve" { AMBER } else { GREEN };
                                 ui.label(RichText::new(time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
                                 ui.label(RichText::new(event_process(row)).size(10.0));
                                 ui.label(RichText::new(host).size(10.0).color(BLUE));
@@ -529,7 +531,8 @@ mod app {
                         });
                         if rows.is_empty() {
                             ui.add_space(12.0);
-                            ui.label(RichText::new("No events recorded yet. Requests appear here as metadata only.").color(MUTED));
+                            let message = if self.events_path.is_some() { "No events recorded yet. New requests will appear here automatically." } else { "Persistent history is disabled because events are sent to stdout." };
+                            ui.label(RichText::new(message).color(MUTED));
                         }
                     });
                     ui.add_space(8.0);
@@ -537,7 +540,7 @@ mod app {
                     return;
                 }
                 let recent = history_rows(self.events_path.as_ref());
-                let blocked = recent.iter().filter(|r| r.get("status").and_then(|v| v.as_u64()).is_some_and(|n| n == 403)).count();
+                let blocked = recent.iter().filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("block")).count();
                 let allowed = recent.len().saturating_sub(blocked);
                 ui.horizontal(|ui| {
                     stat_card(ui, "RECENT REQUESTS", &recent.len().to_string(), BLUE);
