@@ -1,5 +1,12 @@
 //! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
 
+// Release builds run in the background with the tray and no console window of their own; output goes to the console
+// they were started from, if any (see `attach_parent_console`).
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 mod approve;
 mod ca;
 mod config;
@@ -229,12 +236,49 @@ fn run(command: Command) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Without a console of its own, gatewizz writes to the console it was started from. Output that is already
+/// redirected (a file or pipe) stays where it is. Returns whether there is anywhere to print to.
+#[cfg(windows)]
+fn attach_parent_console() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE,
+    };
+    let err = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if !err.is_null() && err != INVALID_HANDLE_VALUE {
+        return true;
+    }
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
+/// Started from Explorer there is no console, so an error that ends gatewizz is shown in a message box.
+#[cfg(windows)]
+fn show_error(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (text, caption) = (wide(text), wide("gatewizz"));
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    let console = attach_parent_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args).and_then(run) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("gatewizz: {err}");
+            #[cfg(windows)]
+            if !console {
+                show_error(&err);
+            }
             ExitCode::from(EXIT_FAILURE)
         }
     }
