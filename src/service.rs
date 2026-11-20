@@ -130,6 +130,24 @@ fn same_file(a: &Path, b: &Path) -> bool {
         .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
+/// The configuration text to install: the given file, validated; without one, the protected copy when `keep` says
+/// it is the current rule set (the service is installed), so `apply` or `install` without `--config` never wipes
+/// the rules; otherwise the defaults (no rules).
+fn rules_to_apply(config_path: Option<&Path>, keep: bool) -> Result<String, String> {
+    let given = config_path.map(read_valid).transpose()?;
+    let existing = if keep && given.is_none() {
+        std::fs::read_to_string(protected_config()).ok()
+    } else {
+        None
+    };
+    Ok(choose_rules(given, existing))
+}
+
+/// `--config` wins; then the existing protected copy; then the defaults.
+fn choose_rules(given: Option<String>, existing: Option<String>) -> String {
+    given.or(existing).unwrap_or_default()
+}
+
 /// Reads and validates a configuration file, so only a valid one ever reaches the protected copy.
 fn read_valid(path: &Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path)
@@ -224,12 +242,10 @@ fn refresh() -> Result<String, String> {
 /// `firewall apply`: with the service installed, update its protected configuration and ask it to reload, then apply
 /// right away too. Without the service, apply once.
 pub fn apply(config_path: Option<&Path>) -> Result<String, String> {
-    let config_text = match config_path {
-        Some(p) => read_valid(p)?,
-        None => String::new(),
-    };
+    let installed = status()?.is_some();
+    let config_text = rules_to_apply(config_path, installed)?;
     let config = Config::parse(&config_text)?;
-    if status()?.is_some() {
+    if installed {
         let self_paths = merged_self_paths()?;
         write_protected(&config_text, &self_paths)?;
         let mut all = service_self_paths();
@@ -265,10 +281,7 @@ pub fn status() -> Result<Option<&'static str>, String> {
 
 #[cfg(windows)]
 pub fn install(config_path: Option<&Path>) -> Result<String, String> {
-    let config_text = match config_path {
-        Some(p) => read_valid(p)?,
-        None => String::new(),
-    };
+    let config_text = rules_to_apply(config_path, true)?;
     let self_paths = merged_self_paths()?;
     let existed = status()?.is_some();
     if existed {
@@ -711,6 +724,17 @@ mod tests {
         assert!(rotated.contains("Applied") && rotated.contains("yyyy"));
         assert_eq!(current.lines().count(), 1);
         assert!(current.contains("after rotation"));
+    }
+
+    #[test]
+    fn without_a_config_the_installed_rules_are_kept() {
+        let rules = "[[connection_rules]]\nid = \"a\"\naction = \"block\"\n".to_string();
+        // `--config` replaces the rules.
+        assert_eq!(choose_rules(Some("new".into()), Some(rules.clone())), "new");
+        // No `--config`: the installed rules stay, never an empty set.
+        assert_eq!(choose_rules(None, Some(rules.clone())), rules);
+        // Nothing installed and nothing given: the defaults.
+        assert_eq!(choose_rules(None, None), "");
     }
 
     #[test]

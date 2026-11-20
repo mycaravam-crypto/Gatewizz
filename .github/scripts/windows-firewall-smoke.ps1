@@ -110,6 +110,12 @@ try {
     $reloaded = Wait-Until { (Applied-Count) -gt $appliedAtStart }
     Check 'service refreshed after the reload request' $reloaded "$(Get-Content -Raw (Join-Path $home_ 'service.log'))"
 
+    # Without --config, apply re-applies the installed rules; it must never replace them with an empty set.
+    $r = Invoke-Gatewizz @('firewall', 'apply')
+    Check 'apply without --config keeps the installed rules' (
+        $r.Code -eq 0 -and (Filter-Count) -eq $count + 1 -and
+        (Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-block-two') "$($r.Text) filters: $(Filter-Count)"
+
     # Restarting keeps the rules, read from the protected copy. Restart-Service returns once the service reports
     # running, and it applies before that.
     Restart-Service gatewizz-fw
