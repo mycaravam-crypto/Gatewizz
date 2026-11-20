@@ -16,11 +16,27 @@ it for approval before any byte goes upstream. Every decision is logged; content
     gatewizz [--config gatewizz.toml]                 # run until Ctrl+C; exits 130
     gatewizz [--config gatewizz.toml] --check-config  # print the effective config; exits 0, or 2 on an error
 
+    gatewizz ca install                               # create the local CA if missing and trust it (current user)
+    gatewizz ca remove                                # untrust every gatewizz CA and delete its files
+
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
 defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
 bodies.
 
 `gatewizz --help` lists every flag and the exit codes.
+
+## Local CA
+
+TLS interception (M2) needs a CA that the wizz tools trust. `gatewizz ca install` creates one and adds it to the
+**current user's** Trusted Root store; Windows shows its own confirmation dialog. No admin rights are needed and other
+users are not affected. Re-running it reuses the existing CA.
+
+- **Files** in `%LOCALAPPDATA%\gatewizz`: `ca.cer` (the public certificate) and `ca.key` (the ECDSA P-256 key,
+  encrypted with DPAPI so that only your Windows account can read it). The key is never written in the clear.
+- **What it can do:** sign certificates that the current user's Windows-store clients (the .NET wizz tools, curl.exe,
+  Edge, Chrome) accept for any host. That is why the key stays DPAPI-protected and the CA is per-user. Its basic
+  constraints allow leaf certificates only (path length 0).
+- `gatewizz ca remove` removes every gatewizz CA from the store (Windows asks again) and deletes both files.
 
 ## Use with the wizz tools
 
