@@ -48,3 +48,18 @@ jobs:
               throw "embedded manifest: $p missing"
             }
           }
+      # The shipping binary from a console: CLI output, exit codes and the startup Run-key round trip (#36).
+      - name: CLI smoke test of the release binary
+        shell: pwsh
+        run: .github/scripts/windows-cli-smoke.ps1 -Exe target\release\gatewizz.exe
+      # The acceptance script runs by hand on a real machine; at least make sure Windows PowerShell 5.1 parses it.
+      - name: Parse the PowerShell scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem scripts\*.ps1, .github\scripts\*.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "$($file.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }

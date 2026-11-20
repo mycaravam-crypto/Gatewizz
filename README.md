@@ -217,7 +217,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-CI also builds and tests on Windows, scans dependencies with Trivy and runs the SmartWizz review workflow. Release builds publish a versioned Windows x64 executable and SHA-256 checksums. See [CI and releases](docs/REFERENCE.md#ci-and-releases).
+Manual acceptance on a real Windows machine is scripted in `scripts/windows-acceptance.ps1` (see [Acceptance testing](docs/REFERENCE.md#acceptance-testing-on-windows)). CI also builds and tests on Windows, smoke-tests the release binary's CLI, scans dependencies with Trivy and runs the SmartWizz review workflow. Release builds publish a versioned Windows x64 executable and SHA-256 checksums. See [CI and releases](docs/REFERENCE.md#ci-and-releases).
 
 ## License
 

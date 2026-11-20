@@ -152,7 +152,7 @@ On Windows, the tray icon indicates state:
 - Grey: paused.
 - Amber: an approval is waiting.
 
-Clicking the icon opens the approval window. The context menu provides **Pause/Resume**, **Open event log**, **Copy proxy address** and **Quit**.
+Clicking the icon opens the workspace window. The context menu provides **Pause/Resume**, **Open event log**, **Copy proxy address** and **Quit**.
 
 An approval entry shows the requesting program, PID, user, host, rule, finding kinds and remaining time. It never displays request content. Available decisions:
 
@@ -160,7 +160,7 @@ An approval entry shows the requesting program, PID, user, host, rule, finding k
 - **Deny**: block this request.
 - **Allow program for N minutes**: create a temporary grant for that program and host.
 
-Timeout, closing the last approval window, a full queue or pausing the proxy blocks the request. Closing one of multiple windows does not withdraw requests while another remains open. Ctrl+C in the console stops gatewizz.
+Timeout, a full queue or pausing approvals blocks the request. All approvals share one workspace window. Closing it with its ✕ button denies every waiting request and hides the window to the tray. **Hide to tray** in the status bar only hides it, and the requests keep waiting. Ctrl+C in the console stops gatewizz.
 
 ## Activity history
 
@@ -221,6 +221,20 @@ cargo build --release --locked --target x86_64-pc-windows-gnu
 ```
 
 The executable embeds its icon and manifest via `build.rs`. The manifest requests per-monitor DPI v2 and `asInvoker`. Release builds have no console window when launched from Explorer; startup errors are shown in a message box. When started from a terminal, command output is written there and the prompt returns immediately. Debug builds retain a console.
+
+## Acceptance testing on Windows
+
+Some checks need a real Windows session: the icon, the tray, approvals clicked by a person, Ctrl+C in a console and the Windows certificate dialogs. [`scripts/windows-acceptance.ps1`](../scripts/windows-acceptance.ps1) covers the open acceptance items of #17, #22, #35 and #36. It measures what it can, asks y/n questions for what only a person can see, and writes a Markdown report to paste into the issues.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1
+# Optional: also run smartwizz through Gatewizz (#17); skip the CA part (#22) or the approval part (#35).
+powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1 -SmartwizzRepo C:\src\repo -SkipCa
+```
+
+The script uses its own config, port (18899) and event file under `%TEMP%`, so your setup is left alone. Quit a running Gatewizz first, because only one instance runs per session. It removes the CA again only if it was not installed before the run. Every check that involves Windows dialogs or a person stays manual.
+
+CI runs [`.github/scripts/windows-cli-smoke.ps1`](../.github/scripts/windows-cli-smoke.ps1) on the release binary. It checks the CLI output and exit codes and the `startup install/status/remove` Run-key round trip.
 
 ## CI and releases
 

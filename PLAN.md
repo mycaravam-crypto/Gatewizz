@@ -67,7 +67,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 |---|---|---|---|
 | **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete and released; real-Windows acceptance pending (#17) |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
-| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; real-Windows UI and startup acceptance remain open in #35 and #36 |
+| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
 
 ## 6. Quality gates
 
@@ -79,3 +79,5 @@ bash .github/scripts/semver-next.test.sh
 ```
 
 **Performance budget:** under 5 ms added p50 for requests without a body (from M1). `proxy::tests::bodyless_requests_stay_within_the_latency_budget` checks it on every CI run (direct vs proxied keep-alive GETs on loopback; print the numbers with `cargo test --release latency -- --nocapture`). Real-world overhead is measured with powerwizz.
+
+**Manual acceptance:** `scripts/windows-acceptance.ps1` runs the remaining real-Windows checks of M1–M3 (#17, #22, #35, #36) and writes a report for the issues; CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.
