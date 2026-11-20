@@ -1,5 +1,6 @@
 # Gatewizz manual acceptance on a real Windows machine: the checks left open in #17 (M1), #22 (M2), #35 (M3 approval
-# and tray), #36 (M3.1 background application) and #57 (connection monitor). Everything that can be measured is measured; what only a person
+# and tray), #36 (M3.1 background application), #57 (connection monitor) and, with -Firewall, #59 (connection
+# firewall). Everything that can be measured is measured; what only a person
 # can see (the icon, the tray, a window flash) is asked as a y/n/s question. The result is a Markdown report to paste
 # into the issues.
 #
@@ -16,6 +17,9 @@
 #   -SkipCa         skip the HTTPS interception and secret-routing part (#22), which adds and removes the CA
 #   -SkipApproval   skip the interactive approval and tray part (#35)
 #   -SkipMonitor    skip the connection monitor part (#57)
+#   -Firewall       also run the connection firewall part (#59). Needs an elevated prompt (Run as administrator). It
+#                   installs the gatewizz-fw service with test rules for curl.exe only and removes it at the end, so
+#                   it refuses to run if the firewall is already installed (that would replace your rules).
 #   -Report         where to write the Markdown report
 param(
     [string] $Exe = (Join-Path $env:LOCALAPPDATA 'Programs\Gatewizz\gatewizz.exe'),
@@ -24,6 +28,7 @@ param(
     [switch] $SkipCa,
     [switch] $SkipApproval,
     [switch] $SkipMonitor,
+    [switch] $Firewall,
     [string] $Report = (Join-Path (Get-Location) ("gatewizz-acceptance-{0:yyyyMMdd-HHmm}.md" -f (Get-Date)))
 )
 $ErrorActionPreference = 'Stop'
@@ -480,6 +485,103 @@ Stop-Gatewizz
 $raw = if (Test-Path $events) { Get-Content -Raw $events } else { '' }
 Check 17 'whole run: no query string or header value in the event log' ($raw -notmatch 'must-not-be-logged')
 
+# ---------------------------------------------------------------- #59: connection firewall
+
+if (-not $Firewall) {
+    Record 59 'connection firewall' 'skip' 'run with -Firewall from an elevated prompt'
+} elseif (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Record 59 'connection firewall' 'skip' 'needs an elevated prompt (Run as administrator)'
+} elseif (Get-Service gatewizz-fw -ErrorAction SilentlyContinue) {
+    Record 59 'connection firewall' 'skip' 'the firewall is already installed; this part would replace your rules'
+} else {
+    Step '#59 connection firewall'
+    $fwHome = Join-Path $env:ProgramFiles 'Gatewizz'
+    $curl = (Get-Command curl.exe).Source
+    # A renamed curl copy stands in for a wizz tool: it may reach only the proxy (the proxy-enforcement preset).
+    $wizz = Join-Path $work 'wizzcurl.exe'
+    Copy-Item -LiteralPath $curl -Destination $wizz
+    $fwConfig = Write-Config 'firewall.toml' @"
+[[connection_rules]]
+id = "acceptance-ask-curl"
+process = ['$curl']
+action = "ask"
+
+[[connection_rules]]
+id = "acceptance-wizz-only-through-gatewizz"
+process = ['$wizz']
+ip = ["127.0.0.1"]
+port = [$Port]
+action = "allow"
+
+[[connection_rules]]
+id = "acceptance-wizz-nowhere-else"
+process = ['$wizz']
+action = "block"
+"@
+    # One fixed address per host, so a retry never lands on another address (which would be a new prompt).
+    $pin = @{}
+    foreach ($h in 'example.net', 'example.org', 'example.com') {
+        $pin[$h] = ([System.Net.Dns]::GetHostAddresses($h) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).IPAddressToString
+    }
+    # A direct connection, past the proxy; returns curl's HTTP status ("000" when the connection is blocked).
+    function Invoke-Direct([string] $Program, [string] $HostName, [int] $ToPort, [string] $Scheme) {
+        $out = Join-Path $work ('direct-' + [guid]::NewGuid().ToString('N') + '.txt')
+        $arguments = @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '5', '--noproxy', '*',
+            '--resolve', "${HostName}:${ToPort}:$($pin[$HostName])", "${Scheme}://${HostName}:${ToPort}/")
+        Start-Process -FilePath $Program -ArgumentList (Join-CommandLine $arguments) -NoNewWindow -Wait -RedirectStandardOutput $out | Out-Null
+        if (Test-Path $out) { (Get-Content -Raw $out).Trim() } else { '' }
+    }
+    function Protected-Config { Get-Content -Raw (Join-Path $fwHome 'firewall.toml') }
+
+    $r = Invoke-Gatewizz @('firewall', 'install', '--config', $fwConfig)
+    Check 59 'firewall install succeeds' ($r.Code -eq 0) $r.Text
+    $null = Start-Gatewizz $plain
+    Say 'Open the Gatewizz window from the tray icon.'
+    Ask 59 'the tray app connects to the service' 'Does the status bar show "Firewall prompt on"?'
+
+    Say 'curl.exe now connects to example.net:80 directly. The window should show it as blocked. Click "Allow once".'
+    $first = Invoke-Direct $curl 'example.net' 80 'http'
+    Check 59 'an ask rule blocks the first attempt' ($first -eq '000') "status $first"
+    $allowed = Wait-Until { (Invoke-Direct $curl 'example.net' 80 'http') -ne '000' } 120
+    Check 59 'Allow once lets the retry through' $allowed
+    Ask 59 'the blocked connection was shown with program and address' 'Did the queue show curl.exe and the address of example.net, port 80?'
+
+    Say 'Next: example.org:443. Click "Allow always".'
+    $null = Invoke-Direct $curl 'example.org' 443 'https'
+    $always = Wait-Until { (Invoke-Direct $curl 'example.org' 443 'https') -ne '000' } 120
+    Check 59 'Allow always lets the retry through' $always
+    Check 59 'Allow always is written to the protected configuration' ((Protected-Config) -match 'prompt-allow-curl\.exe') (Protected-Config)
+
+    Say 'Next: example.com:8080. Click "Deny always".'
+    $null = Invoke-Direct $curl 'example.com' 8080 'http'
+    $denied = Wait-Until { (Protected-Config) -match 'prompt-block-curl\.exe' } 120
+    Check 59 'Deny always is written to the protected configuration' $denied (Protected-Config)
+    Start-Sleep -Seconds 2
+    Say 'curl.exe tries example.com:8080 again now. Watch the window.'
+    $again = Invoke-Direct $curl 'example.com' 8080 'http'
+    Check 59 'Deny always keeps blocking' ($again -eq '000') "status $again"
+    Ask 59 'Deny always blocks silently' 'Did the second attempt stay out of the queue (no new prompt)?'
+
+    # The service reads the protected configuration again when it starts, as at boot (it starts automatically).
+    Restart-Service gatewizz-fw
+    Check 59 'Allow always survives a service restart' ((Invoke-Direct $curl 'example.org' 443 'https') -ne '000')
+    $svc = Get-CimInstance Win32_Service -Filter "Name='gatewizz-fw'"
+    Check 59 'the service starts at boot' ($svc -and $svc.StartMode -eq 'Auto') "$($svc.StartMode)"
+
+    $bypass = Invoke-Direct $wizz 'example.com' 80 'http'
+    Check 59 'proxy enforcement: the wizz tool cannot connect past the proxy' ($bypass -eq '000') "status $bypass"
+    $through = Start-Process -FilePath $wizz -ArgumentList (Join-CommandLine @('-s', '-o', 'NUL', '--max-time', '30', '-x', $proxy, 'http://example.com/')) -NoNewWindow -Wait -PassThru
+    Check 59 'proxy enforcement: the wizz tool reaches the network through Gatewizz' ($through.ExitCode -eq 0) "curl exit $($through.ExitCode)"
+    $log = Get-Content -Raw (Join-Path $fwHome 'service.log')
+    $evidence.Add('Firewall service log, blocked lines: ' + ((($log -split "`n") | Where-Object { $_ -match 'blocked:' } | Select-Object -Last 3) -join ' | ').Replace($env:USERNAME, '<user>'))
+
+    Stop-Gatewizz
+    $r = Invoke-Gatewizz @('firewall', 'remove')
+    Check 59 'firewall remove leaves no service, filters or files' (
+        $r.Code -eq 0 -and -not (Get-Service gatewizz-fw -ErrorAction SilentlyContinue) -and -not (Test-Path $fwHome)) $r.Text
+}
+
 # ---------------------------------------------------------------- report
 
 $issueTitles = [ordered]@{
@@ -488,6 +590,7 @@ $issueTitles = [ordered]@{
     '35' = 'M3: approval window and tray'
     '36' = 'M3.1: icon, manifest and background start'
     '57' = 'Firewall Phase 1: connection monitor'
+    '59' = 'Firewall Phase 2: connection rules and prompt'
 }
 $os = (Get-CimInstance Win32_OperatingSystem)
 $lines = New-Object System.Collections.Generic.List[string]

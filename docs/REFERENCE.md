@@ -299,15 +299,17 @@ The executable embeds its icon and manifest via `build.rs`. The manifest request
 
 ## Acceptance testing on Windows
 
-Some checks need a real Windows session: the icon, the tray, approvals clicked by a person, Ctrl+C in a console and the Windows certificate dialogs. [`scripts/windows-acceptance.ps1`](../scripts/windows-acceptance.ps1) covers the open acceptance items of #17, #22, #35 and #36. It measures what it can, asks y/n questions for what only a person can see, and writes a Markdown report to paste into the issues.
+Some checks need a real Windows session: the icon, the tray, approvals clicked by a person, Ctrl+C in a console and the Windows certificate dialogs. [`scripts/windows-acceptance.ps1`](../scripts/windows-acceptance.ps1) covers the open acceptance items of #17, #22, #35, #36, #57 and, with `-Firewall`, #59. It measures what it can, asks y/n questions for what only a person can see, and writes a Markdown report to paste into the issues.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1
 # Optional: also run smartwizz through Gatewizz (#17); skip the CA part (#22) or the approval part (#35).
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1 -SmartwizzRepo C:\src\repo -SkipCa
+# From an elevated prompt (Run as administrator): also the connection firewall and its prompt (#59).
+powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1 -Firewall
 ```
 
-The script uses its own config, port (18899) and event file under `%TEMP%`, so your setup is left alone. Quit a running Gatewizz first, because only one instance runs per session. It removes the CA again only if it was not installed before the run. Every check that involves Windows dialogs or a person stays manual.
+The script uses its own config, port (18899) and event file under `%TEMP%`, so your setup is left alone. Quit a running Gatewizz first, because only one instance runs per session. It removes the CA again only if it was not installed before the run. Every check that involves Windows dialogs or a person stays manual. The firewall part installs the `gatewizz-fw` service with test rules for `curl.exe` and a renamed copy of it (the proxy-enforcement preset), asks you to answer three prompts, and removes everything at the end. It refuses to run if the firewall is already installed, since installing would replace your rules. "Allow always survives a reboot" is checked as a service restart plus the automatic start; both read the same protected configuration that a boot does.
 
 CI runs [`.github/scripts/windows-cli-smoke.ps1`](../.github/scripts/windows-cli-smoke.ps1) on the release binary. It checks the CLI output and exit codes and the `startup install/status/remove` Run-key round trip.
 
