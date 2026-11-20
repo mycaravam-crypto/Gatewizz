@@ -27,6 +27,7 @@ gatewizz startup install
 gatewizz startup install --config .\gatewizz.toml
 gatewizz startup status
 gatewizz startup remove
+gatewizz firewall install --config .\gatewizz.toml # elevated prompt
 gatewizz firewall apply --config .\gatewizz.toml   # elevated prompt
 gatewizz firewall status
 gatewizz firewall remove                           # elevated prompt
@@ -40,7 +41,7 @@ gatewizz firewall remove                           # elevated prompt
 - `startup install [--config <path>]`: registers the current executable in the current user's Windows Run key. The optional config path is resolved to an absolute path and retained for login startup.
 - `startup status`: displays the current Run registration.
 - `startup remove`: removes only Gatewizz's Run value; it does not uninstall the executable or remove the CA.
-- `firewall apply [--config <path>]`, `firewall status`, `firewall remove`: see [Connection firewall](#connection-firewall).
+- `firewall install|apply [--config <path>]`, `firewall status`, `firewall remove`: see [Connection firewall](#connection-firewall).
 
 `gatewizz --help` is authoritative for the complete flag list and exit codes.
 
@@ -204,10 +205,19 @@ Limits:
 The connection firewall turns `[[connection_rules]]` into Windows Filtering Platform (WFP) filters. Those filters allow or block outgoing connections per program, address, port and protocol, for every program, whether or not it uses the proxy. It is Phase 2 of #56 and needs an elevated (Run as administrator) prompt. Nothing else in Gatewizz does.
 
 ```powershell
-gatewizz firewall apply --config .\gatewizz.toml   # install or replace the filters
-gatewizz firewall status                           # installed, and how many filters
-gatewizz firewall remove                           # take every Gatewizz filter away
+gatewizz firewall install --config .\gatewizz.toml # install the service that keeps the rules current
+gatewizz firewall apply --config .\gatewizz.toml   # change the rules (or apply once, without the service)
+gatewizz firewall status                           # filters and service state
+gatewizz firewall remove                           # remove the service, every filter and its files
 ```
+
+- **The service (`gatewizz-fw`):** `firewall install` sets up a Windows service that keeps the rules current.
+  - It resolves program paths and host addresses again every 60 seconds, and at once after `firewall apply`.
+  - It starts automatically at boot, before anyone signs in.
+  - It runs as LocalSystem, so it never runs or reads anything a normal user can write. `install` copies `gatewizz.exe` and the validated configuration into `%ProgramFiles%\Gatewizz`, which only administrators can change, and the service runs from that copy. `firewall apply` updates the copy, again from an elevated prompt. Editing your own configuration file changes nothing until you run `apply`.
+  - It writes each refresh, and any error, to `%ProgramFiles%\Gatewizz\service.log`. That file rotates at 256 KiB.
+  - When a refresh fails, or the service stops, the last filters stay in force (fail closed).
+- **Without the service:** `firewall apply` installs the filters once, with names resolved at that moment.
 
 - **Rules:** see the commented `[firewall]` and `[[connection_rules]]` example in [gatewizz.example.toml](../config/gatewizz.example.toml).
   - The most specific matching rule wins: first by how many of program, address, port and protocol it pins down, then by how narrow its address is (exact host, then `*.suffix`, then IP prefix width).
@@ -218,14 +228,14 @@ gatewizz firewall remove                           # take every Gatewizz filter 
   - Block filters are hard blocks, so other software cannot override them.
   - Filters are persistent: they stay in force after a reboot, or when Gatewizz is not running, until `firewall remove`.
   - `apply` replaces the whole set in one transaction, so a failed apply leaves the previous rules in place.
-- **Names:** WFP works with full program paths and IP addresses, so `apply` resolves names when it runs. A program file name covers the copies on `PATH` and those running at that moment. A host covers the addresses it resolves to at that moment. `apply` warns about anything it could not resolve, since that part of a rule is not enforced. Use full paths in `process`, and `ip`, for what must always be covered. Run `apply` again after installing a program or when a host's addresses change.
-- **Gatewizz itself** is always allowed. No rule can block it.
+- **Names:** WFP works with full program paths and IP addresses, so names are resolved on every apply and every service refresh. A program file name covers the copies on `PATH` and those running at that moment. A host covers the addresses it resolves to at that moment. `apply` warns about anything it could not resolve, since that part of a rule is not enforced until a later refresh finds it. Use full paths in `process`, and `ip`, for what must always be covered.
+- **Gatewizz itself** is always allowed: the service's copy, and the copy that ran `install` or `apply` (your tray app and proxy). No rule can block it.
 - **`default`:**
   - `allow` (the default) filters only what rules name.
   - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
   - `ask` blocks for now. It will prompt for unknown connections once the background service and approval prompt exist (#59).
 
-Not yet: the approval prompt for blocked connections, rules added from it, and a background service that keeps program paths and host addresses current. These are the next steps of #59.
+Not yet: the approval prompt for blocked connections and rules added from it. Those are the next steps of #59; they need the service to report blocked connections to the tray app.
 
 ## Events and privacy
 

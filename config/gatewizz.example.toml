@@ -91,8 +91,10 @@
 
 [firewall]
 # Connection firewall (Windows, #59). Nothing here takes effect until
-# `gatewizz firewall apply --config <this file>` runs from an elevated prompt;
-# `gatewizz firewall remove` takes every Gatewizz filter away again.
+# `gatewizz firewall install --config <this file>` (service that keeps the rules
+# current) or `gatewizz firewall apply --config <this file>` runs from an
+# elevated prompt. Editing this file changes nothing until the next `apply`;
+# `gatewizz firewall remove` takes the service and every filter away again.
 #
 # What happens to a connection no rule matches: "allow", "block" or "ask".
 # Until the approval prompt exists, "ask" blocks. "block" blocks every program

@@ -378,25 +378,34 @@ pub struct Filter {
 /// - a host becomes one filter per IP `resolved` reports for it (from the DNS cache); a host with no known IP yet
 ///   yields no filter, and the default filter decides until the name is seen.
 ///
-/// Gatewizz's own executable (`own_path`) gets the top-weight allow; a `block`/`ask` default gets a bottom-weight
-/// block.
+/// Gatewizz's own executables (`own_paths`: the service's copy and the user's) get the top-weight allow; a
+/// `block`/`ask` default gets a bottom-weight block.
 pub fn plan(
     rules: &[Rule],
     default: DefaultAction,
-    own_path: &str,
+    own_paths: &[String],
     now: SystemTime,
     resolved: impl Fn(&str) -> Vec<IpAddr>,
     programs: impl Fn(&str) -> Vec<String>,
 ) -> Vec<Filter> {
-    let mut out = vec![Filter {
-        rule: SELF_RULE.into(),
-        program: Some(own_path.to_string()),
-        remote: None,
-        port: None,
-        protocol: Protocol::Any,
-        action: RuleAction::Allow,
-        weight: u64::MAX,
-    }];
+    let mut out: Vec<Filter> = Vec::new();
+    for path in own_paths {
+        if !out.iter().any(|f| {
+            f.program
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(path))
+        }) {
+            out.push(Filter {
+                rule: SELF_RULE.into(),
+                program: Some(path.clone()),
+                remote: None,
+                port: None,
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                weight: u64::MAX,
+            });
+        }
+    }
     let count = rules.len() as u64;
     for (i, rule) in rules.iter().enumerate().filter(|(_, r)| r.active(now)) {
         let (dims, narrow) = rule.specificity();
@@ -611,6 +620,10 @@ mod tests {
 
     const OWN: &str = "gatewizz.exe";
     const OWN_PATH: &str = r"C:\Users\u\AppData\Local\Programs\Gatewizz\gatewizz.exe";
+
+    fn own_paths() -> Vec<String> {
+        vec![OWN_PATH.to_string()]
+    }
 
     fn no_paths(_: &str) -> Vec<String> {
         Vec::new()
@@ -956,7 +969,7 @@ mod tests {
             plan(
                 &r,
                 DefaultAction::Block,
-                OWN_PATH,
+                &own_paths(),
                 later,
                 |_| Vec::new(),
                 no_paths
@@ -1004,12 +1017,29 @@ mod tests {
         let p = plan(
             &r,
             DefaultAction::Ask,
-            OWN_PATH,
+            &own_paths(),
             SystemTime::now(),
             resolved,
             paths,
         );
-        // Self first, default last.
+        // Self first, default last; every own path is allowed once.
+        let two = [
+            OWN_PATH.to_string(),
+            r"C:\Program Files\Gatewizz\gatewizz.exe".to_string(),
+            OWN_PATH.to_ascii_uppercase(),
+        ];
+        let selfs = plan(
+            &r,
+            DefaultAction::Allow,
+            &two,
+            SystemTime::now(),
+            |_| Vec::new(),
+            no_paths,
+        )
+        .into_iter()
+        .filter(|f| f.rule == SELF_RULE)
+        .count();
+        assert_eq!(selfs, 2);
         assert_eq!(p.first().unwrap().rule, SELF_RULE);
         assert_eq!(p.first().unwrap().program.as_deref(), Some(OWN_PATH));
         let last = p.last().unwrap();
@@ -1043,7 +1073,7 @@ mod tests {
             plan(
                 &r,
                 DefaultAction::Allow,
-                OWN_PATH,
+                &own_paths(),
                 SystemTime::now(),
                 |_| Vec::new(),
                 no_paths
@@ -1074,7 +1104,7 @@ mod tests {
         let p = plan(
             &r,
             DefaultAction::Allow,
-            OWN_PATH,
+            &own_paths(),
             SystemTime::now(),
             |_| Vec::new(),
             paths,
