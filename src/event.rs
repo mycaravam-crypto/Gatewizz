@@ -12,13 +12,15 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::config::EventTarget;
+use crate::detect::Finding;
 use crate::process::Process;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Coverage {
-    /// Plain HTTP: request metadata is seen.
-    // ponytail: bodies are not inspected before M2, so plain HTTP is only partially inspected.
+    /// The whole request, body included, was inspected before anything went upstream.
+    Inspected,
+    /// Headers were inspected, but the body only partly or not at all (over the limit, or compressed).
     PartiallyInspected,
     /// CONNECT passed through without decryption.
     Tunneled,
@@ -39,11 +41,15 @@ pub struct Event {
     /// Request path without the query string; empty for CONNECT.
     pub path: String,
     pub coverage: Coverage,
+    /// Secret kinds found in the request, with counts; never the matched text.
+    pub findings: Vec<Finding>,
+    /// The model of an OpenAI-compatible request.
+    pub model: Option<String>,
     pub status: u16,
     /// Why the proxy itself answered (rejection or upstream failure).
     pub reason: Option<&'static str>,
     /// Bytes client→upstream and upstream→client.
-    // ponytail: counted for tunnels only; plain HTTP gets counters when M2 reads request bodies anyway.
+    // ponytail: bytes_down is counted for tunnels only; for plain HTTP it needs a counting response body.
     pub bytes_up: Option<u64>,
     pub bytes_down: Option<u64>,
 }
@@ -222,6 +228,8 @@ mod tests {
             port: 443,
             path: path.into(),
             coverage: Coverage::PartiallyInspected,
+            findings: Vec::new(),
+            model: None,
             status: 200,
             reason: None,
             bytes_up: None,
@@ -256,8 +264,10 @@ mod tests {
                 "bytes_up",
                 "client",
                 "coverage",
+                "findings",
                 "host",
                 "method",
+                "model",
                 "path",
                 "port",
                 "process",

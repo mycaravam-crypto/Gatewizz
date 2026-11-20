@@ -20,8 +20,8 @@ it for approval before any byte goes upstream. Every decision is logged; content
     gatewizz ca remove                                # untrust every gatewizz CA and delete its files
 
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
-defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
-bodies.
+defaults. Events hold metadata only (process, host, path without query, status, coverage, secret kinds found, AI model),
+never header values, secrets or bodies.
 
 `gatewizz --help` lists every flag and the exit codes.
 
