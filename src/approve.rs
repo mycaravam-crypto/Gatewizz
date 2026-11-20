@@ -326,7 +326,10 @@ mod tests {
         assert_eq!(task.await.unwrap(), Outcome::Blocked("approval withdrawn"));
         assert!(a.pending().is_empty());
         assert_eq!(*a.watch().borrow(), 0);
-        assert_eq!(a.ask(held("h")).await, Outcome::Blocked("no approval window"));
+        assert_eq!(
+            a.ask(held("h")).await,
+            Outcome::Blocked("no approval window")
+        );
     }
 
     #[tokio::test]
