@@ -152,16 +152,14 @@ fn proxy_settings(
     Ok(settings)
 }
 
-/// How long a request waits for an answer, and how many may wait.
-// ponytail: fixed until the [approval] config keys arrive with the approve action (#34).
-#[cfg(windows)]
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(windows)]
-const APPROVAL_QUEUE: usize = 16;
-
 /// Runs until `stop` completes, then drains, flushes the events and returns.
-fn run_proxy(config: &Config, stop: impl std::future::Future<Output = ()>) -> Result<(), String> {
-    let settings = proxy_settings(config, config::data_dir())?;
+fn run_proxy(
+    config: &Config,
+    approvals: Option<std::sync::Arc<approve::Approvals>>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let mut settings = proxy_settings(config, config::data_dir())?;
+    settings.approvals = approvals;
     let target = config.event_target()?;
     let (events, writer) = event::spawn(
         target,
@@ -196,13 +194,17 @@ fn run_proxy(config: &Config, stop: impl std::future::Future<Output = ()>) -> Re
 /// On Windows the tray and approval window own the main thread; Quit, Ctrl+C or console close stop the proxy.
 #[cfg(windows)]
 fn run_with_ui(config: Config) -> Result<(), String> {
-    let approvals = std::sync::Arc::new(approve::Approvals::new(APPROVAL_TIMEOUT, APPROVAL_QUEUE));
+    let approvals = std::sync::Arc::new(approve::Approvals::new(
+        Duration::from_secs(config.approval.timeout_secs),
+        config.approval.max_pending,
+    ));
     let events_path = match config.event_target()? {
         config::EventTarget::File(path) => Some(path),
         config::EventTarget::Stdout => None,
     };
+    let queue = approvals.clone();
     ui::run(config.general.listen, events_path, approvals, move |quit| {
-        run_proxy(&config, async move {
+        run_proxy(&config, Some(queue), async move {
             tokio::select! {
                 () = cancelled() => {}
                 _ = quit => {}
@@ -214,7 +216,8 @@ fn run_with_ui(config: Config) -> Result<(), String> {
 /// Elsewhere gatewizz is a console proxy that runs until Ctrl+C.
 #[cfg(not(windows))]
 fn run_with_ui(config: Config) -> Result<(), String> {
-    run_proxy(&config, cancelled())
+    // No approval window here, so `approve` rules block (fail closed).
+    run_proxy(&config, None, cancelled())
 }
 
 fn run(command: Command) -> Result<ExitCode, String> {

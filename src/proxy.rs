@@ -23,6 +23,7 @@ use tokio::time::timeout;
 
 type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
 
+use crate::approve::{Approvals, Held, Outcome};
 use crate::detect::{self, BodyLimits, Inspected};
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
@@ -65,6 +66,8 @@ pub struct Settings {
     /// Allow/block rules, validated at config load.
     pub rules: Vec<Rule>,
     pub default_action: Action,
+    /// The approval window's queue; without one, `approve` rules block (fail closed).
+    pub approvals: Option<Arc<Approvals>>,
     /// How much of a request body is read and inspected before any request byte goes upstream.
     pub body: BodyLimits,
 }
@@ -83,6 +86,7 @@ impl Default for Settings {
             tls: None,
             rules: Vec::new(),
             default_action: Action::Allow,
+            approvals: None,
             body: BodyLimits::default(),
         }
     }
@@ -278,32 +282,37 @@ async fn forward(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early).await {
         return blocked;
     }
-    let upstream = match connect_upstream(ctx, &host, port).await {
-        Ok(stream) => stream,
-        Err(failure) => return refuse(ctx, event, failure.status(), failure.reason()).await,
-    };
     let authority = req.uri().authority().map(|a| a.as_str().to_string());
     to_origin_form(&mut req, authority);
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                return refuse(
-                    ctx,
-                    event,
-                    StatusCode::BAD_GATEWAY,
-                    "upstream handshake failed",
-                )
-                .await;
-            }
-        };
+    // ponytail: one upstream connection per request, no pooling; add a pool if the latency budget needs it.
+    relay(ctx, event, Upstream::Connect { host: &host, port }, req).await
+}
+
+/// The upstream a request goes to. Plain HTTP connects only once the request is decided, so a refused or held
+/// request opens no upstream connection at all; a decrypted request already has its tunnel's connection.
+enum Upstream<'a> {
+    Connect { host: &'a str, port: u16 },
+    Ready(&'a mut UpstreamSender),
+}
+
+/// TCP and an HTTP/1.1 connection to a plain-HTTP upstream.
+async fn connect_http(
+    ctx: &Ctx,
+    host: &str,
+    port: u16,
+) -> Result<UpstreamSender, (StatusCode, &'static str)> {
+    let tcp = connect_upstream(ctx, host, port)
+        .await
+        .map_err(|failure| (failure.status(), failure.reason()))?;
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "upstream handshake failed"))?;
     // Ends when the response body is consumed or dropped (client gone).
     tokio::spawn(conn);
-    // ponytail: one upstream connection per request, no pooling; add a pool if the latency budget needs it.
-    relay(ctx, event, &mut sender, req).await
+    Ok(sender)
 }
 
 /// Turns a proxy request into what the upstream expects: origin-form target, no hop-by-hop headers, a `Host`.
@@ -329,7 +338,7 @@ fn to_origin_form(req: &mut Request<Incoming>, authority: Option<String>) {
 async fn relay(
     ctx: &Ctx,
     mut event: Event,
-    sender: &mut UpstreamSender,
+    upstream: Upstream<'_>,
     req: Request<Incoming>,
 ) -> Response<Body> {
     // Plain HTTP and decrypted HTTPS both end here: the body is read and inspected before any request byte is sent.
@@ -363,9 +372,20 @@ async fn relay(
             defer_content: false,
         })
     };
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Final).await {
         return blocked;
     }
+    let mut connected;
+    let sender = match upstream {
+        Upstream::Ready(sender) => sender,
+        Upstream::Connect { host, port } => match connect_http(ctx, host, port).await {
+            Ok(sender) => {
+                connected = sender;
+                &mut connected
+            }
+            Err((status, reason)) => return refuse(ctx, event, status, reason).await,
+        },
+    };
     let response = match timeout(ctx.settings.response_timeout, sender.send_request(req)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => return refuse(ctx, event, StatusCode::BAD_GATEWAY, "upstream failed").await,
@@ -446,7 +466,13 @@ async fn tunnel(
         content: None,
         defer_content: interceptor.is_some(),
     });
-    if let Some(blocked) = enforce(&ctx, &mut event, decision).await {
+    // A blind tunnel is decided once, here; a decrypted one asks for approval per request.
+    let stage = if interceptor.is_some() {
+        Stage::Early
+    } else {
+        Stage::Final
+    };
+    if let Some(blocked) = enforce(&ctx, &mut event, decision, stage).await {
         return blocked;
     }
     if let Some(interceptor) = interceptor {
@@ -641,7 +667,7 @@ async fn inside(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early).await {
         return blocked;
     }
     let authority = if port == 443 {
@@ -664,33 +690,88 @@ async fn inside(
         }
     }
     // The lock is held until the response head arrives; HTTP/1.1 serves one request at a time anyway.
-    relay(ctx, event, &mut sender, req).await
+    relay(ctx, event, Upstream::Ready(&mut sender), req).await
 }
 
 /// Notes the decision on the event. Anything but `allow` answers 403 naming the rule, records the event and closes
 /// the connection; nothing reaches the upstream.
-async fn enforce(ctx: &Ctx, event: &mut Event, decision: Decision) -> Option<Response<Body>> {
+/// Where a decision is taken. A request is decided early (host, process, path) and finally (after the body is read,
+/// or at CONNECT for a blind tunnel); blocks apply at both, approvals are asked only at the final one so a request
+/// is never asked twice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Early,
+    Final,
+}
+
+/// Notes the decision on the event and applies it. `block`, and an `approve` that is denied, times out or has no
+/// window to ask, answer 403 naming the rule, record the event and close the connection; nothing reaches the
+/// upstream. A request held for approval waits here, before any of its bytes are sent.
+async fn enforce(
+    ctx: &Ctx,
+    event: &mut Event,
+    decision: Decision,
+    stage: Stage,
+) -> Option<Response<Body>> {
     event.action = Some(decision.action);
     event.rule = Some(decision.rule.clone());
-    if decision.action == Action::Allow {
-        return None;
+    match decision.action {
+        Action::Allow => None,
+        Action::Approve if stage == Stage::Early => None,
+        Action::Approve => {
+            let outcome = match &ctx.settings.approvals {
+                Some(approvals) => {
+                    approvals
+                        .ask(Held {
+                            process: event.process.clone(),
+                            host: event.host.clone(),
+                            rule: decision.rule.clone(),
+                            findings: event.findings.iter().map(|f| f.kind.to_string()).collect(),
+                        })
+                        .await
+                }
+                None => Outcome::Blocked("no approval window"),
+            };
+            match outcome {
+                Outcome::Allowed(reason) => {
+                    event.reason = Some(reason);
+                    None
+                }
+                Outcome::Blocked(reason) => Some(forbid(ctx, event, &decision, reason).await),
+            }
+        }
+        Action::Block => Some(forbid(ctx, event, &decision, "blocked by rule").await),
     }
+}
+
+/// The 403 for a blocked request: rule, severity, description and the event time, so the user can find the event.
+async fn forbid(
+    ctx: &Ctx,
+    event: &Event,
+    decision: &Decision,
+    reason: &'static str,
+) -> Response<Body> {
     let mut blocked = event.clone();
     blocked.coverage = Coverage::Blocked;
     blocked.status = StatusCode::FORBIDDEN.as_u16();
-    blocked.reason = Some("blocked by rule");
+    blocked.reason = Some(reason);
     let time = blocked.time.clone();
     ctx.emit(blocked).await;
     let severity = decision
         .severity
         .map_or(String::new(), |s| format!(" ({})", s.as_str()));
+    let why = if reason == "blocked by rule" {
+        String::new()
+    } else {
+        format!(": {reason}")
+    };
     let description = if decision.description.is_empty() {
         String::new()
     } else {
         format!("{}\n", decision.description)
     };
     let text = format!(
-        "gatewizz: blocked by rule \"{}\"{severity}\n{description}event time: {time}\n",
+        "gatewizz: blocked by rule \"{}\"{severity}{why}\n{description}event time: {time}\n",
         decision.rule
     );
     let mut response = Response::new(
@@ -705,7 +786,7 @@ async fn enforce(ctx: &Ctx, event: &mut Event, decision: Decision) -> Option<Res
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
-    Some(response)
+    response
 }
 
 /// Image file name of a known client process (`smartwizz.exe`), as `match.process` names it.
@@ -1473,14 +1554,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_disconnect_mid_upload_closes_the_upstream() {
+    async fn client_disconnect_mid_upload_leaves_no_upstream_connection() {
         let (proxy, _events) = start(Settings::default()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = listener.local_addr().unwrap();
+        // The body is read before the upstream connection opens, so normally none is opened at all; if one is,
+        // it must be closed once the client is gone.
         let closed = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let Ok(accepted) = timeout(Duration::from_secs(1), listener.accept()).await else {
+                return true;
+            };
+            let (mut stream, _) = accepted.unwrap();
             let mut sink = Vec::new();
-            // Ends only when the proxy closes its side.
             timeout(Duration::from_secs(5), stream.read_to_end(&mut sink))
                 .await
                 .is_ok()
@@ -1493,7 +1578,10 @@ mod tests {
         client.write_all(&[b'x'; 10]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         drop(client);
-        assert!(closed.await.unwrap(), "upstream connection must be closed");
+        assert!(
+            closed.await.unwrap(),
+            "no upstream connection may outlive the client"
+        );
     }
 
     #[tokio::test]
@@ -1756,5 +1844,161 @@ mod tests {
             (Some(Action::Allow), Some("default"))
         );
         assert_eq!(event.coverage, Coverage::Inspected);
+    }
+
+    /// A plain-HTTP upstream that counts connections and reports each request head it receives.
+    async fn counting_upstream() -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        mpsc::Receiver<String>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel(8);
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    let _ = tx.send(String::from_utf8_lossy(&head).into_owned()).await;
+                });
+            }
+        });
+        (addr, connections, rx)
+    }
+
+    fn approve_all() -> Rule {
+        Rule {
+            id: "ask-first".into(),
+            description: String::new(),
+            matches: rules::Match::default(),
+            action: Action::Approve,
+            severity: rules::Severity::Medium,
+        }
+    }
+
+    async fn held(approvals: &crate::approve::Approvals) -> u64 {
+        for _ in 0..100 {
+            if let Some((id, held, _)) = approvals.pending().into_iter().next() {
+                assert_eq!(held.rule, "ask-first");
+                return id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the request was never held");
+    }
+
+    #[tokio::test]
+    async fn approval_holds_the_request_until_allowed() {
+        use crate::approve::{Approvals, Verdict};
+        let (upstream, connections, mut seen) = counting_upstream().await;
+        let approvals = Arc::new(Approvals::new(Duration::from_secs(10), 4));
+        let _window = approvals.attach();
+        let settings = Settings {
+            rules: vec![approve_all()],
+            approvals: Some(approvals.clone()),
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let request = format!("GET http://{upstream}/held HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let id = held(&approvals).await;
+        // While held, not even a connection reaches the upstream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(approvals.answer(id, Verdict::AllowOnce));
+
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(seen.recv().await.unwrap().starts_with("GET /held"));
+        let event = next_event(&mut events).await;
+        assert_eq!(
+            (event.action, event.rule.as_deref(), event.reason),
+            (
+                Some(Action::Approve),
+                Some("ask-first"),
+                Some("approved once")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_unanswered_and_windowless_approvals_block() {
+        use crate::approve::{Approvals, Verdict};
+        let (upstream, connections, _seen) = counting_upstream().await;
+        let request = format!("GET http://{upstream}/x HTTP/1.1\r\nHost: {upstream}\r\n\r\n");
+
+        // Denied in the window.
+        let approvals = Arc::new(Approvals::new(Duration::from_secs(10), 4));
+        let window = approvals.attach();
+        let settings = Settings {
+            rules: vec![approve_all()],
+            approvals: Some(approvals.clone()),
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings.clone()).await;
+        let pending = tokio::spawn({
+            let request = request.clone();
+            async move { exchange(proxy, request.as_bytes()).await }
+        });
+        let id = held(&approvals).await;
+        assert!(approvals.answer(id, Verdict::Deny));
+        let response = pending.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("ask-first") && response.contains("approval denied"),
+            "{response}"
+        );
+        assert_eq!(
+            next_event(&mut events).await.reason,
+            Some("approval denied")
+        );
+
+        // No window attached: blocked at once.
+        drop(window);
+        let response = exchange(proxy, request.as_bytes()).await;
+        assert!(response.contains("no approval window"), "{response}");
+
+        // No approval queue at all (no tray, e.g. not on Windows): blocked too.
+        let (bare, _events) = start(Settings {
+            approvals: None,
+            ..settings
+        })
+        .await;
+        let response = exchange(bare, request.as_bytes()).await;
+        assert!(response.contains("no approval window"), "{response}");
+
+        // Nobody answers: blocked when the time is up.
+        let quick = Arc::new(Approvals::new(Duration::from_millis(200), 4));
+        let _window = quick.attach();
+        let (proxy, _events) = start(Settings {
+            rules: vec![approve_all()],
+            approvals: Some(quick),
+            ..Settings::default()
+        })
+        .await;
+        let response = exchange(proxy, request.as_bytes()).await;
+        assert!(response.contains("approval timed out"), "{response}");
+
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a blocked request never reaches the upstream"
+        );
     }
 }

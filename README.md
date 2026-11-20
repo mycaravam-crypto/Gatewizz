@@ -59,7 +59,9 @@ gatewizz at startup instead of falling back to blind tunnels.
 
 `[[rules]]` in the config decide whether a request goes upstream. Every key under `match` is optional and all must
 hold: `host`, `not_host`, `process` (e.g. `smartwizz.exe`), `path_prefix`, `finding` (`secret.*` or one kind) and `ai`.
-`block` beats `allow`; with no match, `[general] default_action` (default `allow`) applies. A blocked request gets
+The action is `allow`, `block` or `approve`; `block` beats `approve` beats `allow`, and with no match
+`[general] default_action` (default `allow`) applies. An `approve` request waits in the approval window, before any
+upstream connection is opened, and is blocked unless allowed there (see [Tray and approvals](#tray-and-approvals)). A blocked request gets
 `403` naming the rule, its severity and the event time, and nothing is sent upstream. Every event records the action
 and the deciding rule (`default` when none matched). An allowlist is one `block` rule with `not_host`:
 

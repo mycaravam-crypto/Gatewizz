@@ -12,7 +12,7 @@
 # Ports a CONNECT may target. Any other port is blocked.
 # allowed_connect_ports = [443]
 
-# What happens to a request that no rule matches: "allow" or "block".
+# What happens to a request that no rule matches: "allow", "block" or "approve".
 # default_action = "allow"
 
 [limits]
@@ -68,9 +68,18 @@
 # certificates or use mutual TLS. Exact names or "*.suffix".
 # tunnel_hosts = []
 
-# Allow/block rules. Keys under `match` are optional and must all hold; "block"
-# beats "allow"; with no match, general.default_action applies. A blocked
-# request gets 403 naming the rule, and nothing is sent upstream.
+[approval]
+# Requests matched by an "approve" rule wait in the approval window (the tray,
+# Windows only). Unanswered within this time, or with this many already
+# waiting, they are blocked. So are they with no window, or while paused.
+# timeout_secs = 60
+# max_pending = 16
+
+# Allow/block/approve rules. Keys under `match` are optional and must all hold;
+# "block" beats "approve" beats "allow"; with no match, general.default_action
+# applies. A blocked request gets 403 naming the rule, and nothing is sent
+# upstream. An "approve" request waits for the approval window ([approval]) and
+# is blocked unless it is allowed there.
 #
 # match keys: host / not_host (exact names or "*.suffix"), process (image file
 # name, e.g. "smartwizz.exe"), path_prefix, finding (a kind such as
@@ -95,3 +104,10 @@
 # match = { process = ["smartwizz.exe"], not_host = ["generativelanguage.googleapis.com"] }
 # action = "block"
 # severity = "high"
+#
+# Ask before code goes to any model that is not the internal gateway.
+# [[rules]]
+# id = "ask-before-external-models"
+# match = { ai = true, not_host = ["llm.internal.example"] }
+# action = "approve"
+# severity = "medium"
