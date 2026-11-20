@@ -502,6 +502,25 @@ mod app {
         format!("\"{}\"", value.replace('"', "\"\""))
     }
 
+    /// Rows whose host or process name contains `text` (case-insensitive) and whose decision
+    /// equals `decision` ("all" matches every decision). Both filters must match.
+    fn filter_history<'a>(
+        rows: &'a [HistoryEvent],
+        text: &str,
+        decision: &str,
+    ) -> Vec<&'a HistoryEvent> {
+        let needle = text.to_lowercase();
+        rows.iter()
+            .filter(|event| {
+                let text_match = needle.is_empty()
+                    || format!("{} {}", event.host, event.process_name())
+                        .to_lowercase()
+                        .contains(&needle);
+                text_match && (decision == "all" || event.decision() == decision)
+            })
+            .collect()
+    }
+
     /// Exports only the same metadata fields already persisted in the event log.
     fn history_csv(events: &[&HistoryEvent]) -> String {
         let mut csv = String::from(
@@ -678,14 +697,8 @@ mod app {
                                 ui.selectable_value(&mut self.history_decision, "block".into(), "Blocked");
                                 ui.selectable_value(&mut self.history_decision, "approve".into(), "Approval");
                             });
-                        let filtered: Vec<&HistoryEvent> = rows.iter().filter(|event| {
-                            let hay = format!("{} {}", event.host, event.process_name()).to_lowercase();
-                            let text_match = self.history_filter.is_empty()
-                                || hay.contains(&self.history_filter.to_lowercase());
-                            let decision_match = self.history_decision == "all"
-                                || event.decision() == self.history_decision;
-                            text_match && decision_match
-                        }).collect();
+                        let filtered =
+                            filter_history(rows, &self.history_filter, &self.history_decision);
                         if ui.button("Copy CSV").on_hover_text("Copy filtered metadata to the clipboard").clicked() {
                             copy_to_clipboard(&history_csv(&filtered));
                         }
@@ -978,6 +991,74 @@ mod app {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].host, "example.com");
             assert_eq!(rows[0].process_name(), "curl.exe");
+        }
+
+        fn history_rows() -> Vec<HistoryEvent> {
+            [
+                r#"{"host":"api.openai.com","action":"allow","process":{"known":{"image":"C:\\Tools\\Code.exe"}}}"#,
+                r#"{"host":"api.anthropic.com","action":"block","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#,
+                r#"{"host":"internal.example.com","action":"approve","process":{"unknown":"access denied"}}"#,
+                r#"{"host":"example.org"}"#,
+            ]
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("parse test event"))
+            .collect()
+        }
+
+        fn hosts(rows: &[&HistoryEvent]) -> Vec<String> {
+            rows.iter().map(|event| event.host.clone()).collect()
+        }
+
+        #[test]
+        fn empty_filters_keep_every_row() {
+            let rows = history_rows();
+            assert_eq!(filter_history(&rows, "", "all").len(), rows.len());
+        }
+
+        #[test]
+        fn text_filter_matches_host_or_process_case_insensitively() {
+            let rows = history_rows();
+            assert_eq!(
+                hosts(&filter_history(&rows, "ANTHROPIC", "all")),
+                ["api.anthropic.com"]
+            );
+            assert_eq!(
+                hosts(&filter_history(&rows, "code.EXE", "all")),
+                ["api.openai.com"]
+            );
+            assert_eq!(
+                hosts(&filter_history(&rows, "access denied", "all")),
+                ["internal.example.com"]
+            );
+            assert_eq!(filter_history(&rows, "api.", "all").len(), 2);
+        }
+
+        #[test]
+        fn decision_filter_matches_each_action() {
+            let rows = history_rows();
+            assert_eq!(
+                hosts(&filter_history(&rows, "", "allow")),
+                ["api.openai.com"]
+            );
+            assert_eq!(
+                hosts(&filter_history(&rows, "", "block")),
+                ["api.anthropic.com"]
+            );
+            assert_eq!(
+                hosts(&filter_history(&rows, "", "approve")),
+                ["internal.example.com"]
+            );
+        }
+
+        #[test]
+        fn both_filters_must_match() {
+            let rows = history_rows();
+            assert_eq!(
+                hosts(&filter_history(&rows, "api.", "block")),
+                ["api.anthropic.com"]
+            );
+            assert!(filter_history(&rows, "openai", "block").is_empty());
+            assert!(filter_history(&rows, "no-such-host", "all").is_empty());
         }
 
         #[test]
