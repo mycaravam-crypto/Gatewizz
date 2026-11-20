@@ -78,10 +78,11 @@ pub fn installed(keys: Keys) -> Result<Option<usize>, String> {
     sys::installed(keys)
 }
 
-/// The runtime ids of the installed filters. A drop event names the filter that dropped the connection by this id,
-/// which tells Gatewizz's drops from everyone else's. Ids change on every apply.
+/// The runtime ids of the installed filters, each with whether it asks (an `ask` rule or default). A drop event
+/// names the filter that dropped the connection by this id, which tells Gatewizz's drops from everyone else's, and
+/// the asking ones from silent blocks. Ids change on every apply.
 #[cfg(windows)]
-pub fn filter_ids(keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+pub fn filter_ids(keys: Keys) -> Result<std::collections::HashMap<u64, bool>, String> {
     sys::filter_ids(keys)
 }
 
@@ -128,7 +129,7 @@ pub fn installed(_keys: Keys) -> Result<Option<usize>, String> {
 }
 
 #[cfg(not(windows))]
-pub fn filter_ids(_keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+pub fn filter_ids(_keys: Keys) -> Result<std::collections::HashMap<u64, bool>, String> {
     Err(UNSUPPORTED.into())
 }
 
@@ -195,6 +196,9 @@ mod sys {
 
     /// Above the default sublayer, so Gatewizz's decisions are evaluated early; a hard block wins anyway.
     const SUBLAYER_WEIGHT: u16 = 0x8000;
+
+    /// The description of the filters that ask: their drops become prompts in the tray app.
+    const ASK_DESCRIPTION: &str = "Gatewizz: blocked, and asks through the tray app";
 
     /// windows-sys GUIDs have no `PartialEq`.
     fn same(a: &GUID, b: &GUID) -> bool {
@@ -291,12 +295,12 @@ mod sys {
             Ok(self
                 .filters(keys)?
                 .into_iter()
-                .map(|(key, _)| key)
+                .map(|(key, _, _)| key)
                 .collect())
         }
 
-        /// (key, runtime id) of every filter of this provider in this sublayer, on both connect layers.
-        fn filters(&self, keys: Keys) -> Result<Vec<(GUID, u64)>, String> {
+        /// (key, runtime id, asks) of every filter of this provider in this sublayer, on both connect layers.
+        fn filters(&self, keys: Keys) -> Result<Vec<(GUID, u64, bool)>, String> {
             let mut out = Vec::new();
             let mut provider = GUID::from_u128(keys.provider);
             let sublayer = GUID::from_u128(keys.sublayer);
@@ -324,7 +328,9 @@ mod sys {
                         for i in 0..n as usize {
                             let filter = unsafe { &**entries.add(i) };
                             if same(&filter.subLayerKey, &sublayer) {
-                                out.push((filter.filterKey, filter.filterId));
+                                let asks = unsafe { text(filter.displayData.description) }
+                                    == ASK_DESCRIPTION;
+                                out.push((filter.filterKey, filter.filterId, asks));
                             }
                         }
                         if !entries.is_null() {
@@ -444,16 +450,26 @@ mod sys {
                 );
             }
             let name = wide(&format!("Gatewizz: {}", f.rule));
+            // The description marks the filters whose drops become prompts; `filters` reads it back.
+            let mut description = if f.action == RuleAction::Ask {
+                wide(ASK_DESCRIPTION)
+            } else {
+                Vec::new()
+            };
             let mut provider = GUID::from_u128(keys.provider);
             let mut weight = f.weight;
-            let block = f.action == RuleAction::Block;
+            let block = f.action.blocks();
             use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
                 FWP_VALUE0, FWP_VALUE0_0, FWPM_ACTION0, FWPM_DISPLAY_DATA0,
             };
             let filter = FWPM_FILTER0 {
                 displayData: FWPM_DISPLAY_DATA0 {
                     name: name.as_ptr().cast_mut(),
-                    description: null_mut(),
+                    description: if description.is_empty() {
+                        null_mut()
+                    } else {
+                        description.as_mut_ptr()
+                    },
                 },
                 flags: FWPM_FILTER_FLAG_PERSISTENT
                     | if block {
@@ -572,13 +588,25 @@ mod sys {
         })
     }
 
-    pub fn filter_ids(keys: Keys) -> Result<std::collections::HashSet<u64>, String> {
+    pub fn filter_ids(keys: Keys) -> Result<std::collections::HashMap<u64, bool>, String> {
         let engine = Engine::open()?;
         Ok(engine
             .filters(keys)?
             .into_iter()
-            .map(|(_, id)| id)
+            .map(|(_, id, asks)| (id, asks))
             .collect())
+    }
+
+    /// A filter description: a null-terminated UTF-16 string, or none.
+    unsafe fn text(p: *mut u16) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        let mut len = 0;
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
     }
 
     /// Keeps the engine session and the callback's sender alive for as long as the subscription runs.
@@ -811,7 +839,7 @@ mod tests {
 
         let _cleanup = Cleanup;
         let rules: Vec<Rule> = toml::from_str::<std::collections::HashMap<String, Vec<Rule>>>(&format!(
-            "connection_rules = [{{ id = \"test-block\", process = [{:?}], ip = [\"{ip}\"], port = [80], protocol = \"tcp\", action = \"block\" }}]",
+            "connection_rules = [{{ id = \"test-ask\", process = [{:?}], ip = [\"{ip}\"], port = [80], protocol = \"tcp\", action = \"ask\" }}]",
             powershell()
         ))
         .unwrap()
@@ -831,7 +859,7 @@ mod tests {
         );
         let applied = apply(TEST_KEYS, &filters).unwrap();
         assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
-        // The self allow goes to both layers; the block only to IPv4.
+        // The self allow goes to both layers; the ask rule's block only to IPv4.
         assert_eq!(applied.filters, 3);
         assert_eq!(installed(TEST_KEYS).unwrap(), Some(3));
         // Watch for the drop the blocked connect causes.
@@ -840,7 +868,7 @@ mod tests {
         assert_eq!(
             child_connects(ip),
             3,
-            "the block filter must stop the child"
+            "the ask rule's filter must block the child"
         );
         // The drop event names the child's program, the address and port, and one of the test's own filters.
         let ours = filter_ids(TEST_KEYS).unwrap();
@@ -849,7 +877,7 @@ mod tests {
         let found = loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(left) {
-                Ok(d) if d.remote == ip && d.port == 80 && ours.contains(&d.filter_id) => {
+                Ok(d) if d.remote == ip && d.port == 80 && ours.contains_key(&d.filter_id) => {
                     break Some(d);
                 }
                 Ok(other) => seen.push(other),
@@ -862,6 +890,10 @@ mod tests {
         });
         assert_eq!(found.program(), "powershell.exe", "{found:?}");
         assert_eq!(found.protocol, 6);
+        assert!(
+            ours[&found.filter_id],
+            "the ask rule's filter must read back as asking"
+        );
 
         // Applying again replaces, never duplicates.
         assert_eq!(apply(TEST_KEYS, &filters).unwrap().filters, 3);

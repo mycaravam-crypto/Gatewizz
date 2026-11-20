@@ -222,7 +222,8 @@ gatewizz firewall remove                           # remove the service, every f
 
 - **Rules:** see the commented `[firewall]` and `[[connection_rules]]` example in [gatewizz.example.toml](../config/gatewizz.example.toml).
   - The most specific matching rule wins: first by how many of program, address, port and protocol it pins down, then by how narrow its address is (exact host, then `*.suffix`, then IP prefix width).
-  - Between equally specific rules, `block` beats `allow`; after that, the first rule in the file wins.
+  - A rule's `action` is `allow`, `block` or `ask`. `ask` blocks like `block`, and its blocked connections are also offered to the prompt (below).
+  - Between equally specific rules, `block` and `ask` beat `allow`; after that, the first rule in the file wins.
   - So an `allow` for one program to `127.0.0.1:8899` overrides a `block` for that program alone. This is the proxy-enforcement pair: the wizz tools can then reach the network only through Gatewizz.
 - **Enforcement:**
   - Filters sit at WFP's connect layers (IPv4 and IPv6) in Gatewizz's own provider and sublayer. They decide connection attempts and never read traffic.
@@ -234,14 +235,14 @@ gatewizz firewall remove                           # remove the service, every f
 - **`default`:**
   - `allow` (the default) filters only what rules name.
   - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
-  - `ask` blocks for now. It will prompt for unknown connections once the background service and approval prompt exist (#59).
+  - `ask` blocks like `block`, and offers each blocked connection to the prompt.
 
-- **The prompt pipe:** the service serves `\\.\pipe\gatewizz-fw`, which only SYSTEM, administrators and interactively logged-on users can open. Remote clients are rejected, and one client is served at a time. While a client is connected, each new blocked connection is sent to it as a notice: program, path, address, port and protocol. The client answers with a decision.
+- **The prompt pipe:** the service serves `\\.\pipe\gatewizz-fw`, which only SYSTEM, administrators and interactively logged-on users can open. Remote clients are rejected, and one client is served at a time. While a client is connected, each new connection blocked by an `ask` rule or the `ask` default is sent to it as a notice: program, path, address, port and protocol. Connections blocked by `block` rules, including "Deny always" answers, are only logged. The client answers with a decision.
   - **What the service accepts:** only answers to notices it sent itself, within the last 10 minutes. The program, address and port always come from that notice. An answer may only widen to "any host" or "any port", choose allow or block, and pick "once" (2 minutes), 5, 15, 60 or 480 minutes, or "always".
   - **Where the rules go:** "always" rules are appended to the protected configuration as `[[connection_rules]]` (your text and comments stay) and validated first. Timed rules stay in the service's memory until they expire.
   - **The service only asks:** with no client connected, nothing is asked and the connection stays blocked.
 
-Not yet: the prompt itself in the tray app, which is the client of this pipe. That is the next step of #59. Until then, `default = "ask"` blocks.
+Not yet: the prompt itself in the tray app, which is the client of this pipe. That is the next step of #59. Until then, `ask` blocks without asking.
 
 ## Events and privacy
 

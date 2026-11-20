@@ -4,16 +4,16 @@
 //! blocks it. [`decide`] picks the rule for one connection; [`plan`] turns the rules into the IP-level filters the
 //! Windows Filtering Platform enforces; [`Coalescer`] keeps a burst of blocked attempts to one prompt.
 //!
-//! Precedence: the most specific matching rule wins; between equally specific rules `block` beats `allow`; between
-//! equal blocks or allows the first one in the list wins. "Most specific" compares, in order, how many of program,
+//! Precedence: the most specific matching rule wins; between equally specific rules `block` and `ask` beat `allow`;
+//! otherwise the first one in the list wins. "Most specific" compares, in order, how many of program,
 //! address, port and protocol a rule pins down, then how narrow its address is. So "smartwizz.exe may reach
 //! 127.0.0.1:8899" (program, address, port) beats "smartwizz.exe is blocked" (program only): that pair is the
 //! proxy-enforcement preset.
 //!
 //! Gatewizz itself is always allowed ([`SELF_RULE`]); no rule can block the update and configuration path.
 //!
-//! `gatewizz firewall apply` uses [`plan`] to install the filters (see `wfp.rs`). [`decide`] and [`Coalescer`] serve
-//! the approval prompt for blocked connections, which comes with the service in the next #59 step.
+//! `gatewizz firewall apply` uses [`plan`] to install the filters (see `wfp.rs`). Connections blocked by an `ask`
+//! rule or an `ask` default become prompts in the tray app (see `prompt.rs`); [`Coalescer`] folds repeats.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -42,6 +42,16 @@ pub enum DefaultAction {
 pub enum RuleAction {
     Allow,
     Block,
+    /// Block, and ask the user (through the tray app's prompt) whether to add a rule. Without the tray app this is
+    /// `block`.
+    Ask,
+}
+
+impl RuleAction {
+    /// Whether WFP blocks the connection: `ask` blocks until a rule from the prompt allows it.
+    pub fn blocks(self) -> bool {
+        self != RuleAction::Allow
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -335,7 +345,7 @@ pub fn decide(
         .max_by(|(i, a), (j, b)| {
             a.specificity()
                 .cmp(&b.specificity())
-                .then((a.action == RuleAction::Block).cmp(&(b.action == RuleAction::Block)))
+                .then(a.action.blocks().cmp(&b.action.blocks()))
                 // Earlier rules win ties: compare indexes reversed.
                 .then(j.cmp(i))
         });
@@ -344,6 +354,8 @@ pub fn decide(
             verdict: match rule.action {
                 RuleAction::Allow => Verdict::Allow,
                 RuleAction::Block => Verdict::Block,
+                RuleAction::Ask if attached => Verdict::Ask,
+                RuleAction::Ask => Verdict::Block,
             },
             rule: rule.id.clone(),
         },
@@ -409,11 +421,11 @@ pub fn plan(
     let count = rules.len() as u64;
     for (i, rule) in rules.iter().enumerate().filter(|(_, r)| r.active(now)) {
         let (dims, narrow) = rule.specificity();
-        // Specificity first, then block over allow, then list order; the self rule and the default stay outside.
+        // Specificity first, then block or ask over allow, then list order; the self rule and the default stay outside.
         let weight = 1
             + (u64::from(dims) << 48)
             + (u64::from(narrow) << 32)
-            + (u64::from(rule.action == RuleAction::Block) << 31)
+            + (u64::from(rule.action.blocks()) << 31)
             + (count - i as u64);
         let mut remotes: Vec<Option<Net>> = rule.ip.iter().copied().map(Some).collect();
         for host in &rule.host {
@@ -468,7 +480,11 @@ pub fn plan(
             remote: None,
             port: None,
             protocol: Protocol::Any,
-            action: RuleAction::Block,
+            action: if default == DefaultAction::Ask {
+                RuleAction::Ask
+            } else {
+                RuleAction::Block
+            },
             weight: 0,
         });
     }
@@ -680,7 +696,11 @@ mod tests {
         assert!(
             parse("[[connection_rules]]\nid = \"a\"\nhots = []\naction = \"allow\"\n").is_err()
         );
-        assert!(parse("[[connection_rules]]\nid = \"a\"\naction = \"ask\"\n").is_err());
+        assert_eq!(
+            parse("[[connection_rules]]\nid = \"a\"\naction = \"ask\"\n").unwrap()[0].action,
+            RuleAction::Ask
+        );
+        assert!(parse("[[connection_rules]]\nid = \"a\"\naction = \"maybe\"\n").is_err());
         assert!(
             parse("[[connection_rules]]\nid = \"a\"\nip = [\"1.2.3\"]\naction = \"allow\"\n")
                 .is_err()
@@ -939,6 +959,50 @@ mod tests {
     }
 
     #[test]
+    fn ask_rules_block_and_ask_and_beat_allows() {
+        let r = rules(
+            r#"
+            [[connection_rules]]
+            id = "allow-curl"
+            process = ["curl.exe"]
+            action = "allow"
+
+            [[connection_rules]]
+            id = "ask-curl"
+            process = ["curl.exe"]
+            action = "ask"
+            "#,
+        );
+        let c = conn("curl.exe", None, "8.8.8.8", 443);
+        let now = SystemTime::now();
+        let d = decide(&c, &r, DefaultAction::Allow, OWN, true, now);
+        assert_eq!((d.verdict, d.rule.as_str()), (Verdict::Ask, "ask-curl"));
+        // Without the tray app, asking is impossible, so it blocks.
+        assert_eq!(
+            decide(&c, &r, DefaultAction::Allow, OWN, false, now).verdict,
+            Verdict::Block
+        );
+        let p = plan(
+            &r,
+            DefaultAction::Block,
+            &[],
+            now,
+            |_| Vec::new(),
+            |_| vec![r"C:\tools\curl.exe".to_string()],
+        );
+        let weight = |id: &str| p.iter().find(|f| f.rule == id).unwrap().weight;
+        assert!(weight("ask-curl") > weight("allow-curl"));
+        let last = p.last().unwrap();
+        assert_eq!(
+            (last.rule.as_str(), last.action),
+            ("default", RuleAction::Block)
+        );
+        assert!(
+            RuleAction::Ask.blocks() && RuleAction::Block.blocks() && !RuleAction::Allow.blocks()
+        );
+    }
+
+    #[test]
     fn gatewizz_itself_is_always_allowed() {
         let r = rules("[[connection_rules]]\nid = \"all\"\naction = \"block\"\n");
         let d = decide_now(
@@ -1045,7 +1109,7 @@ mod tests {
         let last = p.last().unwrap();
         assert_eq!(
             (last.rule.as_str(), last.action, last.weight),
-            ("default", RuleAction::Block, 0)
+            ("default", RuleAction::Ask, 0)
         );
         // 3 program paths × 1 address × 1 port, 2 resolved IPs × 2 ports, 2 smartwizz paths.
         let count = |id: &str| p.iter().filter(|f| f.rule == id).count();

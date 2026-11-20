@@ -97,14 +97,17 @@
 # `gatewizz firewall remove` takes the service and every filter away again.
 #
 # What happens to a connection no rule matches: "allow", "block" or "ask".
-# Until the approval prompt exists, "ask" blocks. "block" blocks every program
+# "ask" blocks too, and asks whether to add a rule while the tray app runs
+# (without it, nothing is asked). "block" blocks every program
 # without a matching allow rule, Windows services included, so start with
 # "allow" and add block rules.
 # default = "allow"
 
 # Connection rules. Keys other than id and action are optional; an omitted key
-# matches anything. The most specific matching rule wins; between equally
-# specific rules, "block" beats "allow". Gatewizz itself is always allowed.
+# matches anything. action: "allow", "block", or "ask" (block, and ask whether
+# to add a rule, as the default "ask" does). The most specific matching rule
+# wins; between equally specific rules, "block" and "ask" beat "allow".
+# Gatewizz itself is always allowed.
 #
 # process: file names ("smartwizz.exe") or full paths. A file name covers the
 #   copies on PATH or running when `firewall apply` runs.

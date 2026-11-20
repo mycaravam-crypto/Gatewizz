@@ -66,8 +66,14 @@ port = [9]
 action = "block"
 
 [[connection_rules]]
-id = "smoke-block-two"
+id = "smoke-ask-two"
 ip = ["192.0.2.2"]
+port = [9]
+action = "ask"
+
+[[connection_rules]]
+id = "smoke-block-three"
+ip = ["192.0.2.3"]
 port = [9]
 action = "block"
 '@
@@ -111,8 +117,8 @@ try {
 
     $r = Invoke-Gatewizz @('firewall', 'apply', '--config', $two)
     Check 'firewall apply with the service installed succeeds' ($r.Code -eq 0 -and $r.Text -match 'service') $r.Text
-    Check 'protected config was updated' ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-block-two')
-    Check 'apply added the second rule' ((Filter-Count) -eq $count + 1) "filters: $(Filter-Count)"
+    Check 'protected config was updated' ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-ask-two')
+    Check 'apply added the two new rules' ((Filter-Count) -eq $count + 2) "filters: $(Filter-Count)"
 
     # The reload request makes the service refresh on its own; its log gets another "Applied" line.
     $reloaded = Wait-Until { (Applied-Count) -gt $appliedAtStart }
@@ -121,16 +127,16 @@ try {
     # Without --config, apply re-applies the installed rules; it must never replace them with an empty set.
     $r = Invoke-Gatewizz @('firewall', 'apply')
     Check 'apply without --config keeps the installed rules' (
-        $r.Code -eq 0 -and (Filter-Count) -eq $count + 1 -and
-        (Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-block-two') "$($r.Text) filters: $(Filter-Count)"
+        $r.Code -eq 0 -and (Filter-Count) -eq $count + 2 -and
+        (Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-ask-two') "$($r.Text) filters: $(Filter-Count)"
 
     # Restarting keeps the rules, read from the protected copy. Restart-Service returns once the service reports
     # running, and it applies before that.
     Restart-Service gatewizz-fw
-    Check 'filters survive a service restart' ((Filter-Count) -eq $count + 1) "filters: $(Filter-Count)"
+    Check 'filters survive a service restart' ((Filter-Count) -eq $count + 2) "filters: $(Filter-Count)"
 
-    # The prompt loop over the pipe, as the tray app will run it: a blocked connection becomes a notice, and an
-    # "allow once" answer becomes a temporary rule, i.e. one more filter.
+    # The prompt loop over the pipe, as the tray app will run it: a connection blocked by an ask rule becomes a
+    # notice, and an "allow once" answer becomes a temporary rule, i.e. one more filter. A block rule stays silent.
     Check 'service serves the prompt pipe' ([bool](Get-ChildItem '\\.\pipe\' | Where-Object Name -eq 'gatewizz-fw'))
     # Asynchronous: synchronous I/O on one pipe handle is serialized, so a pending read would block a write.
     $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'gatewizz-fw', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
@@ -140,12 +146,17 @@ try {
     $writer.AutoFlush = $true
     $before = Filter-Count
     $pending = $reader.ReadLineAsync()
-    # 192.0.2.2:9 is blocked by smoke-block-two and has not been tried yet, so this attempt is a new notice.
+    # 192.0.2.3:9 is blocked by smoke-block-three: logged, never offered. Drops are handled in order, so had it
+    # been offered, its notice would arrive before the one below.
+    & curl.exe -s -o NUL --max-time 5 http://192.0.2.3:9/ 2>$null
+    # 192.0.2.2:9 is blocked by smoke-ask-two and has not been tried yet, so this attempt is a new notice.
     & curl.exe -s -o NUL --max-time 5 http://192.0.2.2:9/ 2>$null
     $notice = if ($pending.Wait(20000)) { $pending.Result | ConvertFrom-Json } else { $null }
     Check 'a blocked connection reaches the pipe as a notice' (
         $notice -and $notice.type -eq 'notice' -and $notice.program -eq 'curl.exe' -and $notice.port -eq 9 -and
         $notice.remote -eq '192.0.2.2') "$($notice | ConvertTo-Json -Compress)"
+    Check 'a block rule is logged, not offered' (
+        (Get-Content -Raw (Join-Path $home_ 'service.log')) -match 'blocked: curl\.exe -> 192\.0\.2\.3:9 tcp') "$(Get-Content -Raw (Join-Path $home_ 'service.log'))"
     if ($notice) {
         $writer.WriteLine((@{ type = 'decision'; id = $notice.id; action = 'allow'; lasting = 'once' } | ConvertTo-Json -Compress))
         $pending = $reader.ReadLineAsync()

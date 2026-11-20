@@ -98,7 +98,7 @@ fn summary(
             firewall::DefaultAction::Allow => "allowed",
             firewall::DefaultAction::Block => "blocked",
             firewall::DefaultAction::Ask =>
-                "blocked (\"ask\" blocks until the approval prompt exists)",
+                "blocked, and the tray app asks about them while it runs",
         }
     );
     for program in unresolved_programs {
@@ -443,8 +443,9 @@ impl DropWatch {
 /// Watches WFP drop events and logs one "blocked" notice per program, host and port and [`NOTICE_WINDOW`]. Only
 /// drops by Gatewizz's own filters count; their ids change on every apply, so an unknown id re-reads them (at most
 /// once a second).
-/// With `prompt`, each new notice also goes to the connected tray app, when the program's DOS path is known
-/// (the rule it may become needs it).
+/// With `prompt`, a new notice from an asking filter (an `ask` rule or default) also goes to the connected tray
+/// app, when the program's DOS path is known (the rule it may become needs it). Drops by `block` rules, the
+/// user's own and "Deny always" from the prompt, stay silent.
 #[cfg(windows)]
 fn watch_drops(prompt: Option<std::sync::Arc<PromptState>>) -> Result<DropWatch, String> {
     let (tx, rx) = std::sync::mpsc::channel::<wfp::Dropped>();
@@ -456,14 +457,15 @@ fn watch_drops(prompt: Option<std::sync::Arc<PromptState>>) -> Result<DropWatch,
             let mut ids = wfp::filter_ids(wfp::KEYS).unwrap_or_default();
             let mut ids_read = std::time::Instant::now();
             for dropped in rx {
-                if !ids.contains(&dropped.filter_id) && ids_read.elapsed() >= Duration::from_secs(1)
+                if !ids.contains_key(&dropped.filter_id)
+                    && ids_read.elapsed() >= Duration::from_secs(1)
                 {
                     ids = wfp::filter_ids(wfp::KEYS).unwrap_or_default();
                     ids_read = std::time::Instant::now();
                 }
-                if !ids.contains(&dropped.filter_id) {
+                let Some(&asks) = ids.get(&dropped.filter_id) else {
                     continue;
-                }
+                };
                 let host = dropped.remote.to_string();
                 if notices.push(
                     dropped.program(),
@@ -472,7 +474,7 @@ fn watch_drops(prompt: Option<std::sync::Arc<PromptState>>) -> Result<DropWatch,
                     std::time::Instant::now(),
                 ) {
                     log(&blocked_line(&dropped));
-                    if let Some(prompt) = &prompt {
+                    if let Some(prompt) = prompt.as_ref().filter(|_| asks) {
                         prompt.offer(&dropped);
                     }
                 }
@@ -1045,7 +1047,7 @@ mod tests {
             "Applied 5 Windows filter(s) for 2 connection rule(s); connections no rule matches are allowed."
         );
         assert!(summary(&clean, 2, Block, &[], &[]).ends_with("are blocked."));
-        assert!(summary(&clean, 2, Ask, &[], &[]).contains("\"ask\" blocks"));
+        assert!(summary(&clean, 2, Ask, &[], &[]).contains("the tray app asks"));
 
         let partial = wfp::Applied {
             filters: 1,
