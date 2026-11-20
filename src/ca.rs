@@ -26,7 +26,6 @@ const LEAF_CACHE: usize = 256;
 
 /// A leaf certificate and its private key, both DER (the key as PKCS#8).
 #[derive(Debug)]
-#[allow(dead_code)] // `key` is read by TLS interception (#19)
 pub struct Leaf {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
@@ -87,7 +86,6 @@ impl Ca {
     }
 
     /// A leaf for `host` (a DNS name or an IP address), from the cache while it is not close to expiry.
-    #[allow(dead_code)] // used by TLS interception (#19)
     pub fn leaf(&self, host: &str) -> Result<Arc<Leaf>, String> {
         let now = OffsetDateTime::now_utc();
         let mut leaves = self.leaves.lock().expect("leaf cache poisoned");

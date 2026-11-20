@@ -38,6 +38,23 @@ users are not affected. Re-running it reuses the existing CA.
   constraints allow leaf certificates only (path length 0).
 - `gatewizz ca remove` removes every gatewizz CA from the store (Windows asks again) and deletes both files.
 
+### Decrypting HTTPS
+
+With the CA installed, turn on interception in the config and start gatewizz with it:
+
+```toml
+[tls]
+intercept = true
+tunnel_hosts = []   # pinned or mutual-TLS hosts that must keep a blind tunnel, e.g. ["*.pinned.example"]
+```
+
+Each request inside a CONNECT tunnel is then decrypted, forwarded over a separate TLS connection to the same host, and
+logged on its own (method, path without query). The upstream certificate is checked against the Windows store, with no
+way to skip that check: a bad one gets `502` before the client sends anything. A `Host` header naming any other site
+gets `421`, so a tunnel to an allowed host cannot reach a different site behind the same server. A client that rejects
+the gatewizz certificate is logged, never silently passed through. Without `ca install`, `intercept = true` stops
+gatewizz at startup instead of falling back to blind tunnels.
+
 ## Use with the wizz tools
 
 Start gatewizz in one terminal, then run the tool in another with the proxy set for that shell only:
@@ -55,8 +72,8 @@ request then shows up in `events.jsonl` with the tool's process, the model host 
 - **Local models bypass gatewizz.** .NET never proxies `localhost`, so an Ollama on the same machine is not seen. That is
   intended: the traffic never leaves the machine. A model on another host is seen.
 - **`NO_PROXY` wins.** A host listed there (smartwizz suggests it for internal model hosts) goes direct and is not seen.
-- **In M1, HTTPS is tunneled.** gatewizz sees which process talks to which host and how much, not the content.
-  Decryption and rules come in M2.
+- **Without `[tls] intercept`, HTTPS is tunneled.** gatewizz sees which process talks to which host and how much, not
+  the content. See [Decrypting HTTPS](#decrypting-https).
 
 ## Build
 

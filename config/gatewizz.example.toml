@@ -55,3 +55,12 @@
 
 # Rotated files kept next to the live one (events.jsonl.1, .2, ...).
 # keep_files = 5
+
+[tls]
+# Decrypt CONNECT tunnels so their requests can be checked. Needs the local CA:
+# run `gatewizz ca install` first. Off, every HTTPS connection is a blind tunnel.
+# intercept = false
+
+# Hosts that keep a blind tunnel even when intercepting: clients that pin
+# certificates or use mutual TLS. Exact names or "*.suffix".
+# tunnel_hosts = []
