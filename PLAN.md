@@ -31,9 +31,11 @@ web UI or API, AI analysis, Linux.
   blocks when no window can ask. Gatewizz's own program is always allowed, and that rule can't be edited.
 - **Still out:** our own kernel driver and packet interception. Holding a connection while the user decides is
   Phase 3 (#60), decided separately.
-- **Order:** the pure rule core lands first (`firewall.rs`, every OS). Then come the service, WFP and the pipe
-  (Windows CI runs elevated), then the prompt and config write-back. The `[firewall]` and `[[connection_rules]]`
-  keys arrive with the service, so no accepted key ever does nothing.
+- **Order:** the pure rule core lands first (`firewall.rs`, every OS). Next is `firewall apply/remove/status`,
+  which installs the rules as WFP filters from an elevated prompt (`wfp.rs`; Windows CI runs elevated). The
+  `[firewall]` and `[[connection_rules]]` keys arrive in that step, because it is the first one that uses them.
+  Then come the service and the pipe, which keep program paths and host IPs current, and last the prompt and
+  config write-back.
 
 ## 2. YAGNI and engineering rules
 
@@ -71,6 +73,7 @@ src/
 ├── ca.rs        # local CA: generation, leaf issuance and cache, DPAPI key file, CurrentUser Root store (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
 ├── connections.rs # connection monitor: TCP table sampling, snapshot diff, rate limit, live list (#57)
+├── wfp.rs       # WFP provider, sublayer and filters for `firewall apply/remove/status` (Windows, elevated; #59)
 ├── dns.rs       # IP → hostname cache for the monitor, filled from the Windows DNS Client cache (#57)
 ├── firewall.rs  # connection rules: matching, precedence, expiry, WFP filter plan, notice coalescing (pure; #59)
 ├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
@@ -95,7 +98,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
 | **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
 | **F1: See every connection** (#56 Phase 1) | Read-only connection monitor: TCP tables per process, DNS-cache hostnames, `connection` events, Network tab | Every outgoing TCP connection is visible with its process and, where the DNS cache knows it, its hostname, without admin rights | implemented (#57); Windows CI test for the sampler; manual acceptance and overhead measurement pending |
-| **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); service, WFP, pipe and prompt next (#59) |
+| **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); `firewall apply/remove/status` installs persistent WFP filters (`wfp.rs`, elevated Windows CI test); service, pipe and prompt next (#59) |
 
 ## 6. Quality gates
 

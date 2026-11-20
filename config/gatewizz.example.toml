@@ -89,6 +89,41 @@
 # Remote IP -> hostname entries kept (16-1000000).
 # dns_cache_size = 4096
 
+[firewall]
+# Connection firewall (Windows, #59). Nothing here takes effect until
+# `gatewizz firewall apply --config <this file>` runs from an elevated prompt;
+# `gatewizz firewall remove` takes every Gatewizz filter away again.
+#
+# What happens to a connection no rule matches: "allow", "block" or "ask".
+# Until the approval prompt exists, "ask" blocks. "block" blocks every program
+# without a matching allow rule, Windows services included, so start with
+# "allow" and add block rules.
+# default = "allow"
+
+# Connection rules. Keys other than id and action are optional; an omitted key
+# matches anything. The most specific matching rule wins; between equally
+# specific rules, "block" beats "allow". Gatewizz itself is always allowed.
+#
+# process: file names ("smartwizz.exe") or full paths. A file name covers the
+#   copies on PATH or running when `firewall apply` runs.
+# host: exact names or "*.suffix", enforced through the IPs they resolve to
+#   at apply time (wildcards have none; use ip for addresses that must match).
+# ip: addresses or prefixes ("10.0.0.0/8", "2001:db8::/32").
+# port: remote ports. protocol: "any" (default), "tcp" or "udp".
+#
+# Proxy enforcement: smartwizz may only talk to the Gatewizz proxy.
+# [[connection_rules]]
+# id = "smartwizz-only-through-gatewizz"
+# process = ["smartwizz.exe"]
+# ip = ["127.0.0.1"]
+# port = [8899]
+# action = "allow"
+#
+# [[connection_rules]]
+# id = "smartwizz-nowhere-else"
+# process = ["smartwizz.exe"]
+# action = "block"
+
 # Allow/block/approve rules. Keys under `match` are optional and must all hold;
 # "block" beats "approve" beats "allow"; with no match, general.default_action
 # applies. A blocked request gets 403 naming the rule, and nothing is sent

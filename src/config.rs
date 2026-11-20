@@ -20,9 +20,22 @@ pub struct Config {
     pub tls: Tls,
     pub approval: Approval,
     pub monitor: Monitor,
+    pub firewall: Firewall,
     /// Allow/block rules (#21); see `config/gatewizz.example.toml`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
+    /// Connection rules for `gatewizz firewall apply` (#59).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connection_rules: Vec<crate::firewall::Rule>,
+}
+
+/// The connection firewall (#59). Nothing here takes effect until `gatewizz firewall apply` runs elevated.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Firewall {
+    /// What happens to a connection no rule matches: `allow`, `block`, or `ask`. Until the prompt exists, `ask`
+    /// blocks (fail closed).
+    pub default: crate::firewall::DefaultAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -207,6 +220,7 @@ impl Config {
             return Err("general.allowed_connect_ports: port 0 is not a valid target".into());
         }
         rules::validate(&self.rules)?;
+        crate::firewall::validate(&self.connection_rules)?;
         let l = &self.limits;
         for (key, value) in [
             ("max_connections", l.max_connections as u64),
@@ -447,6 +461,32 @@ mod tests {
     }
 
     #[test]
+    fn firewall_section_and_connection_rules_parse() {
+        let c = Config::parse(
+            "[firewall]\ndefault = \"block\"\n[[connection_rules]]\nid = \"proxy\"\nprocess = [\"smartwizz.exe\"]\nip = [\"127.0.0.1\"]\nport = [8899]\naction = \"allow\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.firewall.default, crate::firewall::DefaultAction::Block);
+        assert_eq!(c.connection_rules[0].port, [8899]);
+        assert_eq!(Config::parse(&c.effective()).unwrap(), c);
+        assert_eq!(
+            Config::parse("").unwrap().firewall.default,
+            crate::firewall::DefaultAction::Allow
+        );
+        let dup = "[[connection_rules]]\nid = \"a\"\naction = \"block\"\n[[connection_rules]]\nid = \"a\"\naction = \"block\"\n";
+        assert!(
+            Config::parse(dup)
+                .unwrap_err()
+                .contains("connection_rules[1].id")
+        );
+        assert!(
+            Config::parse("[firewall]\nenabled = true\n")
+                .unwrap_err()
+                .contains("enabled")
+        );
+    }
+
+    #[test]
     fn effective_config_round_trips() {
         let c = Config::default();
         assert_eq!(Config::parse(&c.effective()).unwrap(), c);
@@ -482,7 +522,12 @@ mod tests {
         // The example rules must be valid, and everything else must be the defaults.
         let mut uncommented = Config::parse(&uncommented).unwrap();
         assert!(!uncommented.rules.is_empty(), "the example documents rules");
+        assert!(
+            !uncommented.connection_rules.is_empty(),
+            "the example documents connection rules"
+        );
         uncommented.rules.clear();
+        uncommented.connection_rules.clear();
         assert_eq!(uncommented, Config::default());
     }
 
