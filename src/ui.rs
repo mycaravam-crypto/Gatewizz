@@ -122,8 +122,8 @@ mod app {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("gatewizz: approval")
-                .with_inner_size([780.0, 560.0])
-                .with_min_inner_size([640.0, 460.0])
+                .with_inner_size([980.0, 700.0])
+                .with_min_inner_size([760.0, 560.0])
                 .with_resizable(true)
                 .with_visible(false),
             ..Default::default()
@@ -350,7 +350,7 @@ mod app {
     fn history_rows(path: Option<&PathBuf>) -> Vec<serde_json::Value> {
         let Some(path) = path else { return Vec::new() };
         let mut rows = Vec::new();
-        for suffix in (0..=5).rev() {
+        for suffix in 0..=5 {
             let candidate = if suffix == 0 { path.clone() } else {
                 let mut name = path.as_os_str().to_owned();
                 name.push(format!(".{suffix}"));
@@ -536,7 +536,16 @@ mod app {
                     ui.label(RichText::new("History contains request metadata only. Bodies, header values and query strings are never stored.").size(10.0).color(MUTED));
                     return;
                 }
-                ui.add_space(8.0);
+                let recent = history_rows(self.events_path.as_ref());
+                let blocked = recent.iter().filter(|r| r.get("status").and_then(|v| v.as_u64()).is_some_and(|n| n == 403)).count();
+                let allowed = recent.len().saturating_sub(blocked);
+                ui.horizontal(|ui| {
+                    stat_card(ui, "RECENT REQUESTS", &recent.len().to_string(), BLUE);
+                    stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
+                    stat_card(ui, "OTHER DECISIONS", &allowed.to_string(), GREEN);
+                    stat_card(ui, "AWAITING REVIEW", &pending.len().to_string(), AMBER);
+                });
+                ui.add_space(10.0);
 
                 ui.columns(2, |columns| {
                     columns[0].set_min_width(205.0);
