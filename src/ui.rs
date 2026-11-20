@@ -431,6 +431,7 @@ mod app {
     }
 
     /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
+    /// Accepts a borrowed path so callers do not need to allocate a `PathBuf`.
     fn load_history(path: &Path) -> Vec<HistoryEvent> {
         let mut rows = Vec::new();
         for suffix in 0..=MAX_LOG_ROTATIONS {
