@@ -140,9 +140,11 @@ mod sys {
                 .is_some()
         }
 
-        /// Stops accepting and returns once the server thread is done.
+        /// Stops accepting and returns once the server thread is done. Safe to call more than once.
         pub fn stop(&self) {
-            self.stopping.store(true, Ordering::SeqCst);
+            if self.stopping.swap(true, Ordering::SeqCst) {
+                return;
+            }
             // Wake a ConnectNamedPipe that waits for a client by being that client.
             let h = unsafe {
                 CreateFileW(
@@ -170,6 +172,13 @@ mod sys {
             if let Some(thread) = thread {
                 let _ = thread.join();
             }
+        }
+    }
+
+    /// The server thread never outlives its `Server`, also when unwinding drops it without a `stop`.
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop();
         }
     }
 

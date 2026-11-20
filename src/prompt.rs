@@ -412,10 +412,21 @@ mod tests {
         let existing = "# my rules\n[firewall]\ndefault = \"ask\"\n";
         let combined = format!("{existing}{}", rule_toml(&c.rule));
         let config = crate::config::Config::parse(&combined).unwrap();
-        assert_eq!(config.connection_rules, [c.rule]);
+        assert_eq!(config.connection_rules, std::slice::from_ref(&c.rule));
         assert!(
             combined.starts_with("# my rules\n"),
             "the user's text stays"
         );
+        // A file that ends without a newline, even in a comment, still gets a separate, valid table.
+        for tail in [
+            "[firewall]\ndefault = \"ask\"",
+            "[firewall]\ndefault = \"ask\" # trailing comment",
+        ] {
+            let combined = format!("{tail}{}", rule_toml(&c.rule));
+            let rules = crate::config::Config::parse(&combined)
+                .unwrap()
+                .connection_rules;
+            assert_eq!(rules.len(), 1, "{combined}");
+        }
     }
 }

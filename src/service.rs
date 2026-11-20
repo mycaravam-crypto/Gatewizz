@@ -539,6 +539,10 @@ struct Prompt {
 #[cfg(windows)]
 fn start_prompt() -> Result<Prompt, String> {
     let (tx, rx) = std::sync::mpsc::channel::<crate::prompt::Decision>();
+    // Who may open the pipe: crate::pipe::SDDL = "D:P(A;;GA;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;IU)", a protected DACL
+    // with SYSTEM full control, administrators and interactive users read/write, everyone else (network logons,
+    // services) refused; remote clients are rejected too. Pinned by pipe::tests, enforced by the restricted-token
+    // test. Opening the pipe still grants no rule: decisions only answer notices sent here (prompt::Outstanding).
     let server = crate::pipe::serve(crate::pipe::NAME, crate::pipe::SDDL, tx)?;
     let state = std::sync::Arc::new(PromptState {
         outstanding: std::sync::Mutex::new(crate::prompt::Outstanding::new(256)),
