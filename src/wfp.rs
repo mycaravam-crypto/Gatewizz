@@ -169,11 +169,11 @@ mod sys {
         FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_NET_EVENT_FLAG_APP_ID_SET,
         FWPM_NET_EVENT_FLAG_IP_VERSION_SET, FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET,
         FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET, FWPM_NET_EVENT_SUBSCRIPTION0,
-        FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_NET_EVENT1, FWPM_PROVIDER_FLAG_PERSISTENT,
+        FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_NET_EVENT2, FWPM_PROVIDER_FLAG_PERSISTENT,
         FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
         FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
         FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
-        FwpmGetAppIdFromFileName0, FwpmNetEventSubscribe0, FwpmNetEventUnsubscribe0,
+        FwpmGetAppIdFromFileName0, FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0,
         FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
         FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
     };
@@ -599,7 +599,9 @@ mod sys {
         }
     }
 
-    unsafe extern "system" fn on_event(context: *mut c_void, event: *const FWPM_NET_EVENT1) {
+    /// `FwpmNetEventSubscribe1` delivers `FWPM_NET_EVENT2` (Windows 8 and later). Only header fields (address,
+    /// port, protocol, app id) and the classify-drop filter id are read, which every event version has.
+    unsafe extern "system" fn on_event(context: *mut c_void, event: *const FWPM_NET_EVENT2) {
         let (Some(event), false) = (unsafe { event.as_ref() }, context.is_null()) else {
             return;
         };
@@ -661,7 +663,7 @@ mod sys {
         let subscription = FWPM_NET_EVENT_SUBSCRIPTION0::default();
         let mut handle: HANDLE = null_mut();
         let rc = unsafe {
-            FwpmNetEventSubscribe0(
+            FwpmNetEventSubscribe1(
                 engine.0,
                 &subscription,
                 Some(on_event),
