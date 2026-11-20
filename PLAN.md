@@ -55,7 +55,7 @@ src/
 ├── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ├── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
 ├── startup.rs   # per-user Run registration and per-session single-instance mutex (Windows only)
-└── ui.rs        # tray icon and approval window (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35, #45)
+└── ui.rs        # tray icon, approval window and activity history with filters and CSV copy (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35, #45, #51, #53)
 ```
 
 Request framing is parsed by hyper alone and re-framed towards the upstream, so client and upstream cannot disagree
