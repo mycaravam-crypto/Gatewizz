@@ -86,8 +86,8 @@ mod app {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
-    use std::time::Duration;
     use std::fs;
+    use std::time::Duration;
 
     use eframe::egui::{self, Align, Color32, Layout, RichText, Stroke, ViewportCommand};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -185,7 +185,10 @@ mod app {
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Tab { Overview, Activity }
+    enum Tab {
+        Overview,
+        Activity,
+    }
 
     impl App {
         fn new(
@@ -351,16 +354,22 @@ mod app {
         let Some(path) = path else { return Vec::new() };
         let mut rows = Vec::new();
         for suffix in 0..=5 {
-            let candidate = if suffix == 0 { path.clone() } else {
+            let candidate = if suffix == 0 {
+                path.clone()
+            } else {
                 let mut name = path.as_os_str().to_owned();
                 name.push(format!(".{suffix}"));
                 PathBuf::from(name)
             };
-            let Ok(contents) = fs::read_to_string(candidate) else { continue };
+            let Ok(contents) = fs::read_to_string(candidate) else {
+                continue;
+            };
             for line in contents.lines().rev() {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
                     rows.push(value);
-                    if rows.len() >= 500 { return rows; }
+                    if rows.len() >= 500 {
+                        return rows;
+                    }
                 }
             }
         }
@@ -368,10 +377,20 @@ mod app {
     }
 
     fn event_process(value: &serde_json::Value) -> String {
-        if let Some(image) = value.pointer("/process/known/image").and_then(|v| v.as_str()) {
-            return image.rsplit(['\\', '/']).next().unwrap_or(image).to_string();
+        if let Some(image) = value
+            .pointer("/process/known/image")
+            .and_then(|v| v.as_str())
+        {
+            return image
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(image)
+                .to_string();
         }
-        value.get("process").map(|v| v.to_string()).unwrap_or_else(|| "unknown".into())
+        value
+            .get("process")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into())
     }
 
     fn icon(state: TrayState) -> Icon {
