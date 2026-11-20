@@ -74,7 +74,13 @@ pub struct Window(Arc<Approvals>);
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.0.lock().windows -= 1;
+        let mut state = self.0.lock();
+        state.windows = state.windows.saturating_sub(1);
+        if state.windows == 0 && !state.pending.is_empty() {
+            // Closing the last window is an explicit denial, not a reason to leave requests waiting for timeout.
+            state.pending.clear();
+            self.0.count.send_replace(0);
+        }
     }
 }
 
@@ -162,7 +168,11 @@ impl Approvals {
             return false;
         };
         let pending = state.pending.remove(at).expect("position is in range");
-        if let Verdict::AllowFor(duration) = verdict
+        self.count.send_replace(state.pending.len());
+        // Only persist a grant if the waiting request actually receives this verdict.
+        let delivered = pending.reply.send(verdict).is_ok();
+        if delivered
+            && let Verdict::AllowFor(duration) = verdict
             && let Some(image) = image(&pending.held.process)
         {
             state.grants.insert(
@@ -170,9 +180,7 @@ impl Approvals {
                 Instant::now() + duration,
             );
         }
-        self.count.send_replace(state.pending.len());
-        // The asker may have just timed out; then the verdict is moot.
-        pending.reply.send(verdict).is_ok()
+        delivered
     }
 
     /// Waiting requests in arrival order, with their id and time left.
@@ -305,6 +313,54 @@ mod tests {
             a.ask(held("h")).await,
             Outcome::Blocked("no approval window")
         );
+    }
+
+    #[tokio::test]
+    async fn closing_last_window_withdraws_waiting_requests_immediately() {
+        let a = approvals(5_000, 4);
+        let window = a.attach();
+        let (_id, task) = queued(&a, "h").await;
+
+        drop(window);
+
+        assert_eq!(task.await.unwrap(), Outcome::Blocked("approval withdrawn"));
+        assert!(a.pending().is_empty());
+        assert_eq!(*a.watch().borrow(), 0);
+        assert_eq!(a.ask(held("h")).await, Outcome::Blocked("no approval window"));
+    }
+
+    #[tokio::test]
+    async fn closing_one_of_multiple_windows_keeps_requests_waiting() {
+        let a = approvals(5_000, 4);
+        let first = a.attach();
+        let second = a.attach();
+        let (id, task) = queued(&a, "h").await;
+
+        drop(first);
+
+        assert_eq!(a.pending().len(), 1);
+        assert!(a.answer(id, Verdict::Deny));
+        assert_eq!(task.await.unwrap(), Outcome::Blocked("approval denied"));
+        drop(second);
+    }
+
+    #[test]
+    fn undelivered_allow_for_does_not_create_a_grant() {
+        let a = approvals(5_000, 4);
+        let (reply, receiver) = oneshot::channel();
+        drop(receiver);
+        {
+            let mut state = a.lock();
+            state.pending.push_back(Pending {
+                id: 42,
+                held: held("api.example.com"),
+                deadline: Instant::now() + Duration::from_secs(5),
+                reply,
+            });
+        }
+
+        assert!(!a.answer(42, Verdict::AllowFor(Duration::from_secs(60))));
+        assert!(a.lock().grants.is_empty());
     }
 
     #[tokio::test]
