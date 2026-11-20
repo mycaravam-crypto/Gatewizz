@@ -1,8 +1,8 @@
 # PLAN.md: gatewizz — local HTTPS gate for code sent to AI models
 
 The source of truth for scope is the epic, [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1). This file keeps the
-engineering rules, the architecture and the status next to the code.
-
+engineering rules, the architecture and the status next to the code. User-facing operational documentation is indexed
+in [docs/README.md](docs/README.md).
 ## 1. Goal
 
 A loopback proxy for Windows. Tools that send code to AI models (smartwizz, testwizz, `docwizz --ai`, gitwizz, coding
