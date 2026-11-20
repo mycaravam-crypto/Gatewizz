@@ -5,13 +5,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{ClientConfig, ServerConfig};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use crate::ca::Ca;
 
 /// Both sides speak HTTP/1.1 only; offering `h2` would let a client negotiate a protocol the proxy cannot read.
 const ALPN_HTTP1: &[u8] = b"http/1.1";
@@ -44,8 +46,6 @@ pub enum UpstreamTlsFailure {
 
 impl Interceptor {
     /// `upstream` decides which upstream certificates are trusted; production uses [`platform_upstream`].
-    // ponytail: main builds the interceptor once #18 provides the CA; until then only tests construct one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         leaf: Box<LeafIssuer>,
         mut upstream: ClientConfig,
@@ -101,9 +101,22 @@ impl Interceptor {
     }
 }
 
+/// Leaves from the local CA, as rustls wants them. The CA caches the certificates; the signing key is parsed per
+/// tunnel, which is cheap next to the handshake.
+pub fn leaf_issuer(ca: Arc<Ca>) -> Box<LeafIssuer> {
+    Box::new(move |host: &str| {
+        let leaf = ca.leaf(host)?;
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf.key.clone()));
+        let signer = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|err| format!("[ca] unusable leaf key for {host:?}: {err}"))?;
+        Ok(Arc::new(CertifiedKey::new(
+            vec![CertificateDer::from(leaf.cert.clone())],
+            signer,
+        )))
+    })
+}
+
 /// Upstream TLS verified by the operating system's trust store (the Windows certificate store on Windows).
-// ponytail: called from main once #18 provides the CA.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn platform_upstream() -> Result<ClientConfig, String> {
     use rustls_platform_verifier::BuilderVerifierExt;
     Ok(ClientConfig::builder_with_provider(provider())
@@ -154,7 +167,6 @@ mod tests {
         BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     };
     use rustls::RootCertStore;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -372,6 +384,35 @@ mod tests {
             assert_eq!((event.host.as_str(), event.status), ("localhost", 200));
             assert_eq!(event.coverage, Coverage::PartiallyInspected);
         }
+    }
+
+    #[tokio::test]
+    async fn leaves_from_the_local_ca_are_accepted() {
+        let ca = Arc::new(Ca::generate().unwrap());
+        let gatewizz = TestCa {
+            cert: CertificateDer::from(ca.cert().to_vec()),
+            issuer: Issuer::new(CertificateParams::default(), KeyPair::generate().unwrap()),
+        };
+        let origin = test_ca("origin test");
+        let (port, _seen) = upstream(leaf(&origin, "localhost"), false).await;
+        let interceptor = Interceptor::new(leaf_issuer(ca), trusting(&origin), Vec::new());
+        let settings = Settings {
+            allowed_connect_ports: vec![port],
+            tls: Some(Arc::new(interceptor)),
+            ..Settings::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events, _received) = mpsc::channel(16);
+        tokio::spawn(serve(listener, settings, events, std::future::pending()));
+
+        let (tcp, status) = connect(addr, port).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        // A client trusting only the local CA's certificate accepts the leaf it issued.
+        let (mut sender, _) = handshake(tcp, &gatewizz).await.unwrap();
+        let (status, body) =
+            send(&mut sender, "GET", "/ok", &format!("localhost:{port}"), "").await;
+        assert_eq!((status, body.as_str()), (200, "GET /ok 0"));
     }
 
     #[tokio::test]

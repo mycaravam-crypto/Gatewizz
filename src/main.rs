@@ -120,8 +120,30 @@ async fn cancelled() {
     }
 }
 
+/// The proxy settings, with TLS interception when `[tls] intercept` is on. That needs the CA, so a missing CA is a
+/// startup error rather than a silent fallback to blind tunnels.
+fn proxy_settings(
+    config: &Config,
+    data_dir: Result<std::path::PathBuf, String>,
+) -> Result<proxy::Settings, String> {
+    let mut settings = config.settings();
+    if config.tls.intercept {
+        let ca = data_dir.and_then(|dir| ca::Ca::load(&dir)).map_err(|err| {
+            format!("[configuration] tls.intercept needs the local CA; run `gatewizz ca install` ({err})")
+        })?;
+        let upstream = tls::platform_upstream().map_err(|err| format!("[configuration] {err}"))?;
+        settings.tls = Some(std::sync::Arc::new(tls::Interceptor::new(
+            tls::leaf_issuer(std::sync::Arc::new(ca)),
+            upstream,
+            config.tls.tunnel_hosts.clone(),
+        )));
+    }
+    Ok(settings)
+}
+
 /// Runs until cancelled, then drains, flushes the events and returns.
 fn run_proxy(config: &Config) -> Result<(), String> {
+    let settings = proxy_settings(config, config::data_dir())?;
     let target = config.event_target()?;
     let (events, writer) = event::spawn(
         target,
@@ -139,7 +161,7 @@ fn run_proxy(config: &Config) -> Result<(), String> {
             .await
             .map_err(|err| format!("[network] cannot listen on {listen}: {err}"))?;
         eprintln!("gatewizz {VERSION} listening on {listen}");
-        proxy::serve(listener, config.settings(), events, cancelled())
+        proxy::serve(listener, settings, events, cancelled())
             .await
             .map_err(|err| format!("[network] {err}"))
     });
@@ -253,6 +275,21 @@ mod tests {
         ] {
             assert!(USAGE.contains(flag), "{flag}");
         }
+    }
+
+    #[test]
+    fn intercept_without_a_ca_is_a_startup_error() {
+        let empty = std::env::temp_dir().join(format!("gatewizz-no-ca-{}", std::process::id()));
+        let mut config = Config::default();
+        assert!(
+            proxy_settings(&config, Ok(empty.clone()))
+                .unwrap()
+                .tls
+                .is_none()
+        );
+        config.tls.intercept = true;
+        let err = proxy_settings(&config, Ok(empty)).unwrap_err();
+        assert!(err.contains("gatewizz ca install"), "{err}");
     }
 
     #[test]

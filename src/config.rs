@@ -15,6 +15,7 @@ pub struct Config {
     pub general: General,
     pub limits: Limits,
     pub events: Events,
+    pub tls: Tls,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -84,6 +85,16 @@ impl Default for Events {
             keep_files: 5,
         }
     }
+}
+
+/// HTTPS decryption of CONNECT tunnels (#19). Off by default: it needs the CA from `gatewizz ca install`.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tls {
+    pub intercept: bool,
+    /// Hosts that keep a blind tunnel even when intercepting (pinned or mutual-TLS endpoints): exact names or
+    /// `*.suffix`.
+    pub tunnel_hosts: Vec<String>,
 }
 
 /// Where events go once `[events].path` is resolved.
