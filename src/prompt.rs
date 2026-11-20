@@ -190,11 +190,13 @@ impl Outstanding {
             }
             Lasting::Always => None,
         };
-        let (_, notice) = self.sent.remove(at).expect("position is in range");
         let verb = match decision.action {
             RuleAction::Allow => "allow",
             RuleAction::Block => "block",
+            // The answer to a prompt cannot be another prompt.
+            RuleAction::Ask => return Err("a decision allows or blocks; it cannot ask".into()),
         };
+        let (_, notice) = self.sent.remove(at).expect("position is in range");
         // Notice ids restart with the service; the wall-clock second keeps ids unique in the written configuration.
         let stamp = wall
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -352,7 +354,16 @@ mod tests {
             .answer(&decision(n.id, Lasting::Minutes(525_600)), now, wall)
             .unwrap_err();
         assert!(err.contains("not one of the offered durations"));
-        // A refused duration leaves the notice answerable.
+        let ask = Decision {
+            action: RuleAction::Ask,
+            ..decision(n.id, Lasting::Always)
+        };
+        assert!(
+            o.answer(&ask, now, wall)
+                .unwrap_err()
+                .contains("cannot ask")
+        );
+        // Refused durations and actions leave the notice answerable.
         assert!(o.answer(&decision(n.id, Lasting::Once), now, wall).is_ok());
     }
 
