@@ -320,9 +320,11 @@ mod app {
         firewall_connected: bool,
         inbox: Inbox,
         notice_selected: Option<u64>,
-        /// The scope and duration picked for the shown notice.
+        /// The scope and duration picked for the shown notice. The scope belongs to `scope_for`, the notice it was
+        /// picked for: any other notice starts from the narrowest scope.
         any_host: bool,
         any_port: bool,
+        scope_for: Option<u64>,
         notice_minutes: u32,
         /// The service's answer to the last decision, shown in the status bar for a while.
         firewall_result: Option<(Instant, bool, String)>,
@@ -531,6 +533,7 @@ mod app {
                 notice_selected: None,
                 any_host: false,
                 any_port: false,
+                scope_for: None,
                 notice_minutes: NOTICE_MINUTES,
                 firewall_result: None,
             })
@@ -1409,6 +1412,13 @@ mod app {
         /// A connection the firewall blocked and asks about. Unlike a held request it has no timer: it is blocked
         /// already, and the app retries once a rule allows it.
         fn connection(&mut self, ui: &mut egui::Ui, notice: &Notice) {
+            // A widening picked for one notice never carries over to another (another selection, an expiry, or a
+            // repeat folding in under a new id).
+            if self.scope_for != Some(notice.id) {
+                self.scope_for = Some(notice.id);
+                self.any_host = false;
+                self.any_port = false;
+            }
             let mut decision = None;
             egui::Panel::bottom("connection_decision")
                 .resizable(false)
@@ -1482,9 +1492,6 @@ mod app {
                 let sent = self.firewall.send(&Message::Decision(decision));
                 self.inbox.take(notice.id);
                 self.notice_selected = None;
-                // The next notice starts from the narrowest scope again.
-                self.any_host = false;
-                self.any_port = false;
                 if !sent {
                     self.firewall_result = Some((
                         Instant::now(),
