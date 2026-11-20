@@ -221,14 +221,12 @@ fn run_proxy(
     // Ending the runtime cancels what is left (tunnels), which drops the last event senders, so the writer drains
     // its queue and stops.
     runtime.shutdown_timeout(Duration::from_secs(1));
-    if let Some(monitor) = monitor {
-        monitor.stop();
-    }
+    let monitored = monitor.map_or(Ok(()), connections::Monitor::stop);
     let flushed = writer
         .join()
         .map_err(|_| "[events] writer panicked".to_string())
         .and_then(|result| result);
-    served.and(flushed)
+    served.and(monitored).and(flushed)
 }
 
 /// On Windows the tray and approval window own the main thread; Quit, Ctrl+C or console close stop the proxy.

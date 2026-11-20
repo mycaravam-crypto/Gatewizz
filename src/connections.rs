@@ -385,9 +385,13 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    pub fn stop(self) {
+    /// Stops sampling and waits for the thread. An `Err` means the monitor thread panicked.
+    pub fn stop(self) -> Result<(), String> {
+        // A failed send only means the thread already returned (its event writer closed); join tells the rest.
         let _ = self.stop.send(());
-        let _ = self.thread.join();
+        self.thread
+            .join()
+            .map_err(|_| "[monitor] the connection monitor panicked".to_string())
     }
 }
 
