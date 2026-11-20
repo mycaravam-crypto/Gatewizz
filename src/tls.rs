@@ -382,7 +382,7 @@ mod tests {
             let event = next(&mut events).await;
             assert_eq!((event.method.as_str(), event.path.as_str()), (method, path));
             assert_eq!((event.host.as_str(), event.status), ("localhost", 200));
-            assert_eq!(event.coverage, Coverage::PartiallyInspected);
+            assert_eq!(event.coverage, Coverage::Inspected);
         }
     }
 

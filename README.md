@@ -20,8 +20,8 @@ it for approval before any byte goes upstream. Every decision is logged; content
     gatewizz ca remove                                # untrust every gatewizz CA and delete its files
 
 Every config key is optional; [config/gatewizz.example.toml](config/gatewizz.example.toml) lists them with their
-defaults. Events hold metadata only (process, host, path without query, status, coverage), never header values or
-bodies.
+defaults. Events hold metadata only (process, host, path without query, status, coverage, secret kinds found, AI model),
+never header values, secrets or bodies.
 
 `gatewizz --help` lists every flag and the exit codes.
 
@@ -73,7 +73,9 @@ severity = "critical"
 
 Rules on `path_prefix`, `finding` or `ai` need to see inside the request. In a blind tunnel they cannot, so a `block`
 rule using them blocks the tunnel (fail closed); with `[tls] intercept` each decrypted request is decided instead.
-Until body inspection (#20) lands, `finding` and `ai` are never known, so such `block` rules block every request.
+`finding` and `ai` are decided after the body is read: a body that was only partly inspected (over
+`[limits] max_body_bytes` with `over_limit = "allow"`, or compressed) counts as unknown, so a `block` rule on them
+applies.
 
 ## Tray and approvals
 

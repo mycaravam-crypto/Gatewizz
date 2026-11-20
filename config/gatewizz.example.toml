@@ -39,6 +39,14 @@
 # Seconds shutdown waits for in-flight requests (Ctrl+C or console close).
 # shutdown_timeout_secs = 10
 
+# Request bodies up to this many bytes are read in full and checked for
+# secrets before any byte goes upstream.
+# max_body_bytes = 8388608
+
+# What happens to a larger or compressed body: "block" refuses it with 413
+# (fail closed), "allow" forwards it recorded as partially_inspected.
+# over_limit = "block"
+
 [events]
 # JSON Lines event file. Empty means %LOCALAPPDATA%\gatewizz\events.jsonl;
 # "-" writes to stdout. Events hold metadata only: no bodies, header values
