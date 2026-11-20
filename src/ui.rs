@@ -116,7 +116,7 @@ mod app {
             "gatewizz",
             options,
             Box::new(move |cc| {
-                App::new(cc, listen, events_path, approvals, quit, proxy)
+                App::new(cc, listen, events_path, approvals, quit, stop, proxy)
                     .map(|app| Box::new(app) as Box<dyn eframe::App>)
                     .map_err(|error| {
                         Box::new(std::io::Error::other(error))
@@ -172,6 +172,7 @@ mod app {
             events_path: Option<PathBuf>,
             approvals: Arc<Approvals>,
             quit: tokio::sync::oneshot::Sender<()>,
+            stop: tokio::sync::oneshot::Receiver<()>,
             proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String>
             + Send
             + 'static,
