@@ -226,11 +226,13 @@ mod app {
                 .with_tooltip(TrayState::Running.tooltip(0))
                 .build()
                 .map_err(|e| format!("[ui] cannot create tray icon: {e}"))?;
+            // Attach before starting the proxy so an immediate approval cannot race window registration.
+            let window = approvals.attach();
             // Start the proxy only after the tray exists. A UI initialization failure must never leave an
             // unmanageable proxy running in a detached worker thread.
             let proxy = std::thread::spawn(move || proxy(stop));
             Ok(Self {
-                _window: approvals.attach(),
+                _window: window,
                 approvals,
                 _tray: tray,
                 items,
