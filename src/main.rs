@@ -5,6 +5,7 @@ mod config;
 mod event;
 mod process;
 mod proxy;
+mod rules;
 mod tls;
 
 use std::path::PathBuf;

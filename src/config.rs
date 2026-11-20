@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::proxy::Settings;
+use crate::rules::{self, Action, Rule};
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -16,6 +17,9 @@ pub struct Config {
     pub limits: Limits,
     pub events: Events,
     pub tls: Tls,
+    /// Allow/block rules (#21); see `config/gatewizz.example.toml`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -25,6 +29,8 @@ pub struct General {
     pub listen: SocketAddr,
     /// Ports a CONNECT may target; anything else is blocked.
     pub allowed_connect_ports: Vec<u16>,
+    /// What happens when no rule matches.
+    pub default_action: Action,
 }
 
 impl Default for General {
@@ -32,6 +38,7 @@ impl Default for General {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 8899)),
             allowed_connect_ports: vec![443],
+            default_action: Action::Allow,
         }
     }
 }
@@ -140,6 +147,7 @@ impl Config {
         if g.allowed_connect_ports.contains(&0) {
             return Err("general.allowed_connect_ports: port 0 is not a valid target".into());
         }
+        rules::validate(&self.rules, g.default_action)?;
         let l = &self.limits;
         for (key, value) in [
             ("max_connections", l.max_connections as u64),
@@ -188,6 +196,8 @@ impl Config {
             shutdown_timeout: Duration::from_secs(l.shutdown_timeout_secs),
             // Interception is wired to the CA by #18; until then every CONNECT stays a blind tunnel.
             tls: None,
+            rules: self.rules.clone(),
+            default_action: g.default_action,
         }
     }
 
@@ -325,19 +335,40 @@ mod tests {
     }
 
     #[test]
+    fn rules_are_validated_with_their_index() {
+        let approve = "[[rules]]\nid = \"hold\"\naction = \"approve\"\nseverity = \"high\"\n";
+        let err = Config::parse(approve).unwrap_err();
+        assert!(
+            err.contains("rules[0].action") && err.contains("M3"),
+            "{err}"
+        );
+        let typo = "[[rules]]\nid = \"x\"\nmatch = { hots = [\"a\"] }\naction = \"block\"\nseverity = \"low\"\n";
+        assert!(Config::parse(typo).unwrap_err().contains("hots"));
+        let block_all = "[general]\ndefault_action = \"block\"\n";
+        assert_eq!(
+            Config::parse(block_all).unwrap().settings().default_action,
+            Action::Block
+        );
+    }
+
+    #[test]
     fn example_file_matches_defaults() {
         let text = include_str!("../config/gatewizz.example.toml");
         let uncommented: String = text
             .lines()
             .map(|l| {
                 l.strip_prefix("# ")
-                    .filter(|r| r.contains(" = "))
+                    .filter(|r| r.contains(" = ") || r.starts_with("[["))
                     .unwrap_or(l)
             })
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(Config::parse(text).unwrap(), Config::default());
-        assert_eq!(Config::parse(&uncommented).unwrap(), Config::default());
+        // The example rules must be valid, and everything else must be the defaults.
+        let mut uncommented = Config::parse(&uncommented).unwrap();
+        assert!(!uncommented.rules.is_empty(), "the example documents rules");
+        uncommented.rules.clear();
+        assert_eq!(uncommented, Config::default());
     }
 
     #[test]

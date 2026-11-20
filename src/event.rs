@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::config::EventTarget;
 use crate::process::Process;
+use crate::rules::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +47,10 @@ pub struct Event {
     // ponytail: counted for tunnels only; plain HTTP gets counters when M2 reads request bodies anyway.
     pub bytes_up: Option<u64>,
     pub bytes_down: Option<u64>,
+    /// The rule decision, once one was made (`None` for requests the proxy refused before deciding).
+    pub action: Option<Action>,
+    /// The deciding rule's id, or `default`.
+    pub rule: Option<String>,
 }
 
 /// The current time as RFC 3339 UTC with milliseconds.
@@ -226,6 +231,8 @@ mod tests {
             reason: None,
             bytes_up: None,
             bytes_down: None,
+            action: None,
+            rule: None,
         }
     }
 
@@ -252,6 +259,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "action",
                 "bytes_down",
                 "bytes_up",
                 "client",
@@ -262,6 +270,7 @@ mod tests {
                 "port",
                 "process",
                 "reason",
+                "rule",
                 "status",
                 "time"
             ]
