@@ -37,7 +37,6 @@ Invoke-WebRequest https://raw.githubusercontent.com/mycaravam-crypto/Gatewizz/ma
 gatewizz ca install
 # Set [tls].intercept = true in gatewizz.toml when content inspection is required.
 gatewizz --config .\gatewizz.toml --check-config
-gatewizz startup install --config .\gatewizz.toml
 gatewizz --config .\gatewizz.toml
 ```
 
