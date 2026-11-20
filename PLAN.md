@@ -44,6 +44,7 @@ Dependencies are added by the issue that first needs them, not before.
 
 ```
 src/
+├── approve.rs   # approval queue: hold, allow once/deny/allow for N min; timeout, full, no window, pause block (#34)
 ├── ca.rs        # local CA: generation, leaf issuance and cache, DPAPI key file, CurrentUser Root store (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
