@@ -84,7 +84,7 @@ mod app {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread::JoinHandle;
@@ -431,7 +431,7 @@ mod app {
     }
 
     /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
-    fn load_history(path: &PathBuf) -> Vec<HistoryEvent> {
+    fn load_history(path: &Path) -> Vec<HistoryEvent> {
         let mut rows = Vec::new();
         for suffix in 0..=MAX_LOG_ROTATIONS {
             let candidate = if suffix == 0 {
