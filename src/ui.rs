@@ -209,6 +209,14 @@ mod app {
     const SEMIBOLD: &str = "semibold";
     /// How long "Copied" confirmations stay visible.
     const FEEDBACK: Duration = Duration::from_secs(2);
+    /// Blocked connections the queue keeps waiting at most; the oldest goes first.
+    const INBOX_MAX: usize = 64;
+    /// The duration the prompt's "Allow for" starts with, one of `prompt::PRESETS`.
+    const NOTICE_MINUTES: u32 = 15;
+    /// How often a hidden app wakes while notices wait, so expired ones leave the queue.
+    const INBOX_TICK: Duration = Duration::from_secs(5);
+    /// How long the service's answer to a decision stays in the status bar.
+    const RESULT_SHOWN: Duration = Duration::from_secs(8);
 
     /// Starts the proxy on its own thread with a stop signal, shows the tray, and returns the proxy's result once it
     /// has stopped: after Quit, Ctrl+C or a proxy error.
@@ -519,11 +527,11 @@ mod app {
                 firewall,
                 firewall_events,
                 firewall_connected: false,
-                inbox: Inbox::new(64),
+                inbox: Inbox::new(INBOX_MAX),
                 notice_selected: None,
                 any_host: false,
                 any_port: false,
-                notice_minutes: 15,
+                notice_minutes: NOTICE_MINUTES,
                 firewall_result: None,
             })
         }
@@ -1129,7 +1137,7 @@ mod app {
                         .on_hover_text("Connected to the Gatewizz firewall service");
                 }
                 if let Some((at, ok, message)) = &self.firewall_result {
-                    let shown = Duration::from_secs(8);
+                    let shown = RESULT_SHOWN;
                     if at.elapsed() < shown {
                         ui.add_space(8.0);
                         ui.add(
@@ -2202,7 +2210,7 @@ mod app {
             self.inbox.expire(Instant::now());
             if !self.inbox.is_empty() {
                 // Expiry needs a frame now and then, also while hidden.
-                ctx.request_repaint_after(Duration::from_secs(5));
+                ctx.request_repaint_after(INBOX_TICK);
             }
             let waiting = self.approvals.pending().len() + self.inbox.len();
             // A newly held request or blocked connection opens the window.
