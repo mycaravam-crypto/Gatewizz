@@ -1,5 +1,6 @@
 //! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
 
+mod ca;
 mod config;
 mod event;
 mod process;
@@ -28,6 +29,8 @@ gatewizz: a local HTTPS gate for code sent to AI models
 Usage:
   gatewizz [--config <path>]                  run the proxy until Ctrl+C
   gatewizz [--config <path>] --check-config   validate the config and print the effective values
+  gatewizz ca install                         create the local CA if missing and trust it for the current user
+  gatewizz ca remove                          untrust every gatewizz CA and delete its files
   gatewizz --version | --help
 
 Options:
@@ -37,21 +40,33 @@ Options:
   -V, --version     print the version
   -h, --help        print this help
 
+The CA lives in %LOCALAPPDATA%\\gatewizz: ca.cer (public certificate) and ca.key (private key, encrypted with
+DPAPI for the current user). It is trusted only by the current user (CurrentUser Root store), and gatewizz uses it
+to sign certificates for hosts whose TLS it inspects. Windows asks for confirmation when it is added or removed.
+
 Point tools at the proxy with HTTPS_PROXY=http://127.0.0.1:8899 (the default listen address).
 
-Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events]), 130 stopped by Ctrl+C or console close.
+Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events], [ca]), 130 stopped by Ctrl+C or console close.
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Run(Option<PathBuf>),
     CheckConfig(Option<PathBuf>),
+    CaInstall,
+    CaRemove,
     Version,
     Help,
 }
 
 // Four flags do not justify an argument-parsing dependency (PLAN rule 4).
 fn parse(args: &[String]) -> Result<Command, String> {
+    match args {
+        [ca, action] if ca == "ca" && action == "install" => return Ok(Command::CaInstall),
+        [ca, action] if ca == "ca" && action == "remove" => return Ok(Command::CaRemove),
+        [ca, ..] if ca == "ca" => return Err("[usage] ca needs install or remove".into()),
+        _ => {}
+    }
     let (mut config, mut check) = (None, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -141,6 +156,8 @@ fn run(command: Command) -> Result<ExitCode, String> {
     match command {
         Command::Version => println!("gatewizz {VERSION}"),
         Command::Help => print!("{USAGE}"),
+        Command::CaInstall => println!("{}", ca::install(&config::data_dir()?)?),
+        Command::CaRemove => println!("{}", ca::remove(&config::data_dir()?)?),
         Command::CheckConfig(path) => {
             let config = load(path)?;
             config.event_target()?;
@@ -197,6 +214,8 @@ mod tests {
             parse(&args(&["--check-config"])),
             Ok(Command::CheckConfig(None))
         );
+        assert_eq!(parse(&args(&["ca", "install"])), Ok(Command::CaInstall));
+        assert_eq!(parse(&args(&["ca", "remove"])), Ok(Command::CaRemove));
     }
 
     #[test]
@@ -208,6 +227,10 @@ mod tests {
             &["--config", "a", "--config", "b"][..],
             &["--check-config", "--version"][..],
             &["--help", "x"][..],
+            &["ca"][..],
+            &["ca", "bogus"][..],
+            &["ca", "install", "x"][..],
+            &["--config", "g.toml", "ca", "install"][..],
         ] {
             let err = parse(&args(input)).unwrap_err();
             assert!(err.starts_with("[usage]"), "{err}");
@@ -222,6 +245,9 @@ mod tests {
             "--version",
             "--help",
             "HTTPS_PROXY",
+            "ca install",
+            "ca remove",
+            "ca.key",
             "130",
         ] {
             assert!(USAGE.contains(flag), "{flag}");

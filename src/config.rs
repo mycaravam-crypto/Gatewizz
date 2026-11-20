@@ -93,6 +93,13 @@ pub enum EventTarget {
     File(PathBuf),
 }
 
+/// `%LOCALAPPDATA%\gatewizz`, home of the default event log and the CA.
+pub fn data_dir() -> Result<PathBuf, String> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| Path::new(&dir).join("gatewizz"))
+        .ok_or_else(|| "LOCALAPPDATA is not set".into())
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
@@ -149,9 +156,9 @@ impl Config {
     pub fn event_target(&self) -> Result<EventTarget, String> {
         match self.events.path.as_str() {
             "-" => Ok(EventTarget::Stdout),
-            "" => std::env::var_os("LOCALAPPDATA")
-                .map(|dir| EventTarget::File(Path::new(&dir).join("gatewizz").join("events.jsonl")))
-                .ok_or_else(|| "events.path: LOCALAPPDATA is not set; set the path".into()),
+            "" => data_dir()
+                .map(|dir| EventTarget::File(dir.join("events.jsonl")))
+                .map_err(|e| format!("events.path: {e}; set the path")),
             path => Ok(EventTarget::File(PathBuf::from(path))),
         }
     }

@@ -14,11 +14,17 @@ strip = true
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+time = "0.3.55"
 tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 toml = "1.2.1"
 
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+pki_types = { version = "1.16.0", package = "rustls-pki-types", features = ["std"] }
+webpki = { version = "0.103", package = "rustls-webpki", features = ["ring", "std"] }
