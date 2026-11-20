@@ -14,6 +14,7 @@ mod connections;
 mod detect;
 mod dns;
 mod event;
+mod firewall;
 mod process;
 mod proxy;
 mod rules;
