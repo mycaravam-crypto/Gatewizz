@@ -65,24 +65,6 @@ pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, Str
         wfp::program_paths,
     );
     let applied = wfp::apply(wfp::KEYS, &filters)?;
-
-    let mut out = format!(
-        "Applied {} Windows filter(s) for {} connection rule(s); connections no rule matches are {}.",
-        applied.filters,
-        rules.len(),
-        match config.firewall.default {
-            firewall::DefaultAction::Allow => "allowed",
-            firewall::DefaultAction::Block => "blocked",
-            firewall::DefaultAction::Ask =>
-                "blocked (\"ask\" blocks until the approval prompt exists)",
-        }
-    );
-    for program in firewall::unresolved(rules, now, wfp::program_paths) {
-        out.push_str(&format!(
-            "\nwarning: {program} is neither on PATH nor running, so its rules are not enforced yet. Use its full \
-             path in `process`, or let the service find it once it runs."
-        ));
-    }
     let mut unresolved_hosts: Vec<&str> = rules
         .iter()
         .flat_map(|r| r.host.iter())
@@ -91,6 +73,40 @@ pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, Str
         .collect();
     unresolved_hosts.sort_unstable();
     unresolved_hosts.dedup();
+    Ok(summary(
+        &applied,
+        rules.len(),
+        config.firewall.default,
+        &firewall::unresolved(rules, now, wfp::program_paths),
+        &unresolved_hosts,
+    ))
+}
+
+/// What `apply` reports: the filter count and the default, then one warning per program, host or path that is not
+/// enforced, since the user must know which parts of their rules do nothing yet.
+fn summary(
+    applied: &wfp::Applied,
+    rules: usize,
+    default: firewall::DefaultAction,
+    unresolved_programs: &[String],
+    unresolved_hosts: &[&str],
+) -> String {
+    let mut out = format!(
+        "Applied {} Windows filter(s) for {rules} connection rule(s); connections no rule matches are {}.",
+        applied.filters,
+        match default {
+            firewall::DefaultAction::Allow => "allowed",
+            firewall::DefaultAction::Block => "blocked",
+            firewall::DefaultAction::Ask =>
+                "blocked (\"ask\" blocks until the approval prompt exists)",
+        }
+    );
+    for program in unresolved_programs {
+        out.push_str(&format!(
+            "\nwarning: {program} is neither on PATH nor running, so its rules are not enforced yet. Use its full \
+             path in `process`, or let the service find it once it runs."
+        ));
+    }
     for host in unresolved_hosts {
         out.push_str(&format!(
             "\nwarning: {host} has no IP address now (wildcards never do), so its rules are not enforced. Use `ip` \
@@ -102,7 +118,7 @@ pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, Str
             "\nwarning: {path} does not exist; its filters were skipped."
         ));
     }
-    Ok(out)
+    out
 }
 
 /// The addresses a host name resolves to now. Wildcards name no single host and resolve to nothing.
@@ -735,6 +751,59 @@ mod tests {
         assert_eq!(choose_rules(None, Some(rules.clone())), rules);
         // Nothing installed and nothing given: the defaults.
         assert_eq!(choose_rules(None, None), "");
+    }
+
+    #[test]
+    fn summary_names_the_default_and_every_unenforced_part() {
+        use firewall::DefaultAction::{Allow, Ask, Block};
+        let clean = wfp::Applied {
+            filters: 5,
+            skipped: Vec::new(),
+        };
+        let ok = summary(&clean, 2, Allow, &[], &[]);
+        assert_eq!(
+            ok,
+            "Applied 5 Windows filter(s) for 2 connection rule(s); connections no rule matches are allowed."
+        );
+        assert!(summary(&clean, 2, Block, &[], &[]).ends_with("are blocked."));
+        assert!(summary(&clean, 2, Ask, &[], &[]).contains("\"ask\" blocks"));
+
+        let partial = wfp::Applied {
+            filters: 1,
+            skipped: vec![r"C:\gone\app.exe".into()],
+        };
+        let text = summary(
+            &partial,
+            3,
+            Allow,
+            &["smartwizz.exe".into()],
+            &["*.example.com", "nx.example"],
+        );
+        let warnings: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(warnings.len(), 4, "{text}");
+        assert!(warnings[0].starts_with("warning: smartwizz.exe is neither on PATH nor running"));
+        assert!(warnings[1].starts_with("warning: *.example.com has no IP address"));
+        assert!(warnings[2].starts_with("warning: nx.example has no IP address"));
+        assert!(warnings[3].contains(r"C:\gone\app.exe does not exist"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temporary() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("firewall.toml");
+        write_atomic(&path, "first").unwrap();
+        write_atomic(&path, "second").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tmp_left = path.with_extension("tmp").exists();
+        // A directory where the file should go cannot be replaced: an error, not a silent success.
+        std::fs::create_dir_all(dir.join("blocked.toml")).unwrap();
+        let blocked = write_atomic(&dir.join("blocked.toml"), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(content, "second");
+        assert!(!tmp_left);
+        assert!(blocked.unwrap_err().contains("blocked.toml"));
     }
 
     #[test]
