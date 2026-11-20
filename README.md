@@ -121,7 +121,10 @@ The app targets Windows 10/11 x64. Two ways to build it:
     rustup target add x86_64-pc-windows-gnu
     cargo build --release --target x86_64-pc-windows-gnu
 
-The output is a single `gatewizz.exe`.
+The output is a single `gatewizz.exe` with its icon and manifest (per-monitor DPI v2, `asInvoker`) embedded by
+`build.rs`. A release build has no console window of its own: started from Explorer it runs in the tray, and a startup
+error is shown in a message box. Started from a terminal, its output (`--help`, `--check-config`, `ca …`, the
+`listening on` line) appears in that terminal, but the prompt returns right away. Debug builds keep a console.
 
 ## Checks
 
