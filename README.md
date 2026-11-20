@@ -40,6 +40,17 @@ gatewizz --config .\gatewizz.toml --check-config
 gatewizz --config .\gatewizz.toml
 ```
 
+After the first manual start, Gatewizz can start automatically at each Windows login and run in the notification area:
+
+```powershell
+gatewizz startup install --config .\gatewizz.toml
+gatewizz startup status
+# To disable automatic startup:
+gatewizz startup remove
+```
+
+The tray process owns the proxy and approval UI in the interactive user session. A per-session mutex prevents duplicate instances. Gatewizz is deliberately not a Windows Service because approval dialogs need the logged-in desktop.
+
 In a second PowerShell window, route a tool through the proxy:
 
 ```powershell

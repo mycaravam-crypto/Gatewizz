@@ -23,13 +23,20 @@ gatewizz --config .\gatewizz.toml --check-config
 gatewizz --config .\gatewizz.toml
 gatewizz ca install
 gatewizz ca remove
+gatewizz startup install
+gatewizz startup install --config .\gatewizz.toml
+gatewizz startup status
+gatewizz startup remove
 ```
 
-- `gatewizz`: starts the proxy; Ctrl+C stops it (exit 130).
+- `gatewizz`: starts the proxy and tray application; Ctrl+C or **Quit** in the tray stops it (exit 130).
 - `--config <path>`: selects a TOML configuration file.
 - `--check-config`: validates and prints effective configuration (exit 0; exit 2 on error).
 - `ca install`: creates the local CA if needed and trusts it for the current Windows user.
 - `ca remove`: removes gatewizz CA certificates from the current user's store and deletes its key files.
+- `startup install [--config <path>]`: registers the current executable in the current user's Windows Run key. The optional config path is resolved to an absolute path and retained for login startup.
+- `startup status`: displays the current Run registration.
+- `startup remove`: removes only Gatewizz's Run value; it does not uninstall the executable or remove the CA.
 
 `gatewizz --help` is authoritative for the complete flag list and exit codes.
 
@@ -118,6 +125,24 @@ Files are stored in `%LOCALAPPDATA%\gatewizz`:
 The CA can issue leaf certificates (path length zero). Protect the Windows account that owns this key accordingly.
 
 `gatewizz ca remove` removes gatewizz CA certificates from the current user's store and deletes both files. Windows displays its confirmation dialog again.
+
+## Background startup and process lifecycle
+
+Gatewizz is a per-user desktop application, not a Windows Service. A traditional service runs in Session 0 and cannot own the interactive approval windows. The proxy, tray and approval UI therefore live in one process in the logged-in user's session.
+
+Register automatic login startup:
+
+```powershell
+gatewizz startup install --config .\gatewizz.toml
+gatewizz startup status
+gatewizz startup remove
+```
+
+The registration is stored as a `REG_SZ` value named `Gatewizz` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. It needs no administrator rights. The config path, if supplied, is stored as an absolute path. The registration starts the executable after that user signs in; it does not start before login.
+
+Only one Gatewizz process is allowed per interactive Windows session. A named mutex prevents duplicate proxy listeners. A second launch exits cleanly. The tray must initialize successfully before the proxy worker starts; if tray creation fails, Gatewizz fails startup instead of leaving an invisible proxy running. The approval viewport starts hidden and appears only when an approval is waiting or the tray is clicked.
+
+Quit withdraws pending approvals (fail closed), stops the proxy and flushes the event writer. Pending approvals and temporary grants are memory-only and are never restored after restart.
 
 ## Tray and approvals
 

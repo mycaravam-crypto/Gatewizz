@@ -54,7 +54,8 @@ src/
 ├── rules.rs     # allow/block rules: pure decide(), block beats allow, fail closed on unknown facts (#21)
 ├── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ├── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
-└── ui.rs        # tray icon and approval window (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35)
+├── startup.rs   # per-user Run registration and per-session single-instance mutex (Windows only)
+└── ui.rs        # tray icon and approval window (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35, #45)
 ```
 
 Request framing is parsed by hyper alone and re-framed towards the upstream, so client and upstream cannot disagree
@@ -66,7 +67,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 |---|---|---|---|
 | **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete and released; real-Windows acceptance pending (#17) |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
-| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; real-Windows UI acceptance remains open (#35, #36) |
+| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; background login startup and single-instance lifecycle in progress (#36, #45); real-Windows UI acceptance remains open |
 
 ## 6. Quality gates
 
