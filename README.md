@@ -6,9 +6,11 @@ Tools that send code to a model (smartwizz, testwizz, `docwizz --ai`, gitwizz, c
 `HTTPS_PROXY`. It decrypts each request with a local CA, checks it against a few TOML rules, and allows, blocks or holds
 it for approval before any byte goes upstream. Every decision is logged; content never is.
 
-**Status:** early development. `gatewizz` forwards plain HTTP and tunnels HTTPS (CONNECT to port 443) on
-`127.0.0.1:8899`, names the client process of each connection, and writes one JSON line per request to
-`%LOCALAPPDATA%\gatewizz\events.jsonl`. TLS interception and rules follow in M2. Design and milestones:
+**Status:** M1–M3 implementation is merged. The proxy supports TLS interception, rule-based allow/block/approval,
+a Windows tray and approval window, and metadata-only event logging. Real-Windows acceptance of the M1/M2 tool flows
+and M3 tray interactions remains open in [#17](https://github.com/mycaravam-crypto/Gatewizz/issues/17),
+[#22](https://github.com/mycaravam-crypto/Gatewizz/issues/22), [#35](https://github.com/mycaravam-crypto/Gatewizz/issues/35)
+and [#36](https://github.com/mycaravam-crypto/Gatewizz/issues/36). Design and milestones:
 [PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
 
 ## Usage
