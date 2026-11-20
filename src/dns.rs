@@ -237,6 +237,8 @@ mod sys {
     fn get_cache_data_table() -> Option<GetCacheDataTable> {
         static FN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         let addr = *FN.get_or_init(|| {
+            // The module is never freed on purpose: the function pointer below is cached for the life of the
+            // process, and FreeLibrary would leave it pointing into unloaded code.
             let dll: Vec<u16> = "dnsapi.dll".encode_utf16().chain([0]).collect();
             let module =
                 unsafe { LoadLibraryExW(dll.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
@@ -441,6 +443,71 @@ mod tests {
         assert_eq!(
             c.lookup(cdn, 1, now + Duration::from_secs(10)),
             Some("n9.example")
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_the_newest_three_quarters() {
+        let now = Instant::now();
+        let mut c = Cache::new(8);
+        let at = |i: u8| now + Duration::from_secs(u64::from(i));
+        for i in 0..9u8 {
+            c.insert(
+                IpAddr::from([10, 0, 0, i]),
+                &format!("h{i}.example"),
+                None,
+                TTL,
+                at(i),
+            );
+        }
+        // The ninth insert went over capacity: down to 3/4 of it, the most recently seen.
+        assert_eq!(c.len(), 6);
+        let later = at(9);
+        for i in 0..3u8 {
+            assert_eq!(
+                c.lookup(IpAddr::from([10, 0, 0, i]), 1, later),
+                None,
+                "h{i} kept"
+            );
+        }
+        for i in 3..9u8 {
+            let name = format!("h{i}.example");
+            assert_eq!(
+                c.lookup(IpAddr::from([10, 0, 0, i]), 1, later),
+                Some(name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn expired_entries_go_first_on_eviction() {
+        let now = Instant::now();
+        let mut c = Cache::new(4);
+        // Two short-lived entries, then enough fresh ones to go over capacity once they expired.
+        for i in 0..2u8 {
+            c.insert(
+                IpAddr::from([10, 0, 1, i]),
+                "old.example",
+                None,
+                Duration::ZERO,
+                now,
+            );
+        }
+        let later = now + MIN_TTL + GRACE;
+        for i in 0..3u8 {
+            c.insert(
+                IpAddr::from([10, 0, 2, i]),
+                &format!("n{i}.example"),
+                None,
+                TTL,
+                later,
+            );
+        }
+        // 5 > 4 triggered eviction; dropping the 2 expired entries was enough.
+        assert_eq!(c.len(), 3);
+        assert_eq!(
+            c.lookup(IpAddr::from([10, 0, 2, 0]), 1, later),
+            Some("n0.example")
         );
     }
 
