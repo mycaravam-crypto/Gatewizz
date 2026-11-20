@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::detect::{BodyLimits, OverLimit};
 use crate::proxy::Settings;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -48,6 +49,10 @@ pub struct Limits {
     pub idle_timeout_secs: u64,
     /// How long shutdown waits for in-flight requests before exiting.
     pub shutdown_timeout_secs: u64,
+    /// Request bodies up to this size are read and inspected before anything goes upstream.
+    pub max_body_bytes: usize,
+    /// A larger or compressed body is refused (`block`) or forwarded partially inspected (`allow`).
+    pub over_limit: OverLimit,
 }
 
 impl Default for Limits {
@@ -60,6 +65,8 @@ impl Default for Limits {
             response_timeout_secs: 120,
             idle_timeout_secs: 300,
             shutdown_timeout_secs: 10,
+            max_body_bytes: BodyLimits::default().max_bytes,
+            over_limit: OverLimit::Block,
         }
     }
 }
@@ -138,6 +145,7 @@ impl Config {
             ("response_timeout_secs", l.response_timeout_secs),
             ("idle_timeout_secs", l.idle_timeout_secs),
             ("shutdown_timeout_secs", l.shutdown_timeout_secs),
+            ("max_body_bytes", l.max_body_bytes as u64),
         ] {
             if value == 0 {
                 return Err(format!("limits.{key}: must be at least 1"));
@@ -177,6 +185,10 @@ impl Config {
             shutdown_timeout: Duration::from_secs(l.shutdown_timeout_secs),
             // Interception is wired to the CA by #18; until then every CONNECT stays a blind tunnel.
             tls: None,
+            body: BodyLimits {
+                max_bytes: l.max_body_bytes,
+                over_limit: l.over_limit,
+            },
         }
     }
 
@@ -222,6 +234,8 @@ mod tests {
             response_timeout_secs = 5
             idle_timeout_secs = 6
             shutdown_timeout_secs = 7
+            max_body_bytes = 1024
+            over_limit = "allow"
             [events]
             path = "-"
             max_file_bytes = 4096
@@ -233,6 +247,13 @@ mod tests {
         assert_eq!(c.general.allowed_connect_ports, [443, 8443]);
         assert_eq!(c.settings().response_timeout, Duration::from_secs(5));
         assert_eq!(c.settings().shutdown_timeout, Duration::from_secs(7));
+        assert_eq!(
+            c.settings().body,
+            BodyLimits {
+                max_bytes: 1024,
+                over_limit: OverLimit::Allow
+            }
+        );
         assert_eq!(c.events.keep_files, 0);
         assert_eq!(c.event_target(), Ok(EventTarget::Stdout));
     }
@@ -247,6 +268,12 @@ mod tests {
             let err = Config::parse(text).unwrap_err();
             assert!(err.contains(key), "{err}");
         }
+    }
+
+    #[test]
+    fn rejects_unknown_over_limit_values() {
+        let err = Config::parse("[limits]\nover_limit = \"maybe\"").unwrap_err();
+        assert!(err.contains("over_limit") || err.contains("maybe"), "{err}");
     }
 
     #[test]

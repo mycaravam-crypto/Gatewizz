@@ -46,6 +46,7 @@ Dependencies are added by the issue that first needs them, not before.
 src/
 ├── ca.rs        # local CA: generation, leaf issuance and cache, DPAPI key file, CurrentUser Root store (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
+├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
 ├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
 ├── process.rs   # client process of a loopback connection via IP Helper, keyed by (pid, start) (#5)

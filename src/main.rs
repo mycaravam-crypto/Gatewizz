@@ -2,6 +2,7 @@
 
 mod ca;
 mod config;
+mod detect;
 mod event;
 mod process;
 mod proxy;

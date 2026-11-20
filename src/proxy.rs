@@ -21,8 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::timeout;
 
-type UpstreamSender = hyper::client::conn::http1::SendRequest<Incoming>;
+type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
 
+use crate::detect::{self, BodyLimits, Inspected};
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
 use crate::tls::{Interceptor, UpstreamTlsFailure};
@@ -60,6 +61,8 @@ pub struct Settings {
     pub shutdown_timeout: Duration,
     /// Decrypts CONNECT tunnels when set; without it every CONNECT is a blind tunnel (M1 behaviour).
     pub tls: Option<Arc<Interceptor>>,
+    /// How much of a request body is read and inspected before any request byte goes upstream.
+    pub body: BodyLimits,
 }
 
 impl Default for Settings {
@@ -74,6 +77,7 @@ impl Default for Settings {
             idle_timeout: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(10),
             tls: None,
+            body: BodyLimits::default(),
         }
     }
 }
@@ -94,6 +98,8 @@ impl Event {
             port: 0,
             path: String::new(),
             coverage: Coverage::Blocked,
+            findings: Vec::new(),
+            model: None,
             status: status.as_u16(),
             reason: Some(reason),
             bytes_up: None,
@@ -224,7 +230,7 @@ async fn forward(
     process: Process,
     mut req: Request<Incoming>,
 ) -> Response<Body> {
-    let mut event = Event {
+    let event = Event {
         time: event::now(),
         client,
         process,
@@ -233,6 +239,8 @@ async fn forward(
         port: req.uri().port_u16().unwrap_or(80),
         path: req.uri().path().to_string(),
         coverage: Coverage::Blocked,
+        findings: Vec::new(),
+        model: None,
         status: 0,
         reason: None,
         bytes_up: None,
@@ -251,8 +259,6 @@ async fn forward(
         Ok(stream) => stream,
         Err(failure) => return refuse(ctx, event, failure.status(), failure.reason()).await,
     };
-    // ponytail: bodies are not inspected before #20, so plain HTTP is only partially inspected.
-    event.coverage = Coverage::PartiallyInspected;
     let authority = req.uri().authority().map(|a| a.as_str().to_string());
     to_origin_form(&mut req, authority);
     let (mut sender, conn) =
@@ -300,6 +306,21 @@ async fn relay(
     sender: &mut UpstreamSender,
     req: Request<Incoming>,
 ) -> Response<Body> {
+    // Plain HTTP and decrypted HTTPS both end here: the body is read and inspected before any request byte is sent.
+    let req = match detect::inspect(req, &ctx.settings.body).await {
+        Inspected::Forward(req, inspection) => {
+            event.findings = inspection.findings;
+            event.model = inspection.model;
+            event.coverage = inspection.coverage;
+            event.bytes_up = inspection.bytes_up;
+            *req
+        }
+        Inspected::Refuse(inspection, status, reason) => {
+            event.findings = inspection.findings;
+            event.coverage = inspection.coverage;
+            return refuse(ctx, event, status, reason).await;
+        }
+    };
     let response = match timeout(ctx.settings.response_timeout, sender.send_request(req)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => return refuse(ctx, event, StatusCode::BAD_GATEWAY, "upstream failed").await,
@@ -335,6 +356,8 @@ async fn tunnel(
         port: req.uri().port_u16().unwrap_or(0),
         path: String::new(),
         coverage: Coverage::Blocked,
+        findings: Vec::new(),
+        model: None,
         status: 0,
         reason: None,
         bytes_up: None,
@@ -515,8 +538,10 @@ async fn inside(
         host: host.to_string(),
         port,
         path: req.uri().path().to_string(),
-        // ponytail: bodies are not inspected before #20, so decrypted requests are only partially inspected.
-        coverage: Coverage::PartiallyInspected,
+        // Set by `relay` once the body has been inspected.
+        coverage: Coverage::Blocked,
+        findings: Vec::new(),
+        model: None,
         status: 0,
         reason: None,
         bytes_up: None,
@@ -1000,6 +1025,134 @@ mod tests {
             .unwrap();
     }
 
+    /// A clearly fake GitHub token, assembled at runtime so no token-shaped literal sits in the source.
+    fn fake_token() -> String {
+        format!("{}{}", ["gh", "p_"].concat(), "x".repeat(36))
+    }
+
+    fn post(upstream: SocketAddr, extra_headers: &str, body: &str) -> String {
+        format!(
+            "POST http://{upstream}/v1/chat/completions HTTP/1.1\r\nHost: {upstream}\r\n{extra_headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn inspects_bodies_and_records_findings_without_content() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        let (events, writer) = event::spawn(
+            crate::config::EventTarget::File(path.clone()),
+            1 << 20,
+            1,
+            16,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, Settings::default(), events, async {
+            let _ = stopped.await;
+        }));
+        let (upstream, mut seen) = recording_upstream().await;
+
+        let token = fake_token();
+        let diff = format!("--- a/.env\n+++ b/.env\n{token}\n");
+        let body = serde_json::json!({
+            "model": "llama3.1:8b",
+            "messages": [{"role": "user", "content": diff}],
+        })
+        .to_string();
+        let response = exchange(proxy, post(upstream, "", &body).as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        // Detection reports; deciding is #21's job, so the request still reaches the upstream unchanged.
+        let received = String::from_utf8(seen.recv().await.unwrap()).unwrap();
+        assert!(received.ends_with(&body), "{received}");
+
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        let mut leaked = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            if text.contains(&token) || text.contains(&token[4..]) {
+                leaked.push(text);
+            }
+        }
+        assert!(leaked.is_empty(), "secret written to disk: {leaked:?}");
+        let line: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(line["coverage"], "inspected");
+        assert_eq!(
+            line["findings"],
+            serde_json::json!([{"kind": "secret.github_token", "count": 1}])
+        );
+        assert_eq!(line["model"], "llama3.1:8b");
+        assert_eq!(line["bytes_up"], body.len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn over_limit_bodies_are_blocked_by_default() {
+        let settings = Settings {
+            body: BodyLimits {
+                max_bytes: 16,
+                ..BodyLimits::default()
+            },
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        let (upstream, mut seen) = recording_upstream().await;
+        for (headers, body) in [
+            ("", "x".repeat(17)),
+            ("Content-Encoding: gzip\r\n", "x".repeat(4)),
+        ] {
+            let response = exchange(proxy, post(upstream, headers, &body).as_bytes()).await;
+            assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+            let event = next_event(&mut events).await;
+            assert_eq!((event.coverage, event.status), (Coverage::Blocked, 413));
+        }
+        // Fail closed: no request byte reached the upstream. (Plain HTTP opens the TCP connection before the body
+        // is read, so the upstream may see an empty connection; decrypted requests already have theirs.)
+        while let Ok(Some(bytes)) = timeout(Duration::from_millis(300), seen.recv()).await {
+            assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
+        }
+    }
+
+    #[tokio::test]
+    async fn over_limit_bodies_pass_partially_inspected_when_allowed() {
+        let settings = Settings {
+            body: BodyLimits {
+                max_bytes: 16,
+                over_limit: detect::OverLimit::Allow,
+            },
+            ..Settings::default()
+        };
+        let (proxy, mut events) = start(settings).await;
+        let (upstream, mut seen) = recording_upstream().await;
+        // Chunked, so the limit is only discovered while reading; the read part and the rest must both arrive.
+        let body = "y".repeat(40);
+        let request = format!(
+            "POST http://{upstream}/up HTTP/1.1\r\nHost: {upstream}\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n14\r\n{}\r\n14\r\n{}\r\n0\r\n\r\n",
+            &body[..20],
+            &body[20..]
+        );
+        let response = exchange(proxy, request.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let received = String::from_utf8(seen.recv().await.unwrap()).unwrap();
+        let payload: String = received
+            .split("\r\n")
+            .filter(|l| l.chars().all(|c| c == 'y') && !l.is_empty())
+            .collect();
+        assert_eq!(payload, body, "{received}");
+        let event = next_event(&mut events).await;
+        assert_eq!(event.coverage, Coverage::PartiallyInspected);
+        assert!(event.findings.is_empty());
+    }
+
     #[tokio::test]
     async fn smuggled_request_never_reaches_upstream() {
         let (proxy, mut events) = start(Settings::default()).await;
@@ -1016,11 +1169,12 @@ mod tests {
             .unwrap()
             .to_lowercase();
         assert!(received.starts_with("post /a http/1.1\r\n"), "{received}");
-        assert!(
-            received.contains("transfer-encoding: chunked"),
-            "{received}"
-        );
-        assert!(!received.contains("content-length"), "{received}");
+        // The inspected body is re-framed with its exact length; neither the client's Content-Length nor its chunked
+        // framing reaches the upstream.
+        assert!(received.contains("content-length: 3\r\n"), "{received}");
+        assert!(!received.contains("content-length: 60"), "{received}");
+        assert!(!received.contains("transfer-encoding"), "{received}");
+        assert!(received.ends_with("\r\n\r\nabc"), "{received}");
         assert!(!received.contains("smuggled"), "{received}");
         assert_eq!(next_event(&mut events).await.path, "/a");
         // The connection was closed after the first response: the trailing request is never forwarded.
