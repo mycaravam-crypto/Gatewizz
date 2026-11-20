@@ -157,43 +157,59 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 
 /// Everything the service allows as "Gatewizz itself": its own copy and the recorded user copies.
 fn service_self_paths() -> Vec<String> {
+    let recorded = std::fs::read_to_string(self_paths_file()).unwrap_or_default();
     let mut paths = vec![protected_exe().to_string_lossy().into_owned()];
-    if let Ok(text) = std::fs::read_to_string(self_paths_file()) {
-        paths.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from),
-        );
-    }
+    paths.extend(parse_self_paths(&recorded));
     paths
+}
+
+/// The non-empty, trimmed lines of the self-paths file.
+fn parse_self_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// The recorded self paths plus `me`, unless `me` is the service's own copy or already recorded (case-insensitive,
+/// as Windows paths are).
+fn merge_self_paths(mut recorded: Vec<String>, me: &str, protected: &Path) -> Vec<String> {
+    if !same_file(Path::new(me), protected) && !recorded.iter().any(|p| p.eq_ignore_ascii_case(me))
+    {
+        recorded.push(me.to_string());
+    }
+    recorded
 }
 
 /// The self paths after this run: the recorded ones plus the executable running now (the user's copy).
 fn merged_self_paths() -> Result<Vec<String>, String> {
-    let mut paths = service_self_paths();
-    paths.remove(0);
-    let me = current_exe()?;
-    if !same_file(Path::new(&me), &protected_exe())
-        && !paths.iter().any(|p| p.eq_ignore_ascii_case(&me))
-    {
-        paths.push(me);
-    }
-    Ok(paths)
+    let recorded = std::fs::read_to_string(self_paths_file()).unwrap_or_default();
+    Ok(merge_self_paths(
+        parse_self_paths(&recorded),
+        &current_exe()?,
+        &protected_exe(),
+    ))
 }
 
-/// Appends a line to the service log, rotating it past [`LOG_MAX`]. Best effort: a failing log never stops the
-/// service.
+/// Appends a line to the service log. Best effort: a failing log never stops the service.
 fn log(line: &str) {
+    log_to(&home().join("service.log"), LOG_MAX, line);
+}
+
+/// Appends one timestamped line (newlines folded) to `path`, first moving a file past `max` bytes to `<path>.1`, so
+/// the log never takes more than about twice `max`.
+fn log_to(path: &Path, max: u64, line: &str) {
     use std::io::Write;
-    let path = home().join("service.log");
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX) {
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > max) {
+        let mut rotated = path.as_os_str().to_owned();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, rotated);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let _ = writeln!(f, "{} {}", crate::event::now(), line.replace('\n', " | "));
     }
@@ -652,6 +668,49 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(local, sorted);
+    }
+
+    #[test]
+    fn self_paths_are_parsed_and_merged_once() {
+        let protected = Path::new(r"C:\Program Files\Gatewizz\gatewizz.exe");
+        let user = r"C:\Users\u\AppData\Local\Programs\Gatewizz\gatewizz.exe";
+        let recorded = parse_self_paths(&format!("\n  {user}  \n\n"));
+        assert_eq!(recorded, [user]);
+        // The same copy again, in other letter case: not added twice.
+        let again = merge_self_paths(recorded.clone(), &user.to_uppercase(), protected);
+        assert_eq!(again, [user]);
+        // The service's own copy is allowed anyway and never recorded.
+        let own = merge_self_paths(
+            recorded.clone(),
+            r"c:\program files\gatewizz\GATEWIZZ.EXE",
+            protected,
+        );
+        assert_eq!(own, [user]);
+        // A second user copy (another install location) is added.
+        let other = r"D:\tools\gatewizz.exe";
+        assert_eq!(merge_self_paths(recorded, other, protected), [user, other]);
+        assert!(parse_self_paths("").is_empty());
+    }
+
+    #[test]
+    fn log_lines_are_single_and_the_log_rotates() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("service.log");
+        log_to(&path, 64, "Applied 3 filter(s)\nwarning: x");
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first.lines().count(), 1, "{first}");
+        assert!(first.contains("Applied 3 filter(s) | warning: x"));
+        // Past the limit the file moves to service.log.1 and a new one starts.
+        log_to(&path, 64, &"y".repeat(80));
+        log_to(&path, 64, "after rotation");
+        let rotated = std::fs::read_to_string(dir.join("service.log.1")).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(rotated.contains("Applied") && rotated.contains("yyyy"));
+        assert_eq!(current.lines().count(), 1);
+        assert!(current.contains("after rotation"));
     }
 
     #[test]

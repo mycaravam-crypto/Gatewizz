@@ -28,6 +28,21 @@ function Check([string] $Name, [bool] $Ok, [string] $Detail = '') {
     else { Write-Host "FAIL  $Name`n$Detail"; $failures.Add($Name) }
 }
 
+# Polls instead of sleeping a fixed time, so a slow runner is not a failure and a fast one does not wait.
+function Wait-Until([scriptblock] $Condition, [int] $Seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    [bool](& $Condition)
+}
+
+function Applied-Count {
+    $log = Join-Path $home_ 'service.log'
+    if (Test-Path $log) { @(Select-String -Path $log -Pattern 'Applied ' -SimpleMatch).Count } else { 0 }
+}
+
 function Filter-Count {
     $r = Invoke-Gatewizz @('firewall', 'status')
     if ($r.Text -match 'installed with (\d+) filter') { [int]$Matches[1] } else { 0 }
@@ -78,24 +93,26 @@ try {
     }
     Check 'Program Files\Gatewizz is not writable by users' (-not $userWrite) ($userWrite | Out-String)
 
-    # One rule, no address-less filters: the self allows for both copies (two layers each) plus the IPv4 block.
+    # Self allows for both copies, the service's and this build's, on two layers each (4), plus the one IPv4 block.
+    # The service applies before it reports running, so they are in force when install returns.
     $count = Filter-Count
-    Check 'filters installed by the service' ($count -ge 3) "filters: $count"
+    $expected = 2 * 2 + 1
+    Check 'filters installed by the service' ($count -eq $expected) "filters: $count, expected $expected"
+    $appliedAtStart = Applied-Count
+    Check 'service log records the first refresh' ($appliedAtStart -ge 1) "applied lines: $appliedAtStart"
 
     $r = Invoke-Gatewizz @('firewall', 'apply', '--config', $two)
     Check 'firewall apply with the service installed succeeds' ($r.Code -eq 0 -and $r.Text -match 'service') $r.Text
     Check 'protected config was updated' ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-block-two')
     Check 'apply added the second rule' ((Filter-Count) -eq $count + 1) "filters: $(Filter-Count)"
 
-    # The service re-reads the protected config on its own; its log shows each refresh.
-    Start-Sleep -Seconds 2
-    $log = Join-Path $home_ 'service.log'
-    Check 'service log records a successful refresh' (
-        (Test-Path $log) -and ((Get-Content -Raw $log) -match 'Applied')) "$(if (Test-Path $log) { Get-Content -Raw $log })"
+    # The reload request makes the service refresh on its own; its log gets another "Applied" line.
+    $reloaded = Wait-Until { (Applied-Count) -gt $appliedAtStart }
+    Check 'service refreshed after the reload request' $reloaded "$(Get-Content -Raw (Join-Path $home_ 'service.log'))"
 
-    # Restarting the service keeps the rules: it reads the protected copy.
+    # Restarting keeps the rules, read from the protected copy. Restart-Service returns once the service reports
+    # running, and it applies before that.
     Restart-Service gatewizz-fw
-    Start-Sleep -Seconds 2
     Check 'filters survive a service restart' ((Filter-Count) -eq $count + 1) "filters: $(Filter-Count)"
 
     $r = Invoke-Gatewizz @('firewall', 'status')
