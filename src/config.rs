@@ -18,6 +18,7 @@ pub struct Config {
     pub limits: Limits,
     pub events: Events,
     pub tls: Tls,
+    pub approval: Approval,
     /// Allow/block rules (#21); see `config/gatewizz.example.toml`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
@@ -111,6 +112,25 @@ pub struct Tls {
     pub tunnel_hosts: Vec<String>,
 }
 
+/// Holding requests for the `approve` action (#34).
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Approval {
+    /// A held request that is not answered within this time is blocked.
+    pub timeout_secs: u64,
+    /// More waiting requests than this are blocked at once.
+    pub max_pending: usize,
+}
+
+impl Default for Approval {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 60,
+            max_pending: 16,
+        }
+    }
+}
+
 /// Where events go once `[events].path` is resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventTarget {
@@ -154,7 +174,7 @@ impl Config {
         if g.allowed_connect_ports.contains(&0) {
             return Err("general.allowed_connect_ports: port 0 is not a valid target".into());
         }
-        rules::validate(&self.rules, g.default_action)?;
+        rules::validate(&self.rules)?;
         let l = &self.limits;
         for (key, value) in [
             ("max_connections", l.max_connections as u64),
@@ -172,6 +192,12 @@ impl Config {
         }
         if l.max_connections > u32::MAX as usize {
             return Err("limits.max_connections: too large".into());
+        }
+        if self.approval.timeout_secs == 0 {
+            return Err("approval.timeout_secs: must be at least 1".into());
+        }
+        if self.approval.max_pending == 0 {
+            return Err("approval.max_pending: must be at least 1".into());
         }
         if self.events.max_file_bytes < 4096 {
             return Err("events.max_file_bytes: must be at least 4096".into());
@@ -206,6 +232,8 @@ impl Config {
             tls: None,
             rules: self.rules.clone(),
             default_action: g.default_action,
+            // Attached by main when the approval window runs.
+            approvals: None,
             body: BodyLimits {
                 max_bytes: l.max_body_bytes,
                 over_limit: l.over_limit,
@@ -364,11 +392,8 @@ mod tests {
     #[test]
     fn rules_are_validated_with_their_index() {
         let approve = "[[rules]]\nid = \"hold\"\naction = \"approve\"\nseverity = \"high\"\n";
-        let err = Config::parse(approve).unwrap_err();
-        assert!(
-            err.contains("rules[0].action") && err.contains("M3"),
-            "{err}"
-        );
+        let rules = Config::parse(approve).unwrap().rules;
+        assert_eq!(rules[0].action, Action::Approve);
         let typo = "[[rules]]\nid = \"x\"\nmatch = { hots = [\"a\"] }\naction = \"block\"\nseverity = \"low\"\n";
         assert!(Config::parse(typo).unwrap_err().contains("hots"));
         let block_all = "[general]\ndefault_action = \"block\"\n";
