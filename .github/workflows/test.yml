@@ -32,3 +32,9 @@ jobs:
       - run: cargo test --locked
       # The release binary, so a PR that breaks the shipping build fails here rather than after merge.
       - run: cargo build --release --locked
+      # The shipping exe must carry the manifest (per-monitor DPI v2, asInvoker) from build.rs (#36).
+      - name: Check embedded manifest
+        run: |
+          foreach ($p in 'PerMonitorV2', 'asInvoker') {
+            if (-not (Select-String -Path target\release\gatewizz.exe -Pattern $p -SimpleMatch -Quiet)) { throw "manifest: $p missing" }
+          }
