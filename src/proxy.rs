@@ -25,7 +25,7 @@ type UpstreamSender = hyper::client::conn::http1::SendRequest<Body>;
 
 use crate::approve::{Approvals, Held, Outcome};
 use crate::detect::{self, BodyLimits, Inspected};
-use crate::event::{self, Coverage, Event};
+use crate::event::{self, Coverage, Event, Record};
 use crate::process::{self, Process};
 use crate::rules::{self, Action, Content, Decision, Facts, Rule};
 use crate::tls::{Interceptor, UpstreamTlsFailure};
@@ -123,7 +123,7 @@ impl Event {
 struct Ctx {
     settings: Settings,
     listen: SocketAddr,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<Record>,
 }
 
 impl Ctx {
@@ -134,7 +134,7 @@ impl Ctx {
     /// Waits when the event queue is full: events are never dropped.
     async fn emit(&self, event: Event) {
         // A closed receiver means shutdown; nothing is left to record to.
-        let _ = self.events.send(event).await;
+        let _ = self.events.send(event.into()).await;
     }
 }
 
@@ -144,7 +144,7 @@ impl Ctx {
 pub async fn serve(
     listener: TcpListener,
     settings: Settings,
-    events: mpsc::Sender<Event>,
+    events: mpsc::Sender<Record>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     let listen = listener.local_addr()?;
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     /// End to end: a proxy on an ephemeral port with the given settings.
-    async fn start(settings: Settings) -> (SocketAddr, mpsc::Receiver<Event>) {
+    async fn start(settings: Settings) -> (SocketAddr, mpsc::Receiver<Record>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (events, received) = mpsc::channel(16);
@@ -1104,11 +1104,15 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    async fn next_event(events: &mut mpsc::Receiver<Event>) -> Event {
-        timeout(Duration::from_secs(5), events.recv())
+    async fn next_event(events: &mut mpsc::Receiver<crate::event::Record>) -> Event {
+        match timeout(Duration::from_secs(5), events.recv())
             .await
             .unwrap()
             .unwrap()
+        {
+            crate::event::Record::Request(event) => event,
+            other => panic!("expected a request event, got {other:?}"),
+        }
     }
 
     /// An upstream that answers each request after `delay`, and reports when a request head arrived.

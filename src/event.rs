@@ -59,6 +59,53 @@ pub struct Event {
     pub rule: Option<String>,
 }
 
+/// Whether a monitored connection appeared or went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    Opened,
+    Closed,
+}
+
+/// A connection seen by the monitor (#57). Metadata only: no bytes of the connection are ever read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConnectionEvent {
+    /// Always `"connection"`; request events have no `kind`, so existing readers can tell them apart.
+    pub kind: &'static str,
+    pub time: String,
+    pub state: ConnectionState,
+    pub process: Process,
+    pub protocol: &'static str,
+    pub direction: crate::connections::Direction,
+    pub remote_ip: std::net::IpAddr,
+    pub port: u16,
+    /// From the DNS cache; `None` when no lookup for this address was seen (DoH, hard-coded IPs, expired entries).
+    pub hostname: Option<String>,
+    /// The first connection from this program to this host (or IP) since Gatewizz started.
+    pub first_seen: bool,
+    /// Events of the same kind for the same process and remote left out since the last one (rate limit).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One line of the event log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Record {
+    Request(Event),
+    Connection(ConnectionEvent),
+}
+
+impl From<Event> for Record {
+    fn from(event: Event) -> Self {
+        Record::Request(event)
+    }
+}
+
 /// The current time as RFC 3339 UTC with milliseconds.
 pub fn now() -> String {
     let d = SystemTime::now()
@@ -194,9 +241,9 @@ pub fn spawn(
     max_file_bytes: u64,
     keep_files: usize,
     capacity: usize,
-) -> Result<(mpsc::Sender<Event>, Writer), String> {
+) -> Result<(mpsc::Sender<Record>, Writer), String> {
     let mut out = Out::open(target, max_file_bytes, keep_files)?;
-    let (tx, mut rx) = mpsc::channel::<Event>(capacity);
+    let (tx, mut rx) = mpsc::channel::<Record>(capacity);
     let handle = std::thread::Builder::new()
         .name("events".into())
         .spawn(move || {
@@ -327,7 +374,7 @@ mod tests {
         let (tx, handle) = spawn(EventTarget::File(path.clone()), 1 << 20, 1, 1).unwrap();
         for i in 0..20 {
             // Capacity 1: this waits for the writer instead of dropping.
-            tx.blocking_send(event(&format!("/n{i}"))).unwrap();
+            tx.blocking_send(event(&format!("/n{i}")).into()).unwrap();
         }
         drop(tx);
         handle.join().unwrap().unwrap();

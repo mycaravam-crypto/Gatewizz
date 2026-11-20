@@ -12,6 +12,9 @@ and allows, blocks or holds it for approval before any byte goes upstream. Every
 **Out until a concrete need:** system-wide proxy, Windows service, WFP/transparent capture, HTTP/2, QUIC, database,
 web UI or API, AI analysis, Linux.
 
+**Connection firewall (#56):** Phase 1, a read-only, no-admin connection monitor (`[monitor]`, #57), is in. A Windows
+service and WFP stay out until Phase 2 (#59) is taken up. That decision gets recorded here when it is made.
+
 ## 2. YAGNI and engineering rules
 
 The [smartwizz engineering standard](https://github.com/mycaravam-crypto/smartwizz/blob/main/ENGINEERING_STANDARD.md)
@@ -47,6 +50,8 @@ src/
 ├── approve.rs   # approval queue: hold, allow once/deny/allow for N min; timeout, full, no window, pause block (#34)
 ├── ca.rs        # local CA: generation, leaf issuance and cache, DPAPI key file, CurrentUser Root store (#18)
 ├── config.rs    # TOML config: defaults, unknown keys rejected, errors name the key (#4)
+├── connections.rs # connection monitor: TCP table sampling, snapshot diff, rate limit, live list (#57)
+├── dns.rs       # IP → hostname cache for the monitor, filled from the Windows DNS Client cache (#57)
 ├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
 ├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
@@ -55,7 +60,7 @@ src/
 ├── proxy.rs     # HTTP/1.1 forward proxy and CONNECT tunnels; streams bodies, never retries (#3)
 ├── tls.rs       # CONNECT interception: leaf per host, verified upstream TLS, http/1.1 only, tunnel_hosts (#19)
 ├── startup.rs   # per-user Run registration and per-session single-instance mutex (Windows only)
-└── ui.rs        # tray icon, approval window and activity history with filters and CSV copy (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35, #45, #51, #53)
+└── ui.rs        # tray icon, approval window, activity history with filters and CSV copy, Network tab (eframe/egui, tray-icon; Windows only); proxy on its own thread (#35, #45, #51, #53, #57)
 ```
 
 Request framing is parsed by hyper alone and re-framed towards the upstream, so client and upstream cannot disagree
@@ -67,7 +72,8 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 |---|---|---|---|
 | **M1: See it** | Proxy, CONNECT, attribution, config, events, CI/release | `smartwizz check` works unchanged through gatewizz; each connection is logged with process and host | code complete and released; real-Windows acceptance pending (#17) |
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
-| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; real-Windows UI and startup acceptance remain open in #35 and #36 |
+| **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
+| **F1: See every connection** (#56 Phase 1) | Read-only connection monitor: TCP tables per process, DNS-cache hostnames, `connection` events, Network tab | Every outgoing TCP connection is visible with its process and, where the DNS cache knows it, its hostname, without admin rights | implemented (#57); Windows CI test for the sampler; manual acceptance and overhead measurement pending |
 
 ## 6. Quality gates
 
@@ -79,3 +85,5 @@ bash .github/scripts/semver-next.test.sh
 ```
 
 **Performance budget:** under 5 ms added p50 for requests without a body (from M1). `proxy::tests::bodyless_requests_stay_within_the_latency_budget` checks it on every CI run (direct vs proxied keep-alive GETs on loopback; print the numbers with `cargo test --release latency -- --nocapture`). Real-world overhead is measured with powerwizz.
+
+**Manual acceptance:** `scripts/windows-acceptance.ps1` runs the remaining real-Windows checks of M1–M3 (#17, #22, #35, #36) and writes a report for the issues; CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.

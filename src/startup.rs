@@ -31,9 +31,7 @@ pub fn install(config: Option<&Path>) -> Result<String, String> {
         .map_err(|error| format!("[startup] cannot locate executable: {error}"))?;
     let mut command = quote_arg(&executable);
     if let Some(path) = config {
-        let path = path
-            .canonicalize()
-            .map_err(|error| format!("[startup] cannot resolve config path: {error}"))?;
+        let path = config_path(path)?;
         command.push_str(" --config ");
         command.push_str(&quote_arg(&path));
     }
@@ -116,6 +114,20 @@ pub fn status() -> Result<Option<String>, String> {
     Err("[startup] automatic login startup is supported only on Windows".into())
 }
 
+/// The config path as stored in the Run entry: absolute, without the `\\?\` prefix `canonicalize` adds on Windows,
+/// and pointing at an existing file.
+fn config_path(path: &Path) -> Result<std::path::PathBuf, String> {
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("[startup] cannot resolve config path: {error}"))?;
+    if !absolute.is_file() {
+        return Err(format!(
+            "[startup] config file not found: {}",
+            absolute.display()
+        ));
+    }
+    Ok(absolute)
+}
+
 /// Quotes one Windows command-line argument using the CommandLineToArgvW/CRT backslash rules.
 #[cfg(windows)]
 fn quote_arg(value: &Path) -> String {
@@ -182,6 +194,31 @@ impl Drop for SingleInstance {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn config_path_is_absolute_plain_and_must_exist() {
+        use super::config_path;
+        use std::path::Component;
+        let dir = std::env::temp_dir().join(format!("gatewizz-startup-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("gatewizz.toml"), "").unwrap();
+        let resolved = config_path(&dir.join("sub").join("..").join("gatewizz.toml"));
+        let missing = config_path(&dir.join("missing.toml"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let resolved = resolved.unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{resolved:?}"
+        );
+        assert!(
+            !resolved.components().any(|c| c == Component::ParentDir),
+            "{resolved:?}"
+        );
+        assert!(resolved.ends_with("gatewizz.toml"));
+        assert!(missing.unwrap_err().contains("not found"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn quotes_paths_with_spaces() {

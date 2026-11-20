@@ -10,7 +10,9 @@
 mod approve;
 mod ca;
 mod config;
+mod connections;
 mod detect;
+mod dns;
 mod event;
 mod process;
 mod proxy;
@@ -180,6 +182,7 @@ fn proxy_settings(
 fn run_proxy(
     config: &Config,
     approvals: Option<std::sync::Arc<approve::Approvals>>,
+    live: std::sync::Arc<connections::Live>,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
     let mut settings = proxy_settings(config, config::data_dir())?;
@@ -191,6 +194,16 @@ fn run_proxy(
         config.events.keep_files,
         EVENT_QUEUE,
     )?;
+    // The monitor holds its own event sender, so it stops before the writer is joined.
+    let monitor = if config.monitor.enabled {
+        Some(connections::start(
+            config.monitor.settings(),
+            events.clone(),
+            live,
+        )?)
+    } else {
+        None
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -208,11 +221,12 @@ fn run_proxy(
     // Ending the runtime cancels what is left (tunnels), which drops the last event senders, so the writer drains
     // its queue and stops.
     runtime.shutdown_timeout(Duration::from_secs(1));
+    let monitored = monitor.map_or(Ok(()), connections::Monitor::stop);
     let flushed = writer
         .join()
         .map_err(|_| "[events] writer panicked".to_string())
         .and_then(|result| result);
-    served.and(flushed)
+    served.and(monitored).and(flushed)
 }
 
 /// On Windows the tray and approval window own the main thread; Quit, Ctrl+C or console close stop the proxy.
@@ -227,21 +241,29 @@ fn run_with_ui(config: Config) -> Result<(), String> {
         config::EventTarget::Stdout => None,
     };
     let queue = approvals.clone();
-    ui::run(config.general.listen, events_path, approvals, move |quit| {
-        run_proxy(&config, Some(queue), async move {
-            tokio::select! {
-                () = cancelled() => {}
-                _ = quit => {}
-            }
-        })
-    })
+    let live = std::sync::Arc::new(connections::Live::default());
+    let network = config.monitor.enabled.then(|| live.clone());
+    ui::run(
+        config.general.listen,
+        events_path,
+        approvals,
+        network,
+        move |quit| {
+            run_proxy(&config, Some(queue), live, async move {
+                tokio::select! {
+                    () = cancelled() => {}
+                    _ = quit => {}
+                }
+            })
+        },
+    )
 }
 
 /// Elsewhere gatewizz is a console proxy that runs until Ctrl+C.
 #[cfg(not(windows))]
 fn run_with_ui(config: Config) -> Result<(), String> {
     // No approval window here, so `approve` rules block (fail closed).
-    run_proxy(&config, None, cancelled())
+    run_proxy(&config, None, Default::default(), cancelled())
 }
 
 fn run(command: Command) -> Result<ExitCode, String> {

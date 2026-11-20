@@ -84,6 +84,49 @@ fn duration_label(minutes: u32) -> String {
     }
 }
 
+/// Connections grouped by program for the Network tab, programs sorted by name. `filter` matches the program, the
+/// hostname or the IP, ignoring case.
+fn network_groups<'a>(
+    connections: &'a [crate::connections::LiveConnection],
+    filter: &str,
+) -> Vec<(String, Vec<&'a crate::connections::LiveConnection>)> {
+    let filter = filter.trim().to_lowercase();
+    let mut groups: Vec<(String, Vec<&crate::connections::LiveConnection>)> = Vec::new();
+    for conn in connections {
+        let name = program(&conn.process);
+        let matches = filter.is_empty()
+            || name.to_lowercase().contains(&filter)
+            || conn
+                .hostname
+                .as_deref()
+                .is_some_and(|h| h.to_lowercase().contains(&filter))
+            || conn.remote.ip().to_string().contains(&filter);
+        if !matches {
+            continue;
+        }
+        match groups.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, list)) => list.push(conn),
+            None => groups.push((name, vec![conn])),
+        }
+    }
+    groups.sort_by_key(|(name, _)| name.to_lowercase());
+    groups
+}
+
+/// The distinct PIDs behind a group of connections, in ascending order.
+fn process_ids(list: &[&crate::connections::LiveConnection]) -> Vec<u32> {
+    let mut pids: Vec<u32> = list
+        .iter()
+        .filter_map(|c| match c.process {
+            Process::Known { pid, .. } => Some(pid),
+            Process::Unknown(_) => None,
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 #[cfg(windows)]
 pub use app::run;
 
@@ -107,8 +150,11 @@ mod app {
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
-    use super::{TrayState, countdown, duration_label, icon_rgba, program};
+    use super::{
+        TrayState, countdown, duration_label, icon_rgba, network_groups, process_ids, program,
+    };
     use crate::approve::{Approvals, Held, Verdict, Window};
+    use crate::connections::{Direction, Live};
     use crate::process::Process;
     use crate::rules::Action;
 
@@ -137,6 +183,7 @@ mod app {
         listen: SocketAddr,
         events_path: Option<PathBuf>,
         approvals: Arc<Approvals>,
+        network: Option<Arc<Live>>,
         proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
         let (quit, stop) = tokio::sync::oneshot::channel();
@@ -153,12 +200,21 @@ mod app {
             "gatewizz",
             options,
             Box::new(move |cc| {
-                App::new(cc, listen, events_path, approvals, quit, stop, proxy)
-                    .map(|app| Box::new(app) as Box<dyn eframe::App>)
-                    .map_err(|error| {
-                        Box::new(std::io::Error::other(error))
-                            as Box<dyn std::error::Error + Send + Sync>
-                    })
+                App::new(
+                    cc,
+                    listen,
+                    events_path,
+                    approvals,
+                    network,
+                    quit,
+                    stop,
+                    proxy,
+                )
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|error| {
+                    Box::new(std::io::Error::other(error))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })
             }),
         );
         // The app owns the stop signal and the thread; dropping it (on any exit) has stopped the proxy.
@@ -213,12 +269,16 @@ mod app {
         address_copied: Option<Instant>,
         /// When the CSV was last copied, and how many rows.
         csv_copied: Option<(Instant, usize)>,
+        /// The connection monitor's live list, when `[monitor] enabled` (#57).
+        network: Option<Arc<Live>>,
+        network_filter: String,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Tab {
         Overview,
         Activity,
+        Network,
     }
 
     const MAX_LOG_ROTATIONS: usize = 5;
@@ -229,6 +289,8 @@ mod app {
     #[derive(Debug, Clone, Default, serde::Deserialize)]
     #[serde(default)]
     struct HistoryEvent {
+        /// Set on records that are not requests (`"connection"` from the monitor); those are not activity rows.
+        kind: Option<String>,
         time: String,
         host: String,
         status: u16,
@@ -278,11 +340,13 @@ mod app {
     }
 
     impl App {
+        #[allow(clippy::too_many_arguments)]
         fn new(
             cc: &eframe::CreationContext,
             listen: SocketAddr,
             events_path: Option<PathBuf>,
             approvals: Arc<Approvals>,
+            network: Option<Arc<Live>>,
             quit: tokio::sync::oneshot::Sender<()>,
             stop: tokio::sync::oneshot::Receiver<()>,
             proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String>
@@ -394,6 +458,8 @@ mod app {
                 history_worker,
                 address_copied: None,
                 csv_copied: None,
+                network,
+                network_filter: String::new(),
             })
         }
 
@@ -724,7 +790,9 @@ mod app {
                 contents.drain(..=newline);
             }
             for line in contents.lines().rev() {
-                if let Ok(event) = serde_json::from_str::<HistoryEvent>(line) {
+                if let Ok(event) = serde_json::from_str::<HistoryEvent>(line)
+                    && event.kind.is_none()
+                {
                     rows.push(event);
                     if rows.len() >= MAX_HISTORY_ROWS {
                         return rows;
@@ -921,6 +989,7 @@ mod app {
                         for (tab, label, badge) in [
                             (Tab::Overview, "Overview", waiting),
                             (Tab::Activity, "Activity", 0),
+                            (Tab::Network, "Network", 0),
                         ] {
                             let selected = self.tab == tab;
                             let mut button = egui::Button::new(
@@ -1375,6 +1444,187 @@ mod app {
             });
         }
 
+        /// Live connections per program (#57). Read-only: the monitor never blocks anything.
+        fn network(&mut self, ui: &mut egui::Ui) {
+            let Some(live) = self.network.clone() else {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    caption(ui, "CONNECTION MONITOR IS OFF");
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Turn it on to see every outgoing TCP connection on this computer, per program, with \
+                             the hostname where Windows' DNS cache knows it. It only watches; nothing is blocked.",
+                        )
+                        .size(13.0)
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("[monitor]\nenabled = true")
+                            .font(mono(12.5))
+                            .color(TEXT),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Add this to your configuration file and restart Gatewizz.")
+                            .size(12.0)
+                            .color(SUBTLE),
+                    );
+                });
+                return;
+            };
+            // The sampler updates about once a second; follow it while this tab is visible.
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            let state = live.snapshot();
+            let groups = network_groups(&state.connections, &self.network_filter);
+            let new = state.connections.iter().filter(|c| c.first_seen).count();
+
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.network_filter)
+                        .hint_text("Search program, host or IP")
+                        .desired_width(240.0)
+                        .margin(Margin::symmetric(10, 6)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} connections · {} programs · {new} new",
+                        state.connections.len(),
+                        groups.len()
+                    ))
+                    .size(12.5)
+                    .color(MUTED),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let age = state.sampled.map(|at| at.elapsed().as_secs());
+                    let text = match age {
+                        Some(0 | 1) => "Live".to_string(),
+                        Some(secs) => format!("Updated {secs} s ago"),
+                        None => "Starting…".to_string(),
+                    };
+                    ui.label(RichText::new(text).size(12.0).color(SUBTLE));
+                });
+            });
+            ui.add_space(10.0);
+            if let Some(error) = &state.error {
+                card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        dot(ui, RED, 4.0);
+                        ui.label(RichText::new(error).size(13.0).color(TEXT));
+                    });
+                });
+                ui.add_space(10.0);
+            }
+            if let Some(error) = &state.dns_error {
+                ui.horizontal(|ui| {
+                    dot(ui, AMBER, 3.5);
+                    ui.label(
+                        RichText::new(format!("Hostnames unavailable: {error}"))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(8.0);
+            }
+            if groups.is_empty() {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(if self.network_filter.trim().is_empty() {
+                            "No outgoing connections right now."
+                        } else {
+                            "No connection matches the search."
+                        })
+                        .size(13.0)
+                        .color(MUTED),
+                    );
+                });
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (name, list) in &groups {
+                        card()
+                            .inner_margin(Margin::symmetric(16, 12))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(name).font(semibold(14.0)).color(TEXT));
+                                    ui.label(
+                                        RichText::new(format!("{}", list.len()))
+                                            .size(12.0)
+                                            .color(SUBTLE),
+                                    );
+                                    // Several instances of one program share a group; name the PID only
+                                    // when there is one.
+                                    let label = match process_ids(list).as_slice() {
+                                        [] => None,
+                                        [pid] => Some(format!("PID {pid}")),
+                                        pids => Some(format!("{} processes", pids.len())),
+                                    };
+                                    if let Some(label) = label {
+                                        ui.label(
+                                            RichText::new(label).font(mono(11.5)).color(SUBTLE),
+                                        );
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                for conn in list {
+                                    ui.horizontal(|ui| {
+                                        let host = conn
+                                            .hostname
+                                            .clone()
+                                            .unwrap_or_else(|| conn.remote.ip().to_string());
+                                        dot(
+                                            ui,
+                                            if conn.first_seen { AMBER } else { GREEN },
+                                            3.5,
+                                        );
+                                        ui.add_sized(
+                                            [280.0, 20.0],
+                                            egui::Label::new(
+                                                RichText::new(host).size(13.0).color(TEXT),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.add_sized(
+                                            [220.0, 20.0],
+                                            egui::Label::new(
+                                                RichText::new(conn.remote.to_string())
+                                                    .font(mono(12.0))
+                                                    .color(MUTED),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.label(
+                                            RichText::new(match conn.direction {
+                                                Direction::Outbound => "TCP out",
+                                                Direction::Inbound => "TCP in",
+                                            })
+                                            .size(12.0)
+                                            .color(SUBTLE),
+                                        );
+                                        if conn.first_seen {
+                                            badge(ui, "New", AMBER);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(if conn.first_seen {
+                                        "First connection from this program to this host since Gatewizz started"
+                                    } else {
+                                        "Seen before since Gatewizz started"
+                                    });
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+        }
+
         fn empty_history_message(&self) -> &'static str {
             if self.events_path.is_some() {
                 "No events recorded yet. New requests appear here automatically."
@@ -1666,6 +1916,7 @@ mod app {
                     match self.tab {
                         Tab::Overview => self.overview(ui, &pending),
                         Tab::Activity => self.activity(ui),
+                        Tab::Network => self.network(ui),
                     }
                 });
 
@@ -1694,6 +1945,28 @@ mod app {
     #[cfg(test)]
     mod history_tests {
         use super::*;
+
+        #[test]
+        fn connection_records_are_not_activity_rows() {
+            let dir =
+                std::env::temp_dir().join(format!("gatewizz-history-kind-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("events.jsonl");
+            std::fs::write(
+                &path,
+                concat!(
+                    r#"{"time":"2026-11-20T11:00:00Z","host":"example.com","status":200,"action":"allow"}"#,
+                    "\n",
+                    r#"{"kind":"connection","time":"2026-11-20T11:00:01Z","state":"opened","remote_ip":"1.1.1.1","port":443}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let rows = load_history(&path);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "example.com");
+        }
 
         #[test]
         fn bounded_tail_survives_offset_inside_utf8_character() {
@@ -1816,6 +2089,64 @@ mod app {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(image: &str, host: Option<&str>, remote: &str) -> crate::connections::LiveConnection {
+        conn_pid(1, image, host, remote)
+    }
+
+    fn conn_pid(
+        pid: u32,
+        image: &str,
+        host: Option<&str>,
+        remote: &str,
+    ) -> crate::connections::LiveConnection {
+        crate::connections::LiveConnection {
+            process: Process::Known {
+                pid,
+                start: 1,
+                image: image.into(),
+                user: String::new(),
+            },
+            remote: remote.parse().unwrap(),
+            hostname: host.map(str::to_string),
+            direction: crate::connections::Direction::Outbound,
+            first_seen: false,
+            opened: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn network_groups_by_program_and_filters_program_host_or_ip() {
+        let list = [
+            conn(
+                r"C:\b\Zed.exe",
+                Some("api.example.com"),
+                "93.184.215.14:443",
+            ),
+            conn(r"C:\a\curl.exe", None, "1.1.1.1:443"),
+            conn(r"C:\b\Zed.exe", Some("cdn.example.net"), "151.101.1.1:443"),
+        ];
+        let groups = network_groups(&list, "");
+        let names: Vec<_> = groups.iter().map(|(n, l)| (n.as_str(), l.len())).collect();
+        assert_eq!(names, [("curl.exe", 1), ("Zed.exe", 2)]);
+        assert_eq!(network_groups(&list, "ZED")[0].1.len(), 2);
+        assert_eq!(network_groups(&list, "Example.NET")[0].1.len(), 1);
+        let by_ip = network_groups(&list, "1.1.1.1");
+        assert_eq!((by_ip.len(), by_ip[0].0.as_str()), (1, "curl.exe"));
+        assert!(network_groups(&list, "nothing").is_empty());
+    }
+
+    #[test]
+    fn process_ids_counts_each_instance_once() {
+        let list = [
+            conn_pid(7, r"C:\\a\\app.exe", None, "1.1.1.1:443"),
+            conn_pid(3, r"C:\\a\\app.exe", None, "8.8.8.8:443"),
+            conn_pid(7, r"C:\\a\\app.exe", None, "9.9.9.9:443"),
+        ];
+        let refs: Vec<_> = list.iter().collect();
+        assert_eq!(process_ids(&refs), [3, 7]);
+        assert_eq!(process_ids(&refs[..1]), [7]);
+    }
 
     #[test]
     fn tray_state_prefers_waiting_then_paused() {
