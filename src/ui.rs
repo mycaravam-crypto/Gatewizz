@@ -81,10 +81,12 @@ pub use app::run;
 
 #[cfg(windows)]
 mod app {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
     use std::net::SocketAddr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -97,6 +99,7 @@ mod app {
     use super::{TrayState, icon_rgba, program};
     use crate::approve::{Approvals, Verdict, Window};
     use crate::process::Process;
+    use crate::rules::Action;
 
     const BG: Color32 = Color32::from_rgb(0x0d, 0x11, 0x18);
     const PANEL: Color32 = Color32::from_rgb(0x15, 0x1b, 0x25);
@@ -121,8 +124,8 @@ mod app {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("gatewizz: approval")
-                .with_inner_size([780.0, 560.0])
-                .with_min_inner_size([640.0, 460.0])
+                .with_inner_size([980.0, 700.0])
+                .with_min_inner_size([760.0, 560.0])
                 .with_resizable(true)
                 .with_visible(false),
             ..Default::default()
@@ -179,6 +182,67 @@ mod app {
         events_path: Option<PathBuf>,
         quit: Option<tokio::sync::oneshot::Sender<()>>,
         proxy: Option<JoinHandle<Result<(), String>>>,
+        tab: Tab,
+        history_filter: String,
+        history: Vec<HistoryEvent>,
+        history_rx: Receiver<Vec<HistoryEvent>>,
+        history_stop: Sender<()>,
+        history_worker: Option<JoinHandle<()>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Tab {
+        Overview,
+        Activity,
+    }
+
+    const MAX_LOG_ROTATIONS: usize = 5;
+    const MAX_HISTORY_ROWS: usize = 500;
+    const MAX_HISTORY_FILE_BYTES: u64 = 1024 * 1024;
+    const HISTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+    #[derive(Debug, Clone, Default, serde::Deserialize)]
+    #[serde(default)]
+    struct HistoryEvent {
+        time: String,
+        host: String,
+        status: u16,
+        action: Option<Action>,
+        process: HistoryProcess,
+    }
+
+    #[derive(Debug, Clone, Default, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum HistoryProcess {
+        Known {
+            image: String,
+        },
+        Unknown(String),
+        #[default]
+        Unavailable,
+    }
+
+    impl HistoryEvent {
+        fn process_name(&self) -> String {
+            match &self.process {
+                HistoryProcess::Known { image } => image
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(image)
+                    .to_string(),
+                HistoryProcess::Unknown(reason) => format!("unknown ({reason})"),
+                HistoryProcess::Unavailable => "unknown".into(),
+            }
+        }
+
+        fn decision(&self) -> &'static str {
+            match self.action {
+                Some(Action::Allow) => "allow",
+                Some(Action::Block) => "block",
+                Some(Action::Approve) => "approve",
+                None => "-",
+            }
+        }
     }
 
     impl App {
@@ -221,6 +285,31 @@ mod app {
                     }
                 });
             });
+            let (history_tx, history_rx) = mpsc::channel();
+            let (history_stop, stop_history) = mpsc::channel();
+            let history_worker = if let Some(history_path) = events_path.clone() {
+                let history_ctx = cc.egui_ctx.clone();
+                Some(
+                    std::thread::Builder::new()
+                        .name("activity-history".into())
+                        .spawn(move || {
+                            loop {
+                                if history_tx.send(load_history(&history_path)).is_err() {
+                                    break;
+                                }
+                                history_ctx.request_repaint();
+                                match stop_history.recv_timeout(HISTORY_REFRESH_INTERVAL) {
+                                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                }
+                            }
+                        })
+                        .map_err(|e| format!("[ui] cannot start activity history worker: {e}"))?,
+                )
+            } else {
+                None
+            };
+
             let items = Items {
                 pause: MenuItem::new("Pause", true, None),
                 open_log: MenuItem::new("Open event log", events_path.is_some(), None),
@@ -263,6 +352,12 @@ mod app {
                 events_path,
                 quit: Some(quit),
                 proxy: Some(proxy),
+                tab: Tab::Overview,
+                history_filter: String::new(),
+                history: Vec::new(),
+                history_rx,
+                history_stop,
+                history_worker,
             })
         }
 
@@ -320,6 +415,14 @@ mod app {
         }
     }
 
+    fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(105.0);
+            ui.label(RichText::new(value).size(21.0).strong().color(color));
+            ui.label(RichText::new(label).size(9.0).strong().color(MUTED));
+        });
+    }
+
     fn metadata(ui: &mut egui::Ui, key: &str, value: &str) {
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -328,6 +431,59 @@ mod app {
             );
             ui.label(RichText::new(value).size(11.0));
         });
+    }
+
+    /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
+    /// Accepts a borrowed path so callers do not need to allocate a `PathBuf`.
+    /// `path` comes from the local events.path configuration, which intentionally supports custom locations.
+    fn load_history(path: &Path) -> Vec<HistoryEvent> {
+        let mut rows = Vec::new();
+        for suffix in 0..=MAX_LOG_ROTATIONS {
+            let candidate = if suffix == 0 {
+                path.to_path_buf()
+            } else {
+                let mut name = path.as_os_str().to_owned();
+                name.push(format!(".{suffix}"));
+                PathBuf::from(name)
+            };
+            let Ok(mut file) = File::open(candidate) else {
+                continue;
+            };
+            let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+                continue;
+            };
+            let offset = length.saturating_sub(MAX_HISTORY_FILE_BYTES);
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if file
+                .take(MAX_HISTORY_FILE_BYTES)
+                .read_to_end(&mut bytes)
+                .is_err()
+            {
+                continue;
+            }
+            // The bounded offset may land inside a UTF-8 code point. Decode lossily so one
+            // partial character cannot discard otherwise valid recent log records.
+            let mut contents = String::from_utf8_lossy(&bytes).into_owned();
+            // A bounded tail can begin halfway through a JSON line. Discard that partial record.
+            if offset > 0 {
+                let Some(newline) = contents.find('\n') else {
+                    continue;
+                };
+                contents.drain(..=newline);
+            }
+            for line in contents.lines().rev() {
+                if let Ok(event) = serde_json::from_str::<HistoryEvent>(line) {
+                    rows.push(event);
+                    if rows.len() >= MAX_HISTORY_ROWS {
+                        return rows;
+                    }
+                }
+            }
+        }
+        rows
     }
 
     fn icon(state: TrayState) -> Icon {
@@ -356,6 +512,9 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            while let Ok(history) = self.history_rx.try_recv() {
+                self.history = history;
+            }
             while let Ok(wake) = self.wake.try_recv() {
                 match wake {
                     Wake::Tray(TrayIconEvent::Click {
@@ -431,7 +590,79 @@ mod app {
                     .size(11.0).color(MUTED));
                 ui.add_space(10.0);
                 ui.separator();
-                ui.add_space(8.0);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let overview = ui.selectable_label(self.tab == Tab::Overview, "  Overview  ");
+                    if overview.clicked() { self.tab = Tab::Overview; }
+                    let activity = ui.selectable_label(self.tab == Tab::Activity, "  Activity history  ");
+                    if activity.clicked() { self.tab = Tab::Activity; }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{} pending", pending.len())).size(10.0).color(AMBER));
+                    });
+                });
+                ui.separator();
+                if self.tab == Tab::Activity {
+                    let rows = &self.history;
+                    let blocked = rows.iter().filter(|event| event.action == Some(Action::Block)).count();
+                    let allowed = rows.len().saturating_sub(blocked);
+                    ui.horizontal(|ui| {
+                        stat_card(ui, "RECENT EVENTS", &rows.len().to_string(), BLUE);
+                        stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
+                        stat_card(ui, "OTHER", &allowed.to_string(), GREEN);
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("ACTIVITY").strong().size(11.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.history_filter).hint_text("Filter host or process...").desired_width(220.0));
+                        });
+                    });
+                    ui.add_space(5.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        egui::Grid::new("activity_grid").striped(true).num_columns(5).show(ui, |ui| {
+                            for heading in ["TIME (UTC)", "APPLICATION", "DESTINATION", "DECISION", "STATUS"] {
+                                ui.label(RichText::new(heading).size(9.0).strong().color(MUTED));
+                            }
+                            ui.end_row();
+                            let filter = self.history_filter.to_lowercase();
+                            for event in rows.iter().filter(|event| {
+                                let hay = format!("{} {}", event.host, event.process_name()).to_lowercase();
+                                filter.is_empty() || hay.contains(&filter)
+                            }) {
+                                let decision = event.decision();
+                                let color = match event.action {
+                                    Some(Action::Block) => RED,
+                                    Some(Action::Approve) => AMBER,
+                                    _ => GREEN,
+                                };
+                                ui.label(RichText::new(event.time.replace('T', " ").trim_end_matches('Z').to_string()).size(10.0).color(MUTED));
+                                ui.label(RichText::new(event.process_name()).size(10.0));
+                                ui.label(RichText::new(&event.host).size(10.0).color(BLUE));
+                                ui.label(RichText::new(decision).size(10.0));
+                                ui.label(RichText::new(event.status.to_string()).size(10.0).strong().color(color));
+                                ui.end_row();
+                            }
+                        });
+                        if rows.is_empty() {
+                            ui.add_space(12.0);
+                            let message = if self.events_path.is_some() { "No events recorded yet. New requests will appear here automatically." } else { "Persistent history is disabled because events are sent to stdout." };
+                            ui.label(RichText::new(message).color(MUTED));
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("History contains request metadata only. Bodies, header values and query strings are never stored.").size(10.0).color(MUTED));
+                    return;
+                }
+                let recent = &self.history;
+                let blocked = recent.iter().filter(|event| event.action == Some(Action::Block)).count();
+                let allowed = recent.len().saturating_sub(blocked);
+                ui.horizontal(|ui| {
+                    stat_card(ui, "RECENT REQUESTS", &recent.len().to_string(), BLUE);
+                    stat_card(ui, "BLOCKED", &blocked.to_string(), RED);
+                    stat_card(ui, "OTHER DECISIONS", &allowed.to_string(), GREEN);
+                    stat_card(ui, "AWAITING REVIEW", &pending.len().to_string(), AMBER);
+                });
+                ui.add_space(10.0);
 
                 ui.columns(2, |columns| {
                     columns[0].set_min_width(205.0);
@@ -600,6 +831,10 @@ mod app {
         }
 
         fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+            let _ = self.history_stop.send(());
+            if let Some(worker) = self.history_worker.take() {
+                let _ = worker.join();
+            }
             self.approvals.set_paused(true);
             if let Some(quit) = self.quit.take() {
                 let _ = quit.send(());
@@ -609,6 +844,40 @@ mod app {
                     .unwrap_or_else(|_| Err("[network] proxy panicked".into()))
             });
             *APP_RESULT.lock().expect("result poisoned") = result;
+        }
+    }
+
+    #[cfg(test)]
+    mod history_tests {
+        use super::*;
+
+        #[test]
+        fn bounded_tail_survives_offset_inside_utf8_character() {
+            let event = br#"{"time":"2026-11-20T11:00:00Z","host":"example.com","status":200,"action":"allow","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#;
+            let total_len = MAX_HISTORY_FILE_BYTES as usize + 3;
+            let prefix_len = total_len - event.len() - 1;
+            let mut bytes = vec![b'a'; prefix_len];
+            bytes[1..4].copy_from_slice("€".as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(event);
+            assert_eq!(bytes.len(), total_len);
+
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after UNIX epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "gatewizz-history-{}-{unique}.jsonl",
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).expect("write test event log");
+
+            let rows = load_history(&path);
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].host, "example.com");
+            assert_eq!(rows[0].process_name(), "curl.exe");
         }
     }
 }
