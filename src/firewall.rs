@@ -497,8 +497,8 @@ pub fn unresolved(
 
 /// A blocked attempt the user may be asked about.
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for the approval prompt, next in #59")
+    not(any(test, windows)),
+    expect(dead_code, reason = "used by the Windows firewall service (#59)")
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
@@ -514,8 +514,8 @@ pub struct Notice {
 /// Folds repeated attempts by one program to one host and port into a single notice per window, so a retrying app
 /// produces one prompt, not dozens. Bounded: past `max` keys the oldest are forgotten.
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for the approval prompt, next in #59")
+    not(any(test, windows)),
+    expect(dead_code, reason = "used by the Windows firewall service (#59)")
 )]
 pub struct Coalescer {
     window: Duration,

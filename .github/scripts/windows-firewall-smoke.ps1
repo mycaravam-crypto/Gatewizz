@@ -101,6 +101,14 @@ try {
     $appliedAtStart = Applied-Count
     Check 'service log records the first refresh' ($appliedAtStart -ge 1) "applied lines: $appliedAtStart"
 
+    # A connection the rule blocks shows up in the service log, named by program and destination.
+    & curl.exe -s -o NUL --max-time 5 http://192.0.2.1:9/ 2>$null
+    $blockedLogged = Wait-Until {
+        $log = Join-Path $home_ 'service.log'
+        (Test-Path $log) -and ((Get-Content -Raw $log) -match 'blocked: curl\.exe -> 192\.0\.2\.1:9 tcp')
+    }
+    Check 'service logs the blocked connection' $blockedLogged "$(Get-Content -Raw (Join-Path $home_ 'service.log'))"
+
     $r = Invoke-Gatewizz @('firewall', 'apply', '--config', $two)
     Check 'firewall apply with the service installed succeeds' ($r.Code -eq 0 -and $r.Text -match 'service') $r.Text
     Check 'protected config was updated' ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'smoke-block-two')

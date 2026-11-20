@@ -192,6 +192,21 @@ Windows displays a certificate trust confirmation. Administrator rights are not 
 
 Certificate-pinned and mutual-TLS endpoints may need to be listed in `tunnel_hosts`; those connections remain encrypted tunnels and cannot be inspected.
 
+## Connection firewall (optional, administrator)
+
+The proxy sees only tools that use it. The optional connection firewall decides every outgoing connection of every program, by program, address, port and protocol, through the Windows Filtering Platform. With it, the AI tools can be limited to reaching the network only through Gatewizz.
+
+It is the one part of Gatewizz that needs administrator rights. Everything above keeps working without it. Add `[[connection_rules]]` to your configuration (see the commented proxy-enforcement example in [config/gatewizz.example.toml](config/gatewizz.example.toml)), then, from an **elevated** PowerShell (Run as administrator):
+
+```powershell
+& $gatewizz firewall install --config $config   # install the gatewizz-fw service and apply the rules
+& $gatewizz firewall status                     # filters and service state
+& $gatewizz firewall apply --config $config     # after editing the rules
+& $gatewizz firewall remove                     # remove the service, every filter and its files
+```
+
+`firewall install` copies `gatewizz.exe` and your rules into `%ProgramFiles%\Gatewizz`, which only administrators can change. It then runs the `gatewizz-fw` service from there. The service keeps the rules in force across reboots, refreshes program paths and host addresses every minute, and logs blocked connections to `%ProgramFiles%\Gatewizz\service.log`. Editing your own configuration file changes nothing until the next `firewall apply`. Details: [Connection firewall](docs/REFERENCE.md#connection-firewall).
+
 ## Configuration
 
 All configuration keys are optional; defaults and commented examples are in [config/gatewizz.example.toml](config/gatewizz.example.toml). Unknown keys are rejected.
