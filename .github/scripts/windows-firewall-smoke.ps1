@@ -132,7 +132,8 @@ try {
     # The prompt loop over the pipe, as the tray app will run it: a blocked connection becomes a notice, and an
     # "allow once" answer becomes a temporary rule, i.e. one more filter.
     Check 'service serves the prompt pipe' ([bool](Get-ChildItem '\\.\pipe\' | Where-Object Name -eq 'gatewizz-fw'))
-    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'gatewizz-fw', [System.IO.Pipes.PipeDirection]::InOut)
+    # Asynchronous: synchronous I/O on one pipe handle is serialized, so a pending read would block a write.
+    $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'gatewizz-fw', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
     $pipe.Connect(5000)
     $reader = New-Object System.IO.StreamReader($pipe)
     $writer = New-Object System.IO.StreamWriter($pipe)

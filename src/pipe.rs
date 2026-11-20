@@ -36,8 +36,9 @@ pub use sys::{Server, drives, serve};
 #[cfg(windows)]
 mod sys {
     use crate::prompt::{self, Message};
+    use std::collections::VecDeque;
     use std::fs::File;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{Read, Write};
     use std::os::windows::io::FromRawHandle;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +56,7 @@ mod sys {
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -115,7 +116,10 @@ mod sys {
     /// The running pipe server: [`Server::send`] delivers to the connected client, if any.
     pub struct Server {
         name: String,
-        client: Arc<Mutex<Option<File>>>,
+        /// The connected client's outbox, `None` while no client is connected. Only the server thread touches the
+        /// pipe: synchronous I/O on one pipe is serialized, so a write from another thread would wait behind the
+        /// server thread's read forever.
+        client: Arc<Mutex<Option<VecDeque<String>>>>,
         /// The live pipe instance (as usize, 0 for none), so `stop` can disconnect a connected client.
         current: Arc<Mutex<usize>>,
         stopping: Arc<AtomicBool>,
@@ -128,8 +132,12 @@ mod sys {
         pub fn send(&self, message: &Message) -> bool {
             let mut client = self.client.lock().unwrap_or_else(|e| e.into_inner());
             match client.as_mut() {
-                Some(file) => file.write_all(prompt::encode(message).as_bytes()).is_ok(),
-                None => false,
+                Some(outbox) if outbox.len() < OUTBOX_MAX => {
+                    outbox.push_back(prompt::encode(message));
+                    true
+                }
+                // A client that stops reading cannot make the service queue without limit.
+                _ => false,
             }
         }
 
@@ -189,7 +197,7 @@ mod sys {
         decisions: Sender<prompt::Decision>,
     ) -> Result<Server, String> {
         let descriptor = Descriptor::new(sddl)?;
-        let client: Arc<Mutex<Option<File>>> = Arc::default();
+        let client: Arc<Mutex<Option<VecDeque<String>>>> = Arc::default();
         let current: Arc<Mutex<usize>> = Arc::default();
         let stopping = Arc::new(AtomicBool::new(false));
         // Handles cross into the server thread as integers: HANDLE is a raw pointer.
@@ -209,7 +217,7 @@ mod sys {
                     let connected = unsafe { ConnectNamedPipe(handle, null_mut()) } != 0
                         || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
                     if connected && !thread_stopping.load(Ordering::SeqCst) {
-                        serve_client(handle, &thread_client, &decisions);
+                        serve_client(handle, &thread_client, &decisions, &thread_stopping);
                     }
                     {
                         // Under the lock, so `stop` never disconnects a handle that is being closed.
@@ -274,53 +282,87 @@ mod sys {
         Ok(h)
     }
 
-    /// Reads decisions from one connected client until it disconnects. Bad lines are answered, never acted on.
+    /// Messages queued for a client before more are refused.
+    const OUTBOX_MAX: usize = 256;
+
+    /// How long the client loop waits when there is nothing to read or write.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    /// Serves one connected client until it disconnects or the server stops. This thread does all of the pipe's
+    /// I/O: it writes what `send` queued, then reads only what `PeekNamedPipe` says is there, so no read ever
+    /// blocks a write. Decisions go to `decisions`; bad lines are answered, never acted on.
     fn serve_client(
         handle: HANDLE,
-        client: &Mutex<Option<File>>,
+        client: &Mutex<Option<VecDeque<String>>>,
         decisions: &Sender<prompt::Decision>,
+        stopping: &AtomicBool,
     ) {
-        // The server loop owns `handle` and closes it. ManuallyDrop makes sure this File never does, also when
-        // unwinding; reads go through `&File`. The writer is a duplicate handle, owned by `client`.
+        // The server loop owns `handle` and closes it; ManuallyDrop makes sure this File never does, also when
+        // unwinding. I/O goes through `&File`.
         let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(handle as _) });
-        let Ok(writer) = file.try_clone() else {
-            return;
+        let mut io = &*file;
+        *client.lock().unwrap_or_else(|e| e.into_inner()) = Some(VecDeque::new());
+        let mut pending: Vec<u8> = Vec::new();
+        let reply = |message: String| {
+            if let Some(outbox) = client.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                outbox.push_back(prompt::encode(&Message::Result {
+                    id: 0,
+                    ok: false,
+                    message,
+                }));
+            }
         };
-        *client.lock().unwrap_or_else(|e| e.into_inner()) = Some(writer);
-        let mut reader = BufReader::new(&*file);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            // Bounded: a client that never sends a newline cannot make the service buffer without limit.
-            match (&mut reader)
-                .take(prompt::MAX_LINE as u64 + 1)
-                .read_line(&mut line)
-            {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let reply = match prompt::decode(&line) {
-                Ok(Message::Decision(d)) => {
-                    let _ = decisions.send(d);
-                    None
+        'serve: while !stopping.load(Ordering::SeqCst) {
+            let outgoing: Vec<String> = client
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .map(|q| q.drain(..).collect())
+                .unwrap_or_default();
+            for line in &outgoing {
+                if io.write_all(line.as_bytes()).is_err() {
+                    break 'serve;
                 }
-                Ok(_) => Some("only decisions are accepted".to_string()),
-                Err(err) => Some(err),
+            }
+            let mut available = 0u32;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut available,
+                    null_mut(),
+                )
             };
-            if let Some(message) = reply {
-                let mut c = client.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(w) = c.as_mut() {
-                    let _ = w.write_all(
-                        prompt::encode(&Message::Result {
-                            id: 0,
-                            ok: false,
-                            message,
-                        })
-                        .as_bytes(),
-                    );
+            if ok == 0 {
+                // The client went away.
+                break;
+            }
+            if available == 0 {
+                if outgoing.is_empty() {
+                    std::thread::sleep(POLL);
+                }
+                continue;
+            }
+            let mut chunk = vec![0u8; (available as usize).min(prompt::MAX_LINE + 1)];
+            match io.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            }
+            while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=end).collect();
+                match prompt::decode(&String::from_utf8_lossy(&line)) {
+                    Ok(Message::Decision(d)) => {
+                        let _ = decisions.send(d);
+                    }
+                    Ok(_) => reply("only decisions are accepted".into()),
+                    Err(err) => reply(err),
                 }
             }
-            if line.len() > prompt::MAX_LINE {
+            // Bounded: a client that never sends a newline cannot make the service buffer without limit.
+            if pending.len() > prompt::MAX_LINE {
+                reply(format!("message longer than {} bytes", prompt::MAX_LINE));
                 break;
             }
         }
