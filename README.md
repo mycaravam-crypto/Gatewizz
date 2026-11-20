@@ -6,9 +6,10 @@ Tools that send code to a model (smartwizz, testwizz, `docwizz --ai`, gitwizz, c
 `HTTPS_PROXY`. It decrypts each request with a local CA, checks it against a few TOML rules, and allows, blocks or holds
 it for approval before any byte goes upstream. Every decision is logged; content never is.
 
-**Status:** early development. `gatewizz` forwards plain HTTP and tunnels HTTPS (CONNECT to port 443) on
-`127.0.0.1:8899`, names the client process of each connection, and writes one JSON line per request to
-`%LOCALAPPDATA%\gatewizz\events.jsonl`. TLS interception and rules follow in M2. Design and milestones:
+**Status:** early development. `gatewizz` forwards plain HTTP and HTTPS (CONNECT to port 443) on `127.0.0.1:8899`,
+names the client process of each connection, and writes one JSON line per request to
+`%LOCALAPPDATA%\gatewizz\events.jsonl`. With the CA from `gatewizz ca install` it decrypts HTTPS and logs each request
+inside (`"coverage": "inspected"`); without it HTTPS is tunneled. Detectors and rules follow in M2. Design and milestones:
 [PLAN.md](PLAN.md) and [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1).
 
 ## Usage
@@ -55,8 +56,12 @@ request then shows up in `events.jsonl` with the tool's process, the model host 
 - **Local models bypass gatewizz.** .NET never proxies `localhost`, so an Ollama on the same machine is not seen. That is
   intended: the traffic never leaves the machine. A model on another host is seen.
 - **`NO_PROXY` wins.** A host listed there (smartwizz suggests it for internal model hosts) goes direct and is not seen.
-- **In M1, HTTPS is tunneled.** gatewizz sees which process talks to which host and how much, not the content.
-  Decryption and rules come in M2.
+- **Without the CA, HTTPS is tunneled.** gatewizz then sees which process talks to which host and how much, not the
+  content. Run `gatewizz ca install` once to have each request decrypted and logged (`"coverage": "inspected"`).
+- **Upstream certificates are verified** against the Windows store; there is no switch to skip that. A host that fails
+  verification gets `502` and an event naming the reason.
+- **Pinned or mutual-TLS hosts** go in `[tls].tunnel_hosts` and keep the blind tunnel. A client that refuses the
+  gatewizz certificate shows up as `"reason": "client TLS handshake failed"`; it is never silently tunneled.
 
 ## Build
 

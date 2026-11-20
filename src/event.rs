@@ -20,6 +20,8 @@ pub enum Coverage {
     /// Plain HTTP: request metadata is seen.
     // ponytail: bodies are not inspected before M2, so plain HTTP is only partially inspected.
     PartiallyInspected,
+    /// Decrypted HTTPS: the request inside an intercepted CONNECT tunnel.
+    Inspected,
     /// CONNECT passed through without decryption.
     Tunneled,
     /// Rejected by the proxy before anything was forwarded.

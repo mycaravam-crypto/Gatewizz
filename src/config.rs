@@ -15,6 +15,7 @@ pub struct Config {
     pub general: General,
     pub limits: Limits,
     pub events: Events,
+    pub tls: Tls,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -86,6 +87,13 @@ impl Default for Events {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tls {
+    /// CONNECT hosts that are tunneled, not intercepted: exact names or `*.suffix`.
+    pub tunnel_hosts: Vec<String>,
+}
+
 /// Where events go once `[events].path` is resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventTarget {
@@ -146,6 +154,14 @@ impl Config {
         if l.max_connections > u32::MAX as usize {
             return Err("limits.max_connections: too large".into());
         }
+        for host in &self.tls.tunnel_hosts {
+            let name = host.strip_prefix("*.").unwrap_or(host);
+            if name.is_empty() || name.contains(['*', '/', ':', ' ']) {
+                return Err(format!(
+                    "tls.tunnel_hosts: {host:?} is not a host name or *.suffix"
+                ));
+            }
+        }
         if self.events.max_file_bytes < 4096 {
             return Err("events.max_file_bytes: must be at least 4096".into());
         }
@@ -175,6 +191,7 @@ impl Config {
             response_timeout: Duration::from_secs(l.response_timeout_secs),
             idle_timeout: Duration::from_secs(l.idle_timeout_secs),
             shutdown_timeout: Duration::from_secs(l.shutdown_timeout_secs),
+            tunnel_hosts: self.tls.tunnel_hosts.clone(),
         }
     }
 
@@ -224,6 +241,8 @@ mod tests {
             path = "-"
             max_file_bytes = 4096
             keep_files = 0
+            [tls]
+            tunnel_hosts = ["pinned.example.com", "*.mtls.example.com"]
             "#,
         )
         .unwrap();
@@ -232,6 +251,7 @@ mod tests {
         assert_eq!(c.settings().response_timeout, Duration::from_secs(5));
         assert_eq!(c.settings().shutdown_timeout, Duration::from_secs(7));
         assert_eq!(c.events.keep_files, 0);
+        assert_eq!(c.settings().tunnel_hosts.len(), 2);
         assert_eq!(c.event_target(), Ok(EventTarget::Stdout));
     }
 
@@ -275,6 +295,14 @@ mod tests {
             (
                 "[limits]\nmax_header_bytes = 0",
                 "limits.max_header_bytes: must be at least 1",
+            ),
+            (
+                "[tls]\ntunnel_hosts = [\"*\"]",
+                "tls.tunnel_hosts: \"*\" is not a host name",
+            ),
+            (
+                "[tls]\ntunnel_hosts = [\"\"]",
+                "tls.tunnel_hosts: \"\" is not a host name",
             ),
             (
                 "[events]\nmax_file_bytes = 10",

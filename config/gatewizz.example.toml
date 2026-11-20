@@ -47,3 +47,10 @@
 
 # Rotated files kept next to the live one (events.jsonl.1, .2, ...).
 # keep_files = 5
+
+[tls]
+# CONNECT hosts that keep a blind tunnel (coverage "tunneled") instead of being
+# decrypted: pinned or mutual-TLS endpoints. Exact names or "*.suffix".
+# Interception needs the CA from `gatewizz ca install`; without it every
+# CONNECT is tunneled.
+# tunnel_hosts = []

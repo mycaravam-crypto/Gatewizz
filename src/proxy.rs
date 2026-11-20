@@ -1,4 +1,5 @@
-//! Explicit HTTP/1.1 forward proxy: plain HTTP forwarding and CONNECT tunnels.
+//! Explicit HTTP/1.1 forward proxy: plain HTTP forwarding, CONNECT tunnels and, with a CA, TLS interception of
+//! CONNECT tunnels (see `tls.rs`).
 //!
 //! Bodies are streamed, never buffered; the proxy never retries and never follows redirects.
 
@@ -23,6 +24,7 @@ use tokio::time::timeout;
 
 use crate::event::{self, Coverage, Event};
 use crate::process::{self, Process};
+use crate::tls::{self, Interceptor};
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
@@ -55,6 +57,8 @@ pub struct Settings {
     pub idle_timeout: Duration,
     /// On shutdown, in-flight requests get this long to finish.
     pub shutdown_timeout: Duration,
+    /// CONNECT hosts that keep the blind tunnel even when TLS interception is on (pinned or mTLS endpoints).
+    pub tunnel_hosts: Vec<String>,
 }
 
 impl Default for Settings {
@@ -68,6 +72,7 @@ impl Default for Settings {
             response_timeout: Duration::from_secs(120),
             idle_timeout: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(10),
+            tunnel_hosts: Vec::new(),
         }
     }
 }
@@ -100,6 +105,8 @@ struct Ctx {
     settings: Settings,
     listen: SocketAddr,
     events: mpsc::Sender<Event>,
+    /// TLS interception; without a CA every CONNECT is a blind tunnel.
+    tls: Option<Arc<Interceptor>>,
 }
 
 impl Ctx {
@@ -116,6 +123,7 @@ impl Ctx {
 pub async fn serve(
     listener: TcpListener,
     settings: Settings,
+    tls: Option<Arc<Interceptor>>,
     events: mpsc::Sender<Event>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
@@ -127,6 +135,7 @@ pub async fn serve(
         settings,
         listen,
         events,
+        tls,
     });
     tokio::pin!(shutdown);
     loop {
@@ -246,23 +255,40 @@ async fn forward(
         Err(failure) => return refuse(ctx, event, failure.status(), failure.reason()).await,
     };
     event.coverage = Coverage::PartiallyInspected;
+    let authority = req.uri().authority().map(|a| a.as_str().to_string());
+    to_origin_form(&mut req, authority);
+    relay(ctx, event, req, upstream).await
+}
 
+/// Rewrites the target to origin form (`/path?query`) and sets `Host` from `authority` when the client sent none.
+fn to_origin_form(req: &mut Request<Incoming>, authority: Option<String>) {
     let origin_form = req
         .uri()
         .path_and_query()
         .map_or("/", |pq| pq.as_str())
         .parse::<Uri>()
         .unwrap_or_else(|_| Uri::from_static("/"));
-    let authority = req.uri().authority().map(|a| a.as_str().to_string());
     *req.uri_mut() = origin_form;
-    strip_hop_by_hop(req.headers_mut());
-    // hyper already answered `100 Continue` to the client when it read the body.
-    req.headers_mut().remove(header::EXPECT);
     if !req.headers().contains_key(header::HOST)
         && let Some(value) = authority.and_then(|a| HeaderValue::from_str(&a).ok())
     {
         req.headers_mut().insert(header::HOST, value);
     }
+}
+
+/// Sends one request over a fresh upstream connection and streams the response back.
+async fn relay<S>(
+    ctx: &Ctx,
+    mut event: Event,
+    mut req: Request<Incoming>,
+    upstream: S,
+) -> Response<Body>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    strip_hop_by_hop(req.headers_mut());
+    // hyper already answered `100 Continue` to the client when it read the body.
+    req.headers_mut().remove(header::EXPECT);
 
     let (mut sender, conn) =
         match hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await {
@@ -342,6 +368,15 @@ async fn tunnel(
         .trim_start_matches('[')
         .trim_end_matches(']')
         .to_string();
+    if let Some(tls) = ctx.tls.clone()
+        && !ctx
+            .settings
+            .tunnel_hosts
+            .iter()
+            .any(|pattern| tls::host_matches(pattern, &host))
+    {
+        return intercept(ctx, tls, req, host, port, event).await;
+    }
     let upstream = match connect_upstream(&ctx, &host, port).await {
         Ok(stream) => stream,
         Err(failure) => return refuse(&ctx, event, failure.status(), failure.reason()).await,
@@ -361,6 +396,127 @@ async fn tunnel(
         ctx.emit(event).await;
     });
     Response::new(Empty::new().map_err(|never| match never {}).boxed())
+}
+
+/// Answers the CONNECT, terminates the client's TLS and serves the decrypted requests, each inspected and sent upstream
+/// over gatewizz's own TLS connection. A successful tunnel records one event per request, not one for itself.
+// ponytail: intercepted tunnels run detached like blind ones and are not drained on shutdown.
+async fn intercept(
+    ctx: Arc<Ctx>,
+    tls: Arc<Interceptor>,
+    req: Request<Incoming>,
+    host: String,
+    port: u16,
+    mut event: Event,
+) -> Response<Body> {
+    // Loops and unknown hosts are refused at CONNECT; each request inside connects on its own.
+    let resolved = timeout(ctx.settings.connect_timeout, resolve(&ctx, &host, port))
+        .await
+        .unwrap_or(Err(UpstreamFailure::Timeout));
+    if let Err(failure) = resolved {
+        return refuse(&ctx, event, failure.status(), failure.reason()).await;
+    }
+    event.status = StatusCode::OK.as_u16();
+    tokio::spawn(async move {
+        let Ok(upgraded) = hyper::upgrade::on(req).await else {
+            event.reason = Some("client left before the tunnel opened");
+            ctx.emit(event).await;
+            return;
+        };
+        let accepted = timeout(
+            ctx.settings.header_timeout,
+            tls.accept(&host, TokioIo::new(upgraded)),
+        )
+        .await
+        .unwrap_or(Err("client TLS handshake timeout"));
+        let stream = match accepted {
+            Ok(stream) => stream,
+            Err(reason) => {
+                // Pinning or a client trust store without the gatewizz CA: recorded, never tunneled instead.
+                event.reason = Some(reason);
+                ctx.emit(event).await;
+                return;
+            }
+        };
+        let (client, process) = (event.client, event.process.clone());
+        let svc_ctx = ctx.clone();
+        let svc = service_fn(move |req| {
+            inspect(
+                svc_ctx.clone(),
+                tls.clone(),
+                client,
+                process.clone(),
+                host.clone(),
+                port,
+                req,
+            )
+        });
+        let served = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(ctx.settings.header_timeout)
+            .max_header_size(ctx.settings.max_header_bytes)
+            .serve_connection(TokioIo::new(stream), svc)
+            .await;
+        if let Err(err) = served
+            && let Some((status, reason)) = malformed(&err)
+        {
+            let mut rejected = Event::rejected_by_parser(client, event.process, status, reason);
+            (rejected.host, rejected.port) = (event.host, port);
+            ctx.emit(rejected).await;
+        }
+    });
+    Response::new(Empty::new().map_err(|never| match never {}).boxed())
+}
+
+/// One decrypted request: sent to the CONNECT host, whatever the request line or `Host` header name.
+async fn inspect(
+    ctx: Arc<Ctx>,
+    tls: Arc<Interceptor>,
+    client: SocketAddr,
+    process: Process,
+    host: String,
+    port: u16,
+    mut req: Request<Incoming>,
+) -> Result<Response<Body>, Infallible> {
+    let mut event = Event {
+        time: event::now(),
+        client,
+        process,
+        method: req.method().to_string(),
+        host: host.clone(),
+        port,
+        path: req.uri().path().to_string(),
+        coverage: Coverage::Blocked,
+        status: 0,
+        reason: None,
+        bytes_up: None,
+        bytes_down: None,
+    };
+    let tcp = match connect_upstream(&ctx, &host, port).await {
+        Ok(stream) => stream,
+        Err(failure) => return Ok(refuse(&ctx, event, failure.status(), failure.reason()).await),
+    };
+    let upstream = match timeout(ctx.settings.connect_timeout, tls.connect(&host, tcp)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(reason)) => return Ok(refuse(&ctx, event, StatusCode::BAD_GATEWAY, reason).await),
+        Err(_) => {
+            return Ok(refuse(
+                &ctx,
+                event,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream TLS handshake timeout",
+            )
+            .await);
+        }
+    };
+    event.coverage = Coverage::Inspected;
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    to_origin_form(&mut req, Some(authority));
+    Ok(relay(&ctx, event, req, upstream).await)
 }
 
 /// Answers the client directly, records the event and closes the connection.
@@ -410,16 +566,22 @@ impl UpstreamFailure {
     }
 }
 
+/// Resolves the target, refusing any address that is gatewizz itself.
+async fn resolve(ctx: &Ctx, host: &str, port: u16) -> Result<Vec<SocketAddr>, UpstreamFailure> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| UpstreamFailure::Unreachable)?
+        .collect();
+    if addrs.iter().any(|addr| is_self(*addr, ctx.listen)) {
+        return Err(UpstreamFailure::Loop);
+    }
+    Ok(addrs)
+}
+
 /// Resolves and connects directly (never through another proxy), refusing any address that is gatewizz itself.
 async fn connect_upstream(ctx: &Ctx, host: &str, port: u16) -> Result<TcpStream, UpstreamFailure> {
     let attempt = async {
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| UpstreamFailure::Unreachable)?
-            .collect();
-        if addrs.iter().any(|addr| is_self(*addr, ctx.listen)) {
-            return Err(UpstreamFailure::Loop);
-        }
+        let addrs = resolve(ctx, host, port).await?;
         TcpStream::connect(addrs.as_slice())
             .await
             .map_err(|_| UpstreamFailure::Unreachable)
@@ -620,7 +782,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (events, received) = mpsc::channel(16);
-        tokio::spawn(serve(listener, settings, events, std::future::pending()));
+        tokio::spawn(serve(
+            listener,
+            settings,
+            None,
+            events,
+            std::future::pending(),
+        ));
         (addr, received)
     }
 
@@ -735,7 +903,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(5),
             ..Settings::default()
         };
-        let server = tokio::spawn(serve(listener, settings, events, async {
+        let server = tokio::spawn(serve(listener, settings, None, events, async {
             let _ = stopped.await;
         }));
 
@@ -779,7 +947,7 @@ mod tests {
             shutdown_timeout: Duration::from_millis(200),
             ..Settings::default()
         };
-        let server = tokio::spawn(serve(listener, settings, events, async {
+        let server = tokio::spawn(serve(listener, settings, None, events, async {
             let _ = stopped.await;
         }));
         let mut client = TcpStream::connect(proxy).await.unwrap();
@@ -921,7 +1089,7 @@ mod tests {
     }
 
     /// Reads one response whose body length is given by `Content-Length` (all responses in these tests).
-    async fn read_response(stream: &mut TcpStream) -> String {
+    async fn read_response<S: AsyncRead + Unpin>(stream: &mut S) -> String {
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             let mut byte = [0u8; 1];
@@ -1101,5 +1269,245 @@ mod tests {
             next_event(&mut events).await.reason,
             Some("request head too large")
         );
+    }
+
+    mod interception {
+        use super::*;
+        use crate::ca::Ca;
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, RootCertStore, ServerConfig};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        fn trusting(root: &[u8]) -> ClientConfig {
+            let mut roots = RootCertStore::empty();
+            roots.add(root.to_vec().into()).unwrap();
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+
+        /// A TLS upstream presenting a leaf for `name` from `ca`. It answers `METHOD PATH BODY-LENGTH` and reports
+        /// each decrypted request it served.
+        async fn tls_upstream(ca: &Ca, name: &str) -> (SocketAddr, mpsc::Receiver<String>) {
+            let leaf = ca.leaf(name).unwrap();
+            let config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.cert.clone().into()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(leaf.key.clone().into()),
+            )
+            .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                    tokio::spawn(async move {
+                        let Ok(stream) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let tx = tx.clone();
+                            async move {
+                                let line = format!("{} {}", req.method(), req.uri());
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let line = format!("{line} {}", body.len());
+                                let _ = tx.send(line.clone()).await;
+                                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(line))))
+                            }
+                        });
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), svc)
+                            .await;
+                    });
+                }
+            });
+            (addr, rx)
+        }
+
+        /// A proxy with interception by `ca` whose upstream connections trust `upstream_root`.
+        async fn start_tls(
+            ca: Ca,
+            upstream_root: &Ca,
+            settings: Settings,
+        ) -> (SocketAddr, mpsc::Receiver<Event>) {
+            let tls = Interceptor::with_upstream(ca, trusting(upstream_root.cert()));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (events, received) = mpsc::channel(16);
+            tokio::spawn(serve(
+                listener,
+                settings,
+                Some(Arc::new(tls)),
+                events,
+                std::future::pending(),
+            ));
+            (addr, received)
+        }
+
+        fn allowing(port: u16) -> Settings {
+            Settings {
+                allowed_connect_ports: vec![port],
+                ..Settings::default()
+            }
+        }
+
+        async fn connect(proxy: SocketAddr, target: SocketAddr) -> TcpStream {
+            let mut stream = TcpStream::connect(proxy).await.unwrap();
+            let connect = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+            stream.write_all(connect.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            assert!(head.starts_with(b"HTTP/1.1 200"));
+            stream
+        }
+
+        /// CONNECT, then TLS to the proxy's leaf offering h2 and http/1.1, trusting `root`.
+        async fn tls_client(
+            proxy: SocketAddr,
+            target: SocketAddr,
+            root: &[u8],
+        ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+            let mut config = trusting(root);
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let name = ServerName::try_from(target.ip().to_string()).unwrap();
+            TlsConnector::from(Arc::new(config))
+                .connect(name, connect(proxy, target).await)
+                .await
+        }
+
+        #[tokio::test]
+        async fn inspects_requests_with_keep_alive() {
+            let (gate, upstream_ca) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+            let (upstream, mut seen) = tls_upstream(&upstream_ca, "127.0.0.1").await;
+            // The client trusts the gatewizz CA only.
+            let gate_root = gate.cert().to_vec();
+            let (proxy, mut events) =
+                start_tls(gate, &upstream_ca, allowing(upstream.port())).await;
+            let mut client = tls_client(proxy, upstream, &gate_root).await.unwrap();
+            assert_eq!(client.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+
+            for (request, expected) in [
+                (
+                    "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                    "GET /one?q=1 0",
+                ),
+                (
+                    "POST /two HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello",
+                    "POST /two 5",
+                ),
+                (
+                    "GET /three HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                    "GET /three 0",
+                ),
+            ] {
+                client.write_all(request.as_bytes()).await.unwrap();
+                let response = read_response(&mut client).await;
+                assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                assert!(response.ends_with(expected), "{response}");
+                assert_eq!(seen.recv().await.unwrap(), expected);
+                let event = next_event(&mut events).await;
+                assert_eq!(event.coverage, Coverage::Inspected);
+                assert_eq!((event.status, event.port), (200, upstream.port()));
+                assert_eq!(event.path, expected.split(['?', ' ']).nth(1).unwrap());
+            }
+        }
+
+        #[tokio::test]
+        async fn rejects_untrusted_and_wrong_host_upstreams() {
+            let (upstream_ca, stranger) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+            for (upstream_ca_used, name) in
+                [(&stranger, "127.0.0.1"), (&upstream_ca, "example.com")]
+            {
+                let gate = Ca::generate().unwrap();
+                let (upstream, mut seen) = tls_upstream(upstream_ca_used, name).await;
+                let gate_root = gate.cert().to_vec();
+                let (proxy, mut events) =
+                    start_tls(gate, &upstream_ca, allowing(upstream.port())).await;
+                let mut client = tls_client(proxy, upstream, &gate_root).await.unwrap();
+                client
+                    .write_all(b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nkey")
+                    .await
+                    .unwrap();
+                let response = read_response(&mut client).await;
+                assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+                let event = next_event(&mut events).await;
+                assert_eq!(event.reason, Some("upstream certificate rejected"));
+                assert_eq!(event.coverage, Coverage::Blocked);
+                assert!(
+                    timeout(Duration::from_millis(200), seen.recv())
+                        .await
+                        .is_err(),
+                    "no request may reach an unverified upstream"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn tunnel_hosts_keep_the_blind_tunnel() {
+            let (gate, upstream_ca) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+            let gate_root = gate.cert().to_vec();
+            let (upstream, mut seen) = tls_upstream(&upstream_ca, "127.0.0.1").await;
+            let settings = Settings {
+                tunnel_hosts: vec!["127.0.0.1".into()],
+                ..allowing(upstream.port())
+            };
+            let (proxy, mut events) = start_tls(gate, &upstream_ca, settings).await;
+            // Tunneled, the client sees the upstream's own certificate, not a gatewizz leaf.
+            assert!(tls_client(proxy, upstream, &gate_root).await.is_err());
+            let mut client = tls_client(proxy, upstream, upstream_ca.cert())
+                .await
+                .unwrap();
+            client
+                .write_all(b"GET /t HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+            assert_eq!(seen.recv().await.unwrap(), "GET /t 0");
+            drop(client);
+            let mut coverages = vec![
+                next_event(&mut events).await.coverage,
+                next_event(&mut events).await.coverage,
+            ];
+            coverages.dedup();
+            assert_eq!(coverages, [Coverage::Tunneled]);
+        }
+
+        #[tokio::test]
+        async fn client_refusing_the_leaf_is_recorded() {
+            let (gate, upstream_ca) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+            let (upstream, mut seen) = tls_upstream(&upstream_ca, "127.0.0.1").await;
+            let (proxy, mut events) =
+                start_tls(gate, &upstream_ca, allowing(upstream.port())).await;
+            // Pinning or its own trust store: the client does not trust the gatewizz CA.
+            assert!(
+                tls_client(proxy, upstream, upstream_ca.cert())
+                    .await
+                    .is_err()
+            );
+            let event = next_event(&mut events).await;
+            assert_eq!(
+                (event.method.as_str(), event.coverage),
+                ("CONNECT", Coverage::Blocked)
+            );
+            assert_eq!(event.reason, Some("client TLS handshake failed"));
+            assert!(
+                timeout(Duration::from_millis(200), seen.recv())
+                    .await
+                    .is_err()
+            );
+        }
     }
 }

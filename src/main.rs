@@ -5,9 +5,11 @@ mod config;
 mod event;
 mod process;
 mod proxy;
+mod tls;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use config::Config;
@@ -46,7 +48,7 @@ to sign certificates for hosts whose TLS it inspects. Windows asks for confirmat
 
 Point tools at the proxy with HTTPS_PROXY=http://127.0.0.1:8899 (the default listen address).
 
-Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events], [ca]), 130 stopped by Ctrl+C or console close.
+Exit codes: 0 done, 2 failure ([usage], [configuration], [network], [events], [ca], [tls]), 130 stopped by Ctrl+C or console close.
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -119,8 +121,21 @@ async fn cancelled() {
     }
 }
 
+/// TLS interception when a CA is installed; without one, HTTPS is tunneled as in M1.
+fn interceptor() -> Result<Option<Arc<tls::Interceptor>>, String> {
+    let dir = config::data_dir()
+        .ok()
+        .filter(|dir| dir.join("ca.cer").exists());
+    let Some(dir) = dir else {
+        eprintln!("gatewizz: no CA (run gatewizz ca install); HTTPS is tunneled, not inspected");
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(tls::Interceptor::new(ca::Ca::load(&dir)?)?)))
+}
+
 /// Runs until cancelled, then drains, flushes the events and returns.
 fn run_proxy(config: &Config) -> Result<(), String> {
+    let tls = interceptor()?;
     let target = config.event_target()?;
     let (events, writer) = event::spawn(
         target,
@@ -138,7 +153,7 @@ fn run_proxy(config: &Config) -> Result<(), String> {
             .await
             .map_err(|err| format!("[network] cannot listen on {listen}: {err}"))?;
         eprintln!("gatewizz {VERSION} listening on {listen}");
-        proxy::serve(listener, config.settings(), events, cancelled())
+        proxy::serve(listener, config.settings(), tls, events, cancelled())
             .await
             .map_err(|err| format!("[network] {err}"))
     });
