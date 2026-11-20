@@ -880,7 +880,6 @@ mod app {
             assert_eq!(rows[0].process_name(), "curl.exe");
         }
     }
-
 }
 
 #[cfg(test)]
