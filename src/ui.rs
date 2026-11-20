@@ -1518,6 +1518,17 @@ mod app {
                 });
                 ui.add_space(10.0);
             }
+            if let Some(error) = &state.dns_error {
+                ui.horizontal(|ui| {
+                    dot(ui, AMBER, 3.5);
+                    ui.label(
+                        RichText::new(format!("Hostnames unavailable: {error}"))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(8.0);
+            }
             if groups.is_empty() {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {

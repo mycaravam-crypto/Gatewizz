@@ -220,6 +220,8 @@ pub struct LiveState {
     pub connections: Vec<LiveConnection>,
     /// Why the last sample failed, if it did.
     pub error: Option<String>,
+    /// Why the last DNS cache read failed, if it did; hostnames are then missing, connections are not.
+    pub dns_error: Option<String>,
     pub sampled: Option<Instant>,
 }
 
@@ -228,12 +230,19 @@ impl Live {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn set(&self, connections: Vec<LiveConnection>, error: Option<String>, now: Instant) {
+    fn set(
+        &self,
+        connections: Vec<LiveConnection>,
+        error: Option<String>,
+        dns_error: Option<String>,
+        now: Instant,
+    ) {
         let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if error.is_none() {
             s.connections = connections;
         }
         s.error = error;
+        s.dns_error = dns_error;
         s.sampled = Some(now);
     }
 }
@@ -406,6 +415,8 @@ pub fn start(
             let mut tracker = Tracker::new(RATE_WINDOW);
             let mut dns = crate::dns::Cache::new(settings.dns_cache_size);
             let mut dns_read: Option<Instant> = None;
+            // The last refresh's outcome, shown in the Network tab until a later refresh succeeds.
+            let mut dns_error: Option<String> = None;
             loop {
                 let now = Instant::now();
                 let sample = sys::rows().map(|rows| {
@@ -442,8 +453,9 @@ pub fn start(
                                 };
                                 if dns.lookup(ip, pid, now).is_none() && refresh_allowed {
                                     dns_read = Some(now);
-                                    // ponytail: a failed read leaves the address unnamed until the next refresh.
-                                    let _ = crate::dns::refresh(&mut dns, now);
+                                    // A failed read leaves addresses unnamed until a later refresh works; the
+                                    // Network tab says why meanwhile.
+                                    dns_error = crate::dns::refresh(&mut dns, now).err();
                                 }
                                 dns.lookup(ip, pid, now).map(str::to_string)
                             },
@@ -456,9 +468,9 @@ pub fn start(
                                 return;
                             }
                         }
-                        live.set(tracker.live(), None, now);
+                        live.set(tracker.live(), None, dns_error.clone(), now);
                     }
-                    Err(err) => live.set(Vec::new(), Some(err), now),
+                    Err(err) => live.set(Vec::new(), Some(err), dns_error.clone(), now),
                 }
                 match stopped.recv_timeout(settings.poll) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
