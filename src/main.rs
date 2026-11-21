@@ -1,4 +1,4 @@
-//! Gatewizz: a local HTTPS gate for code sent to AI models. See PLAN.md.
+//! Gatewizz: a local security gate for outgoing traffic on Windows. See PLAN.md.
 
 // Release builds run in the background with the tray and no console window of their own; output goes to the console
 // they were started from, if any (see `attach_parent_console`).
@@ -45,7 +45,7 @@ const EXIT_CANCELLED: u8 = 130;
 const EVENT_QUEUE: usize = 4096;
 
 const USAGE: &str = "\
-gatewizz: a local HTTPS gate for code sent to AI models
+gatewizz: a local security gate for outgoing traffic
 
 Usage:
   gatewizz [--config <path>]                  run the proxy and tray until Quit or Ctrl+C

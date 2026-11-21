@@ -1,12 +1,13 @@
-# PLAN.md: gatewizz — local HTTPS gate for code sent to AI models
+# PLAN.md: gatewizz — local security gate for outgoing traffic
 
 The source of truth for scope is the epic, [#1](https://github.com/mycaravam-crypto/Gatewizz/issues/1). This file keeps the
 engineering rules, the architecture and the status next to the code. User-facing operational documentation is indexed
 in [docs/README.md](docs/README.md).
 ## 1. Goal
 
-A loopback proxy for Windows. Tools that send code to AI models (smartwizz, testwizz, `docwizz --ai`, gitwizz, coding
-agents) run through it via `HTTPS_PROXY`. It decrypts each request with a local CA, checks it against a few TOML rules,
+A loopback proxy for Windows, a generic gate for outgoing HTTPS traffic. Any tool can run through it via `HTTPS_PROXY`.
+The motivating case is tools that send code to AI models (smartwizz, testwizz, `docwizz --ai`, gitwizz, coding agents),
+but rules are not tied to AI hosts. It decrypts each request with a local CA, checks it against a few TOML rules,
 and allows, blocks or holds it for approval before any byte goes upstream. Every decision is logged; content never is.
 
 **Out until a concrete need:** system-wide proxy, Windows service, WFP/transparent capture, HTTP/2, QUIC, database,
@@ -15,10 +16,10 @@ web UI or API, AI analysis, Linux.
 **Connection firewall (#56):** Phase 1, a read-only, no-admin connection monitor (`[monitor]`, #57), is in.
 
 **Decision (2026-11-20, #59): a Windows service and WFP move from out to in, as an optional, elevated step.**
-- **Why:** the proxy only governs tools that opt in through `HTTPS_PROXY`. Enforcing "the AI tools reach the network
-  only through Gatewizz" needs per-app connection filters, and only the Windows Filtering Platform (WFP) can set
-  those without a kernel driver. Managing WFP filters needs elevation, and only a service can hold that while the
-  user's app stays unprivileged.
+- **Why:** the proxy only governs tools that opt in through `HTTPS_PROXY`. Enforcing "these programs (for example the AI
+  tools) reach the network only through Gatewizz" needs per-app connection filters, and only the Windows Filtering
+  Platform (WFP) can set those without a kernel driver. Managing WFP filters needs elevation, and only a service can
+  hold that while the user's app stays unprivileged.
 - **Shape:** an optional service, `gatewizz-fw` (LocalSystem), installed and removed with
   `gatewizz firewall install/remove` behind a UAC prompt.
   - It owns one WFP provider and sublayer, the connection rules and the blocked-connection events.
