@@ -522,7 +522,7 @@ action = "block"
     # One fixed address per host, so a retry never lands on another address (which would be a new prompt).
     $pin = @{}
     foreach ($h in 'example.net', 'example.org', 'example.com') {
-        $pin[$h] = ([System.Net.Dns]::GetHostAddresses($h) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).IPAddressToString
+        $pin[$h] = ([System.Net.Dns]::GetHostAddresses($h) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).ToString()
     }
     # A direct connection, past the proxy; returns curl's HTTP status ("000" when the connection is blocked).
     function Invoke-Direct([string] $Program, [string] $HostName, [int] $ToPort, [string] $Scheme) {
