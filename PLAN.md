@@ -77,6 +77,7 @@ src/
 ├── dns.rs       # IP → hostname cache for the monitor, filled from the Windows DNS Client cache (#57)
 ├── firewall.rs  # connection rules: matching, precedence, expiry, WFP filter plan, notice coalescing (pure; #59)
 ├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
+├── elevate.rs   # UAC self-elevation for the firewall commands; output relayed over a private pipe (#59)
 ├── event.rs     # JSON Lines events, metadata only; bounded queue, writer thread, size rotation (#4)
 ├── main.rs      # entry point, --config/--check-config, Ctrl+C drain, exit codes (0 ok, 2 failure, 130 cancelled)
 ├── pipe.rs      # the firewall service's named pipe to the tray app: ACL, single client, device→DOS paths (Windows; #59)
