@@ -131,11 +131,11 @@ pub fn rst_for(syn: &Syn) -> Vec<u8> {
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum: u32 = 0;
     for part in parts {
-        let mut chunks = part.chunks_exact(2);
-        for c in &mut chunks {
-            sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+        let (pairs, rest) = part.as_chunks::<2>();
+        for pair in pairs {
+            sum += u32::from(u16::from_be_bytes(*pair));
         }
-        if let [last] = chunks.remainder() {
+        if let [last] = rest {
             sum += u32::from(*last) << 8;
         }
     }
