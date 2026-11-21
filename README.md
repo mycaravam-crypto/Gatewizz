@@ -8,13 +8,15 @@ An optional connection firewall extends this beyond the proxy: it decides every 
 
 ## Install
 
-Needs Windows 10/11 x64 and PowerShell 5.1+; no Rust, .NET runtime or administrator rights. In PowerShell:
+Needs Windows 10/11 x64 and PowerShell 5.1+; no Rust, .NET runtime or administrator rights. In PowerShell, download the installer, read it, then run it:
 
 ```powershell
-irm https://raw.githubusercontent.com/mycaravam-crypto/Gatewizz/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/mycaravam-crypto/Gatewizz/main/scripts/install.ps1 -OutFile install.ps1
+notepad install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies it against `SHA256SUMS.txt`, installs `gatewizz.exe` to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update. To read it first, download it and run `powershell -ExecutionPolicy Bypass -File install.ps1`.
+[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies `gatewizz.exe` against `SHA256SUMS.txt`, installs it to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update.
 
 ## Quick start
 
