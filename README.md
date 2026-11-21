@@ -18,7 +18,7 @@ notepad install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies `gatewizz.exe` against `SHA256SUMS.txt`, installs it to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update. To install the optional WinDivert files needed for `[firewall] hold = true`, run `./install.ps1 -WithWinDivert` from the directory containing the downloaded installer. This option is not needed for the default block-then-ask firewall.
+[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies `gatewizz.exe` against `SHA256SUMS.txt`, installs it to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update. To install the optional WinDivert files needed for `[firewall] hold = true`, run `.\install.ps1 -WithWinDivert` from the directory containing the downloaded installer. This option is not needed for the default block-then-ask firewall.
 
 ## Quick start
 
