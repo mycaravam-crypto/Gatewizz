@@ -205,7 +205,7 @@ It is the one part of Gatewizz that needs administrator rights. Everything above
 & $gatewizz firewall remove                     # remove the service, every filter and its files
 ```
 
-`firewall install` copies `gatewizz.exe` and your rules into `%ProgramFiles%\Gatewizz`, which only administrators can change. It then runs the `gatewizz-fw` service from there. The service keeps the rules in force across reboots, refreshes program paths and host addresses every minute, and logs blocked connections to `%ProgramFiles%\Gatewizz\service.log`. Connections blocked by an `ask` rule or `default = "ask"` also appear in the tray app's approval queue: allow once, for a while or always, or deny always. Editing your own configuration file changes nothing until the next `firewall apply`. Details: [Connection firewall](docs/REFERENCE.md#connection-firewall).
+`firewall install` copies `gatewizz.exe` and your rules into `%ProgramFiles%\Gatewizz`, which only administrators can change. It then runs the `gatewizz-fw` service from there. The service keeps the rules in force across reboots, refreshes program paths and host addresses every minute, and logs blocked connections to `%ProgramFiles%\Gatewizz\service.log`. Connections blocked by an `ask` rule or `default = "ask"` also appear in the tray app's approval queue: allow once, for a while or always, or deny always. With `[firewall] hold = true` and the release's WinDivert files next to `gatewizz.exe`, such TCP connections wait for your answer instead of failing first. Editing your own configuration file changes nothing until the next `firewall apply`. Details: [Connection firewall](docs/REFERENCE.md#connection-firewall).
 
 ## Configuration
 

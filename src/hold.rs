@@ -8,10 +8,7 @@
 //! This module parses SYNs, builds the RSTs (with checksums) and keeps the bounded, expiring queue of held
 //! connections. It never touches the network itself.
 // ponytail: TCP only. UDP has no connection setup to hold, so `ask` UDP flows keep Phase 2's block-then-ask.
-#![allow(
-    dead_code,
-    reason = "the WinDivert binding and the hold service use it, next in #60"
-)]
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -216,15 +213,18 @@ impl<A> Queue<A> {
         taken
     }
 
+    #[cfg(test)]
     /// When the next held connection times out, if any: the caller wakes up then.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.held.iter().map(|h| h.since + self.timeout).min()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.held.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }

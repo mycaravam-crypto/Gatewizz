@@ -9,7 +9,9 @@
 # everything and checks that nothing is left: no service, no filters, no files.
 #
 #   pwsh .github/scripts/windows-firewall-smoke.ps1 -Exe target\release\gatewizz.exe
-param([Parameter(Mandatory)] [string] $Exe)
+# With -WinDivertDir (CI passes the verified WinDivert 2.2.2-A x64 directory), it also checks holding (#60): a held
+# connection completes after "allow once", and one answered "deny always" is refused at once.
+param([Parameter(Mandatory)] [string] $Exe, [string] $WinDivertDir = $env:GATEWIZZ_WINDIVERT_DIR)
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path $Exe).Path
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -173,6 +175,77 @@ try {
     Check 'the protected config is unchanged by temporary and forged decisions' (
         -not ((Get-Content -Raw (Join-Path $home_ 'firewall.toml')) -match 'prompt-'))
 
+    # Holding (#60): the next connections an ask rule covers wait for the answer instead of failing.
+    if ($WinDivertDir) {
+        foreach ($f in 'WinDivert.dll', 'WinDivert64.sys') { Copy-Item (Join-Path $WinDivertDir $f) (Split-Path $Exe) -Force }
+        $target = ([System.Net.Dns]::GetHostAddresses('example.com') | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).ToString()
+        $three = Join-Path $work 'three.toml'
+        # The [firewall] table comes before the [[connection_rules]] tables.
+        Set-Content -Path $three -Value ("[firewall]`nhold = true`n`n" + (Get-Content -Raw $two) + @"
+
+[[connection_rules]]
+id = "smoke-ask-held"
+ip = ["$target"]
+port = [80, 443]
+protocol = "tcp"
+action = "ask"
+"@)
+        $r = Invoke-Gatewizz @('firewall', 'apply', '--config', $three)
+        Check 'apply with hold = true copies the verified WinDivert files' (
+            $r.Code -eq 0 -and $r.Text -match 'WinDivert' -and (Test-Path (Join-Path $home_ 'WinDivert64.sys'))) $r.Text
+        $holding = Wait-Until { (Test-Path (Join-Path $home_ 'service.log')) -and ((Get-Content -Raw (Join-Path $home_ 'service.log')) -match 'holding new connections') }
+        Check 'the service starts holding' $holding "$(Get-Content -Raw (Join-Path $home_ 'service.log'))"
+
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'gatewizz-fw', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+        $pipe.Connect(5000)
+        $reader = New-Object System.IO.StreamReader($pipe)
+        $writer = New-Object System.IO.StreamWriter($pipe)
+        $writer.AutoFlush = $true
+        function Start-Curl([string] $Url) {
+            $out = Join-Path $work ('curl-' + [guid]::NewGuid().ToString('N') + '.txt')
+            $p = Start-Process curl.exe -ArgumentList "-s -k -o NUL -w %{http_code} --max-time 25 -H `"Host: example.com`" $Url" -NoNewWindow -PassThru -RedirectStandardOutput $out
+            [pscustomobject]@{ Process = $p; Out = $out; Started = Get-Date }
+        }
+        function Wait-Curl($c) {
+            $null = $c.Process.WaitForExit(30000)
+            [pscustomobject]@{ Status = (Get-Content -Raw $c.Out -ErrorAction SilentlyContinue); Seconds = ((Get-Date) - $c.Started).TotalSeconds }
+        }
+
+        # Allow once: the held connection simply completes.
+        $pending = $reader.ReadLineAsync()
+        $c = Start-Curl "http://${target}:80/"
+        $notice = if ($pending.Wait(20000)) { $pending.Result | ConvertFrom-Json } else { $null }
+        Check 'a held connection reaches the pipe as a held notice' (
+            $notice -and $notice.held -and $notice.remote -eq $target -and $notice.port -eq 80 -and $notice.program -eq 'curl.exe') "$($notice | ConvertTo-Json -Compress)"
+        if ($notice) {
+            Start-Sleep -Seconds 2
+            $writer.WriteLine((@{ type = 'decision'; id = $notice.id; action = 'allow'; lasting = 'once' } | ConvertTo-Json -Compress))
+            $result = Wait-Curl $c
+            Check 'allowed, the held connection completes without curl retrying' ($result.Status -and $result.Status -ne '000' -and $result.Seconds -ge 2) "status $($result.Status) after $($result.Seconds) s"
+        }
+
+        # Deny always: the held connection is refused at once, not left to time out.
+        $pending = $reader.ReadLineAsync()
+        $c = Start-Curl "https://${target}:443/"
+        $notice = $null
+        while ($pending.Wait(20000)) {
+            $m = $pending.Result | ConvertFrom-Json
+            if ($m.type -eq 'notice') { $notice = $m; break }
+            # The result of the earlier decision may come first.
+            $pending = $reader.ReadLineAsync()
+        }
+        Check 'a second held connection is noticed' ($notice -and $notice.held -and $notice.port -eq 443) "$($notice | ConvertTo-Json -Compress)"
+        if ($notice) {
+            $writer.WriteLine((@{ type = 'decision'; id = $notice.id; action = 'block'; lasting = 'always' } | ConvertTo-Json -Compress))
+            $result = Wait-Curl $c
+            Check 'denied, the held connection is refused at once' ($result.Status -eq '000' -and $result.Seconds -lt 20) "status $($result.Status) after $($result.Seconds) s"
+        }
+        $pipe.Dispose()
+        $log = Get-Content -Raw (Join-Path $home_ 'service.log')
+        Check 'the service log records the hold, the release and the refusal' (
+            $log -match 'holding: curl\.exe' -and $log -match 'released: curl\.exe' -and $log -match 'refused \(denied\): curl\.exe') $log
+    }
+
     $r = Invoke-Gatewizz @('firewall', 'status')
     Check 'status shows the running service' ($r.Code -eq 0 -and $r.Text -match 'running') $r.Text
 }
@@ -182,6 +255,8 @@ finally {
     Check 'service is gone' (-not (Get-Service gatewizz-fw -ErrorAction SilentlyContinue))
     Check 'no filters are left' ((Invoke-Gatewizz @('firewall', 'status')).Text -match 'filters: not installed')
     Check 'Program Files\Gatewizz is gone' (-not (Test-Path $home_))
+    $driver = Get-Service WinDivert -ErrorAction SilentlyContinue
+    Check 'the WinDivert driver is not left running' (-not $driver -or $driver.Status -ne 'Running') "$($driver.Status)"
     $r = Invoke-Gatewizz @('firewall', 'remove')
     Check 'firewall remove is idempotent' ($r.Code -eq 0) $r.Text
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue

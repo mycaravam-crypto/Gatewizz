@@ -4,7 +4,7 @@
 //! WinDivert is not linked: `WinDivert.dll` is loaded by full path, and only after it and `WinDivert64.sys` match the
 //! SHA-256 of the pinned release (2.2.2-A). A changed, missing or quarantined file means no holding, never a load of
 //! something else. WinDivert is LGPL v3 / GPL v2 and ships unmodified, with its licence, next to Gatewizz.
-#![allow(dead_code, reason = "the hold service uses it, next in #60")]
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// The WinDivert files Gatewizz loads, with the SHA-256 of the x64 builds in `WinDivert-2.2.2-A.zip` (whose own
 /// SHA-256 is `63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15`).
@@ -27,6 +27,9 @@ pub fn hex(bytes: &[u8]) -> String {
 /// The filter for holding: the SYN of every new outbound TCP connection, never loopback, never packets another
 /// driver injected (they were decided already). Narrower filters are for tests.
 pub const HOLD_FILTER: &str = "outbound and !loopback and !impostor and tcp.Syn and !tcp.Ack";
+
+/// `WINDIVERT_MTU_MAX`: the largest packet WinDivert hands out.
+pub const MTU_MAX: usize = 40 + 0xFFFF;
 
 /// `WINDIVERT_ADDRESS` (80 bytes): where a packet came from and how to send it on.
 #[repr(C)]
@@ -53,20 +56,25 @@ impl Default for Address {
 }
 
 const OUTBOUND: u32 = 1 << 17;
+#[cfg(test)]
 const LOOPBACK: u32 = 1 << 18;
 const IMPOSTOR: u32 = 1 << 19;
+#[cfg(test)]
 const IPV6: u32 = 1 << 20;
 const CHECKSUMS: u32 = (1 << 21) | (1 << 22) | (1 << 23);
 
 impl Address {
+    #[cfg(test)]
     pub fn outbound(&self) -> bool {
         self.bits & OUTBOUND != 0
     }
 
+    #[cfg(test)]
     pub fn loopback(&self) -> bool {
         self.bits & LOOPBACK != 0
     }
 
+    #[cfg(test)]
     pub fn ipv6(&self) -> bool {
         self.bits & IPV6 != 0
     }
@@ -82,8 +90,7 @@ impl Address {
 }
 
 #[cfg(windows)]
-#[allow(unused_imports, reason = "the hold service uses it, next in #60")]
-pub use sys::Divert;
+pub use sys::{Divert, verify};
 
 #[cfg(windows)]
 mod sys {
@@ -108,8 +115,6 @@ mod sys {
 
     const LAYER_NETWORK: i32 = 0;
     const SHUTDOWN_BOTH: i32 = 3;
-    /// `WINDIVERT_MTU_MAX`: the largest packet WinDivert hands out.
-    pub const MTU_MAX: usize = 40 + 0xFFFF;
 
     /// An open WinDivert handle on the network layer. Packets that match its filter are taken off the wire and
     /// handed to [`Divert::recv`]; [`Divert::send`] puts packets back.
@@ -352,7 +357,7 @@ mod tests {
             let result = TcpStream::connect_timeout(&target, Duration::from_secs(20));
             (result.map(|_| ()).map_err(|e| e.kind()), start.elapsed())
         };
-        let mut buf = vec![0u8; sys::MTU_MAX];
+        let mut buf = vec![0u8; MTU_MAX];
 
         // Released: the connect waits while held, then completes without the app retrying.
         let app = std::thread::spawn(connect);

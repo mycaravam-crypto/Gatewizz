@@ -824,6 +824,7 @@ mod tests {
             port: 9,
             protocol: crate::firewall::Protocol::Tcp,
             count: 1,
+            held: false,
         };
         assert!(server.send(&crate::prompt::Message::Notice(notice.clone())));
         assert_eq!(

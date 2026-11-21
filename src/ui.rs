@@ -1376,7 +1376,11 @@ mod app {
                                         .truncate(),
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        badge(ui, "Blocked", RED);
+                                        if notice.held {
+                                            badge(ui, "Waiting", AMBER);
+                                        } else {
+                                            badge(ui, "Blocked", RED);
+                                        }
                                     });
                                 });
                                 ui.add(
@@ -1439,9 +1443,20 @@ mod app {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            caption(ui, "CONNECTION BLOCKED");
+                            caption(
+                                ui,
+                                if notice.held {
+                                    "CONNECTION WAITING"
+                                } else {
+                                    "CONNECTION BLOCKED"
+                                },
+                            );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                badge(ui, "Firewall", RED);
+                                if notice.held {
+                                    badge(ui, "Held", AMBER);
+                                } else {
+                                    badge(ui, "Firewall", RED);
+                                }
                             });
                         });
                         ui.add(
@@ -1459,12 +1474,16 @@ mod app {
                             .wrap(),
                         );
                         ui.add_space(14.0);
-                        caption(ui, "WHY IT WAS BLOCKED");
+                        caption(ui, if notice.held { "WHY IT IS WAITING" } else { "WHY IT WAS BLOCKED" });
                         ui.label(
-                            RichText::new(
+                            RichText::new(if notice.held {
+                                "No connection rule allows this, and the firewall asks about it. The connection is \
+                                 held: allowed, it simply goes on; denied or left unanswered, the program is told \
+                                 the connection was refused."
+                            } else {
                                 "No connection rule allows this, and the firewall asks about it. The first attempt \
-                                 has failed; most programs retry once a rule allows them.",
-                            )
+                                 has failed; most programs retry once a rule allows them."
+                            })
                             .size(13.0)
                             .color(MUTED),
                         );
@@ -1576,14 +1595,19 @@ mod app {
                 ui.add(
                     egui::Label::new(
                         RichText::new(format!(
-                            "The rule covers only {}. Closing the window keeps it blocked.",
+                            "The rule covers only {}. Closing the window {}.",
                             prompt_scope(
                                 &notice.program,
                                 notice.remote,
                                 notice.port,
                                 self.any_host,
                                 self.any_port,
-                            )
+                            ),
+                            if notice.held {
+                                "refuses it when the hold runs out"
+                            } else {
+                                "keeps it blocked"
+                            }
                         ))
                         .size(12.0)
                         .color(SUBTLE),

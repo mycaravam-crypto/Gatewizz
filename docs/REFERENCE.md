@@ -247,6 +247,18 @@ gatewizz firewall remove                           # remove the service, every f
   - The choices are **Allow once**, **Allow for** 5 or 15 minutes, 1 or 8 hours, **Allow always** and **Deny always**. **Any address** and **Any port** widen the rule; by default it covers only that program, address and port. The service's answer (the rule it added, or why it refused) shows in the status bar.
   - Unlike a held request, a blocked connection has no timer: it has failed already, and the program retries once a rule allows it. Closing the window, pausing approvals, or the service restarting drops the waiting notices, and those connections stay blocked. A notice that is not answered within 9 minutes is dropped too, since the service forgets it after 10.
 
+- **Holding connections (`[firewall] hold = true`, #60):** without holding, the first attempt of an asked-about connection fails before you answer, and programs that don't retry show an error. With holding, a new TCP connection that an `ask` rule or `default = "ask"` covers waits for your answer instead. The queue shows it as **Waiting**.
+  - **Allowed:** the connection simply goes on, without the program retrying.
+  - **Denied, or unanswered after `hold_timeout_secs`** (default 20, at most 20, because Windows programs give up connecting after about 21 s): the program gets *connection refused* at once.
+  - **How:** the service uses [WinDivert](https://github.com/basil00/WinDivert) 2.2.2, a signed packet driver, to take the connection's first packet (the TCP SYN) off the wire. It re-sends that packet on allow, and answers with a TCP reset on deny. It finds the program from the connection's row in the TCP table, and classifies the connection against the same filters WFP enforces. Connections no `ask` filter could cover are sent on at once, without that lookup.
+  - **Fail closed:** the persistent `ask` filters keep blocking at connect. While the service holds, it adds permits just above them, in a dynamic WFP session that Windows deletes when the service stops or crashes. With no tray app connected, held connections are refused at once. So are connections whose program cannot be found, and any beyond 256 waiting at a time.
+  - **Setup:** put `WinDivert.dll` and `WinDivert64.sys` from the Gatewizz release next to `gatewizz.exe`, set `hold = true`, and run `firewall install` or `firewall apply`. Gatewizz checks both files against the SHA-256 of WinDivert 2.2.2-A before it copies or loads them, and refuses any other build. `firewall remove` unloads the driver and deletes the files.
+  - **Limits:**
+    - Holding is TCP only; UDP keeps block-then-ask.
+    - It is off by default, because Microsoft Defender may flag packet-interception drivers (WinDivert is sometimes reported as `HackTool:Win64/WinDivert`). If Defender removes or blocks the files, holding stays off and asking falls back to block-then-ask.
+    - Every new outbound TCP connection's first packet passes through the service once. Later packets never do.
+    - WinDivert is licensed LGPL v3 / GPL v2 and ships unmodified with its licence.
+
 ## Events and privacy
 
 Events are written as JSON Lines. The default path is `%LOCALAPPDATA%\gatewizz\events.jsonl`; configure `[events].path` to change it or use `-` for stdout. Files rotate at the configured size and retain a bounded number of previous files.

@@ -102,6 +102,15 @@
 # without a matching allow rule, Windows services included, so start with
 # "allow" and add block rules.
 # default = "allow"
+#
+# Hold new TCP connections that an "ask" rule or default covers while the tray
+# app asks (#60), instead of letting their first attempt fail: allowed, the
+# connection simply completes; denied or unanswered, the program gets
+# "connection refused". Needs WinDivert.dll and WinDivert64.sys (WinDivert
+# 2.2.2-A, from the Gatewizz release) next to gatewizz.exe when you run
+# `firewall install`. UDP keeps block-then-ask.
+# hold = false
+# hold_timeout_secs = 20
 
 # Connection rules. Keys other than id and action are optional; an omitted key
 # matches anything. action: "allow", "block", or "ask" (block, and ask whether

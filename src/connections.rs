@@ -486,6 +486,12 @@ pub fn start(
     Ok(Monitor { stop, thread })
 }
 
+/// Every TCP connection on the machine with its owning process, IPv4 and IPv6. A connection being opened is listed
+/// from its first SYN on (state SYN_SENT), which is how the firewall's hold finds who opened it (#60).
+pub fn tcp_rows() -> Result<Vec<Row>, String> {
+    sys::rows()
+}
+
 #[cfg(not(windows))]
 mod sys {
     pub fn rows() -> Result<Vec<super::Row>, String> {

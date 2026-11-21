@@ -101,8 +101,8 @@ impl Net {
     }
 
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for the approval prompt, next in #59")
+        not(any(test, windows)),
+        expect(dead_code, reason = "the hold service runs on Windows only")
     )]
     pub fn contains(&self, ip: IpAddr) -> bool {
         let bits = |a: IpAddr| match a {
@@ -497,8 +497,8 @@ pub fn plan(
 /// within Gatewizz's sublayer. `None` means no Gatewizz filter matches, so the connection is allowed. `program` is the
 /// connecting program's full path.
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for the hold service, next in #60")
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
 )]
 pub fn classify<'a>(
     filters: &'a [Filter],
@@ -527,8 +527,8 @@ pub fn classify<'a>(
 /// TCP only: holding works on the TCP SYN, so an `ask` filter for any protocol gets a TCP permit, and one for UDP
 /// none. UDP keeps being blocked and asked about afterwards, as without holding.
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "for the hold service, next in #60")
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
 )]
 pub fn hold_permits(filters: &[Filter]) -> Vec<Filter> {
     filters
