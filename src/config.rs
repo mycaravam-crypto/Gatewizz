@@ -30,12 +30,28 @@ pub struct Config {
 }
 
 /// The connection firewall (#59). Nothing here takes effect until `gatewizz firewall apply` runs elevated.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
-    /// What happens to a connection no rule matches: `allow`, `block`, or `ask`. Until the prompt exists, `ask`
-    /// blocks (fail closed).
+    /// What happens to a connection no rule matches: `allow`, `block`, or `ask`. `ask` blocks, and asks through the
+    /// tray app while it runs.
     pub default: crate::firewall::DefaultAction,
+    /// Hold new TCP connections that an `ask` filter covers while the tray app asks, instead of failing their first
+    /// attempt (#60). Needs the WinDivert files next to `gatewizz.exe`; off by default.
+    pub hold: bool,
+    /// How long a connection is held when nobody answers; it is refused after that. 1 to 20 seconds, so the
+    /// program's own connect timeout (about 21 s on Windows) never ends it first.
+    pub hold_timeout_secs: u64,
+}
+
+impl Default for Firewall {
+    fn default() -> Self {
+        Self {
+            default: crate::firewall::DefaultAction::default(),
+            hold: false,
+            hold_timeout_secs: crate::hold::DEFAULT_TIMEOUT.as_secs(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -244,6 +260,13 @@ impl Config {
         }
         if self.approval.max_pending == 0 {
             return Err("approval.max_pending: must be at least 1".into());
+        }
+        if !(1..=crate::hold::DEFAULT_TIMEOUT.as_secs()).contains(&self.firewall.hold_timeout_secs)
+        {
+            return Err(format!(
+                "firewall.hold_timeout_secs: must be between 1 and {} (programs give up connecting after about 21 s)",
+                crate::hold::DEFAULT_TIMEOUT.as_secs()
+            ));
         }
         if !(100..=60_000).contains(&self.monitor.poll_ms) {
             return Err("monitor.poll_ms: must be between 100 and 60000".into());
@@ -467,6 +490,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.firewall.default, crate::firewall::DefaultAction::Block);
+        assert!(!c.firewall.hold, "holding is off unless turned on");
+        assert_eq!(c.firewall.hold_timeout_secs, 20);
+        let held = Config::parse("[firewall]\nhold = true\nhold_timeout_secs = 10\n").unwrap();
+        assert!(held.firewall.hold && held.firewall.hold_timeout_secs == 10);
+        for bad in [0, 21] {
+            assert!(
+                Config::parse(&format!("[firewall]\nhold_timeout_secs = {bad}\n"))
+                    .unwrap_err()
+                    .contains("firewall.hold_timeout_secs")
+            );
+        }
         assert_eq!(c.connection_rules[0].port, [8899]);
         assert_eq!(Config::parse(&c.effective()).unwrap(), c);
         assert_eq!(

@@ -72,6 +72,10 @@ pub fn remove(keys: Keys) -> Result<usize, String> {
     sys::remove(keys)
 }
 
+/// Hold permits (#60): filters in a dynamic WFP session, removed by WFP when the session ends.
+#[cfg(windows)]
+pub use sys::Session;
+
 /// How many filters are installed, or `None` when the sublayer is not installed at all.
 #[cfg(windows)]
 pub fn installed(keys: Keys) -> Result<Option<usize>, String> {
@@ -171,11 +175,12 @@ mod sys {
         FWPM_NET_EVENT_FLAG_IP_VERSION_SET, FWPM_NET_EVENT_FLAG_REMOTE_ADDR_SET,
         FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET, FWPM_NET_EVENT_SUBSCRIPTION0,
         FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWPM_NET_EVENT2, FWPM_PROVIDER_FLAG_PERSISTENT,
-        FWPM_PROVIDER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
-        FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
-        FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
-        FwpmGetAppIdFromFileName0, FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0,
-        FwpmProviderAdd0, FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+        FWPM_PROVIDER0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER_FLAG_PERSISTENT,
+        FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterAdd0,
+        FwpmFilterCreateEnumHandle0, FwpmFilterDeleteById0, FwpmFilterDeleteByKey0,
+        FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0, FwpmGetAppIdFromFileName0,
+        FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0, FwpmProviderAdd0,
+        FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
         FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -229,9 +234,23 @@ mod sys {
 
     impl Engine {
         fn open() -> Result<Self, String> {
+            Self::open_with(null())
+        }
+
+        /// A dynamic session: WFP deletes every filter added through it when the session ends, also when the
+        /// process dies.
+        fn open_dynamic() -> Result<Self, String> {
+            let session = FWPM_SESSION0 {
+                flags: FWPM_SESSION_FLAG_DYNAMIC,
+                ..Default::default()
+            };
+            Self::open_with(&session)
+        }
+
+        fn open_with(session: *const FWPM_SESSION0) -> Result<Self, String> {
             let mut h: HANDLE = null_mut();
             let rc = unsafe {
-                FwpmEngineOpen0(null(), RPC_C_AUTHN_DEFAULT as u32, null(), null(), &mut h)
+                FwpmEngineOpen0(null(), RPC_C_AUTHN_DEFAULT as u32, null(), session, &mut h)
             };
             check(rc, "open the Windows Filtering Platform")?;
             Ok(Self(h))
@@ -362,13 +381,16 @@ mod sys {
             Ok(found.len())
         }
 
+        /// Adds one filter and returns its runtime id. Persistent filters belong to Gatewizz's provider; dynamic
+        /// ones (hold permits) to none, so `apply` and `remove`, which work by provider, never touch them.
         fn add_filter(
             &self,
             keys: Keys,
             layer: GUID,
             f: &Filter,
             app: Option<&mut FWP_BYTE_BLOB>,
-        ) -> Result<(), String> {
+            persistent: bool,
+        ) -> Result<u64, String> {
             let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::new();
             let mut condition = |field: GUID, value: windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0| {
                 conditions.push(FWPM_FILTER_CONDITION0 {
@@ -471,13 +493,20 @@ mod sys {
                         description.as_mut_ptr()
                     },
                 },
-                flags: FWPM_FILTER_FLAG_PERSISTENT
-                    | if block {
-                        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-                    } else {
-                        0
-                    },
-                providerKey: &mut provider,
+                flags: if persistent {
+                    FWPM_FILTER_FLAG_PERSISTENT
+                } else {
+                    0
+                } | if block {
+                    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+                } else {
+                    0
+                },
+                providerKey: if persistent {
+                    &mut provider
+                } else {
+                    null_mut()
+                },
                 layerKey: layer,
                 subLayerKey: GUID::from_u128(keys.sublayer),
                 weight: FWP_VALUE0 {
@@ -502,7 +531,57 @@ mod sys {
             check(
                 unsafe { FwpmFilterAdd0(self.0, &filter, null_mut(), &mut id) },
                 &format!("add the WFP filter for rule {:?}", f.rule),
-            )
+            )?;
+            Ok(id)
+        }
+
+        /// Adds `filters` on the layers their addresses need. Program paths without an app ID are skipped and
+        /// reported. Returns what was added, and the runtime ids.
+        fn add_all(
+            &self,
+            keys: Keys,
+            filters: &[Filter],
+            persistent: bool,
+        ) -> Result<(Applied, Vec<u64>), String> {
+            let mut apps: HashMap<String, Option<AppId>> = HashMap::new();
+            let mut applied = Applied::default();
+            let mut ids = Vec::new();
+            for f in filters {
+                let app = match &f.program {
+                    None => None,
+                    Some(path) => {
+                        let id = apps
+                            .entry(path.to_ascii_lowercase())
+                            .or_insert_with(|| AppId::of(path));
+                        match id {
+                            Some(id) => Some(id.0),
+                            None => {
+                                // Skipping an allow narrows access; skipping a block widens it. Either way say so.
+                                if !applied.skipped.contains(path) {
+                                    applied.skipped.push(path.clone());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let layers: &[GUID] = match f.remote.map(|n| n.addr) {
+                    None => &LAYERS,
+                    Some(IpAddr::V4(_)) => &LAYERS[..1],
+                    Some(IpAddr::V6(_)) => &LAYERS[1..],
+                };
+                for layer in layers {
+                    ids.push(self.add_filter(
+                        keys,
+                        *layer,
+                        f,
+                        app.map(|p| unsafe { &mut *p }),
+                        persistent,
+                    )?);
+                    applied.filters += 1;
+                }
+            }
+            Ok((applied, ids))
         }
     }
 
@@ -533,43 +612,45 @@ mod sys {
 
     pub fn apply(keys: Keys, filters: &[Filter]) -> Result<Applied, String> {
         let engine = Engine::open()?;
-        let mut apps: HashMap<String, Option<AppId>> = HashMap::new();
-        let mut applied = Applied::default();
         engine.transaction(|e| {
             e.ensure_provider_and_sublayer(keys)?;
             e.delete_filters(keys)?;
-            for f in filters {
-                let app = match &f.program {
-                    None => None,
-                    Some(path) => {
-                        let id = apps
-                            .entry(path.to_ascii_lowercase())
-                            .or_insert_with(|| AppId::of(path));
-                        match id {
-                            Some(id) => Some(id.0),
-                            None => {
-                                // Skipping an allow narrows access; skipping a block widens it. Either way say so.
-                                if !applied.skipped.contains(path) {
-                                    applied.skipped.push(path.clone());
-                                }
-                                continue;
-                            }
-                        }
+            Ok(e.add_all(keys, filters, true)?.0)
+        })
+    }
+
+    /// Filters that exist only as long as this value: a dynamic WFP session, so a crash removes them too.
+    pub struct Session {
+        engine: Engine,
+        ids: Vec<u64>,
+    }
+
+    // The engine handle may be used from any one thread at a time; `Session` is only moved, never shared.
+    unsafe impl Send for Session {}
+
+    impl Session {
+        pub fn open() -> Result<Self, String> {
+            Ok(Self {
+                engine: Engine::open_dynamic()?,
+                ids: Vec::new(),
+            })
+        }
+
+        /// Replaces this session's filters with `filters`, in Gatewizz's sublayer, in one transaction.
+        pub fn replace(&mut self, keys: Keys, filters: &[Filter]) -> Result<usize, String> {
+            let old = std::mem::take(&mut self.ids);
+            let (applied, ids) = self.engine.transaction(|e| {
+                for id in &old {
+                    let rc = unsafe { FwpmFilterDeleteById0(e.0, *id) };
+                    if hresult(rc) != FWP_E_FILTER_NOT_FOUND {
+                        check(rc, "delete a hold permit")?;
                     }
-                };
-                let layers: &[GUID] = match f.remote.map(|n| n.addr) {
-                    None => &LAYERS,
-                    Some(IpAddr::V4(_)) => &LAYERS[..1],
-                    Some(IpAddr::V6(_)) => &LAYERS[1..],
-                };
-                for layer in layers {
-                    e.add_filter(keys, *layer, f, app.map(|p| unsafe { &mut *p }))?;
-                    applied.filters += 1;
                 }
-            }
-            Ok(())
-        })?;
-        Ok(applied)
+                e.add_all(keys, filters, false)
+            })?;
+            self.ids = ids;
+            Ok(applied.filters)
+        }
     }
 
     pub fn remove(keys: Keys) -> Result<usize, String> {

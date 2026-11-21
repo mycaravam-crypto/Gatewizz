@@ -54,6 +54,14 @@ fn self_paths_file() -> PathBuf {
 /// resolved now, and program file names to the paths on `PATH` or of running processes; what cannot be resolved is
 /// reported, since those parts of the rules are not enforced until a later apply finds them.
 pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, String> {
+    apply_plan(config, own_paths).map(|(summary, _)| summary)
+}
+
+/// [`apply_config`], also returning the filters it installed: the hold classifies connections against them.
+fn apply_plan(
+    config: &Config,
+    own_paths: &[String],
+) -> Result<(String, Vec<firewall::Filter>), String> {
     let rules = &config.connection_rules;
     let now = SystemTime::now();
     // Read once per apply: the names wildcard host rules expand to.
@@ -76,13 +84,14 @@ pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, Str
         .collect();
     unresolved_hosts.sort_unstable();
     unresolved_hosts.dedup();
-    Ok(summary(
+    let summary = summary(
         &applied,
         rules.len(),
         config.firewall.default,
         &firewall::unresolved(rules, now, wfp::program_paths),
         &unresolved_hosts,
-    ))
+    );
+    Ok((summary, filters))
 }
 
 /// What `apply` reports: the filter count and the default, then one warning per program, host or path that is not
@@ -275,7 +284,12 @@ fn refresh() -> Result<String, String> {
     config
         .connection_rules
         .extend(temporary_rules(SystemTime::now()));
-    apply_config(&config, &service_self_paths())
+    let (summary, filters) = apply_plan(&config, &service_self_paths())?;
+    #[cfg(windows)]
+    holding::sync(&config.firewall, filters);
+    #[cfg(not(windows))]
+    drop(filters);
+    Ok(summary)
 }
 
 /// Rules from the prompt that expire ("once", "for N minutes"): kept in the service's memory only, so a restart
@@ -346,12 +360,15 @@ pub fn apply(config_path: Option<&Path>) -> Result<String, String> {
     if installed {
         let self_paths = merged_self_paths()?;
         write_protected(&config_text, &self_paths)?;
+        let holding = install_windivert(&config)?;
         let mut all = service_self_paths();
         all.truncate(1);
         all.extend(self_paths);
         let out = apply_config(&config, &all)?;
         sys::control(RELOAD)?;
-        Ok(out + "\nThe firewall service keeps these rules current.")
+        Ok(out
+            + "\nThe firewall service keeps these rules current."
+            + &holding.map(|h| format!("\n{h}")).unwrap_or_default())
     } else {
         apply_config(&config, &[current_exe()?])
     }
@@ -397,16 +414,47 @@ pub fn install(config_path: Option<&Path>) -> Result<String, String> {
             )
         })?;
     }
+    let holding = install_windivert(&Config::parse(&config_text)?)?;
     if !existed {
         sys::create(&protected_exe())?;
     }
     sys::start()?;
     Ok(format!(
         "Installed the firewall service {NAME}, running from {}. It applies the connection rules now and keeps \
-         them current every {} s; `gatewizz firewall apply --config <path>` changes them.",
+         them current every {} s; `gatewizz firewall apply --config <path>` changes them.{}",
         home().display(),
-        REFRESH.as_secs()
+        REFRESH.as_secs(),
+        holding.map(|h| format!("\n{h}")).unwrap_or_default()
     ))
+}
+
+/// With `[firewall] hold`, puts the pinned WinDivert files (#60) into [`home`], from next to this `gatewizz.exe`,
+/// unless the copies there are already the pinned ones: a loaded driver's file cannot be replaced, and need not be.
+#[cfg(windows)]
+fn install_windivert(config: &Config) -> Result<Option<String>, String> {
+    if !config.firewall.hold || crate::divert::verify(&home()).is_ok() {
+        return Ok(None);
+    }
+    let me = std::env::current_exe()
+        .map_err(|e| format!("[firewall] cannot locate gatewizz.exe: {e}"))?;
+    let source = me.parent().unwrap_or(Path::new("."));
+    crate::divert::verify(source).map_err(|e| {
+        format!(
+            "{e}\n[firewall] `hold = true` needs WinDivert.dll and WinDivert64.sys (WinDivert 2.2.2-A, attached to \
+             every Gatewizz release) next to {}",
+            me.display()
+        )
+    })?;
+    for (name, _) in crate::divert::FILES {
+        std::fs::copy(source.join(name), home().join(name))
+            .map_err(|e| format!("[firewall] cannot copy {name} to {}: {e}", home().display()))?;
+    }
+    // Checked again where the service loads them from.
+    crate::divert::verify(&home())?;
+    Ok(Some(format!(
+        "Copied WinDivert 2.2.2-A to {} for holding connections while the tray app asks.",
+        home().display()
+    )))
 }
 
 /// `firewall remove`: stop and delete the service, remove every filter, and delete the protected copy.
@@ -418,6 +466,8 @@ pub fn uninstall() -> Result<String, String> {
         sys::delete()?;
     }
     let removed = wfp::remove(wfp::KEYS)?;
+    // A loaded WinDivert driver keeps its file open; with no handle left (the service stopped), it can be unloaded.
+    sys::stop_windivert();
     let dir = home();
     if dir.exists() {
         // The service process can hold its executable for a moment after it reports stopped.
@@ -550,6 +600,24 @@ impl PromptState {
         self.server.send(&crate::prompt::Message::Notice(notice));
     }
 
+    /// Sends a notice for a connection the hold keeps waiting (#60). `path` is the program's DOS path.
+    fn offer_held(&self, path: &str, remote: std::net::SocketAddr) {
+        let mut notice = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(
+                firewall::file_name(path),
+                path,
+                remote.ip(),
+                remote.port(),
+                firewall::Protocol::Tcp,
+                std::time::Instant::now(),
+            );
+        notice.held = true;
+        self.server.send(&crate::prompt::Message::Notice(notice));
+    }
+
     /// Applies one decision from the tray app: validated against the notices sent, then written down (permanent)
     /// or kept in memory (temporary), then applied by a reload. The tray app gets the outcome either way.
     fn decide(&self, decision: &crate::prompt::Decision) {
@@ -580,6 +648,319 @@ impl PromptState {
             ok,
             message,
         });
+    }
+}
+
+/// Hold-and-ask (#60): with `[firewall] hold`, the SYN of each new TCP connection an `ask` filter covers waits while
+/// the tray app asks, and goes on or is refused by what the rules say after the answer.
+///
+/// Fail closed throughout: the persistent `ask` filters keep blocking at connect, and only this module's dynamic WFP
+/// session lets their TCP through, for as long as it holds. It is removed first on every way out.
+#[cfg(windows)]
+mod holding {
+    use super::{PromptState, firewall, home, log, wfp};
+    use crate::divert::{self, Address, Divert};
+    use crate::hold::{self, Offer, Queue, Step, Syn};
+    use firewall::{Filter, Protocol, RuleAction};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// Held connections at most; more are refused (fail closed).
+    const QUEUE_MAX: usize = 256;
+    /// How often timed-out connections are refused.
+    const TICK: Duration = Duration::from_millis(250);
+
+    fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the running hold shares between its threads.
+    struct Inner {
+        divert: Divert,
+        /// Held SYNs, with the address to send them on and the program that opened them.
+        queue: Mutex<Queue<(Address, String)>>,
+        /// The filters in force, which every SYN is classified against.
+        filters: Mutex<Vec<Filter>>,
+        prompt: Arc<PromptState>,
+        stopping: AtomicBool,
+    }
+
+    struct Running {
+        inner: Arc<Inner>,
+        session: wfp::Session,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    /// The tray's prompt, once the service started it; holding asks through it.
+    static PROMPT: Mutex<Option<Arc<PromptState>>> = Mutex::new(None);
+    static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+
+    pub fn set_prompt(prompt: Arc<PromptState>) {
+        *locked(&PROMPT) = Some(prompt);
+    }
+
+    /// After every refresh: start, update or stop holding to match the configuration and the new filters. Errors
+    /// are logged and leave holding off, which is Phase 2's block-then-ask.
+    pub fn sync(config: &crate::config::Firewall, filters: Vec<Filter>) {
+        let mut running = locked(&RUNNING);
+        let prompt = locked(&PROMPT).clone();
+        match (config.hold, prompt, running.as_mut()) {
+            (true, _, Some(r)) => {
+                if let Err(err) = r.update(filters) {
+                    log(&format!(
+                        "error: {err}; holding stops, ask connections are blocked"
+                    ));
+                    if let Some(r) = running.take() {
+                        r.stop();
+                    }
+                }
+            }
+            (true, Some(prompt), None) => {
+                let timeout = Duration::from_secs(config.hold_timeout_secs);
+                match Running::start(prompt, filters, timeout) {
+                    Ok(r) => {
+                        log("holding new connections that ask rules cover while the tray app asks");
+                        *running = Some(r);
+                    }
+                    Err(err) => log(&format!(
+                        "error: {err}; connections are not held, ask blocks"
+                    )),
+                }
+            }
+            (false, _, Some(_)) => {
+                if let Some(r) = running.take() {
+                    r.stop();
+                    log("holding is off");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// On service stop.
+    pub fn stop() {
+        if let Some(r) = locked(&RUNNING).take() {
+            r.stop();
+        }
+    }
+
+    impl Running {
+        fn start(
+            prompt: Arc<PromptState>,
+            filters: Vec<Filter>,
+            timeout: Duration,
+        ) -> Result<Self, String> {
+            let divert = Divert::open(&home(), divert::HOLD_FILTER, 0)?;
+            let mut session = wfp::Session::open()?;
+            session.replace(wfp::KEYS, &firewall::hold_permits(&filters))?;
+            let inner = Arc::new(Inner {
+                divert,
+                queue: Mutex::new(Queue::new(QUEUE_MAX, timeout)),
+                filters: Mutex::new(filters),
+                prompt,
+                stopping: AtomicBool::new(false),
+            });
+            let (recv, tick) = (inner.clone(), inner.clone());
+            let threads = vec![
+                std::thread::Builder::new()
+                    .name("hold".into())
+                    .spawn(move || recv.receive())
+                    .map_err(|e| format!("[firewall] cannot start the hold: {e}"))?,
+                std::thread::Builder::new()
+                    .name("hold-timeouts".into())
+                    .spawn(move || {
+                        while !tick.stopping.load(Ordering::SeqCst) {
+                            std::thread::sleep(TICK);
+                            let expired = locked(&tick.queue).expired(Instant::now());
+                            for held in expired {
+                                tick.refuse(
+                                    &held.syn,
+                                    &held.address.0,
+                                    &held.address.1,
+                                    "nobody answered in time",
+                                );
+                            }
+                        }
+                    })
+                    .map_err(|e| format!("[firewall] cannot start the hold: {e}"))?,
+            ];
+            Ok(Self {
+                inner,
+                session,
+                threads,
+            })
+        }
+
+        /// New filters after a refresh: new permits, and every held connection decided again. Those the rules
+        /// now decide go on or are refused; those still asking keep waiting.
+        fn update(&mut self, filters: Vec<Filter>) -> Result<(), String> {
+            self.session
+                .replace(wfp::KEYS, &firewall::hold_permits(&filters))?;
+            *locked(&self.inner.filters) = filters;
+            let filters = locked(&self.inner.filters).clone();
+            let next = |h: &hold::Held<(Address, String)>| {
+                hold::after_change(action(&filters, &h.address.1, &h.syn))
+            };
+            let decided = locked(&self.inner.queue).take(|h| next(h).is_some());
+            for held in decided {
+                match next(&held) {
+                    Some(Step::Refuse(why)) => {
+                        self.inner
+                            .refuse(&held.syn, &held.address.0, &held.address.1, why)
+                    }
+                    _ => self.inner.release(
+                        &held.packet,
+                        &held.address.0,
+                        &held.address.1,
+                        &held.syn,
+                    ),
+                }
+            }
+            Ok(())
+        }
+
+        /// Permits first, so nothing passes unheld once holding ends; then every waiting connection is refused.
+        fn stop(self) {
+            let Self {
+                inner,
+                session,
+                threads,
+            } = self;
+            drop(session);
+            inner.stopping.store(true, Ordering::SeqCst);
+            // Taken out first: refusing locks the queue again.
+            let waiting = locked(&inner.queue).take(|_| true);
+            for held in waiting {
+                inner.refuse(
+                    &held.syn,
+                    &held.address.0,
+                    &held.address.1,
+                    "the service stopped",
+                );
+            }
+            inner.divert.stop();
+            for t in threads {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// What the filters say about a TCP connection from `program`.
+    fn action(filters: &[Filter], program: &str, syn: &Syn) -> Option<RuleAction> {
+        firewall::classify(
+            filters,
+            program,
+            syn.remote.ip(),
+            syn.remote.port(),
+            Protocol::Tcp,
+        )
+        .map(|f| f.action)
+    }
+
+    /// The DOS path of the program that opened the connection from `local`: its row in the TCP table, which lists
+    /// a connection from its SYN on.
+    fn owner(local: std::net::SocketAddr) -> Option<String> {
+        let pid = crate::connections::tcp_rows()
+            .ok()?
+            .into_iter()
+            .find(|r| r.local == local)?
+            .pid;
+        let start = crate::process::start_time(pid)?;
+        match crate::process::describe_pid(pid, start) {
+            crate::process::Process::Known { image, .. } => Some(image),
+            crate::process::Process::Unknown(_) => None,
+        }
+    }
+
+    impl Inner {
+        fn receive(&self) {
+            let mut buf = vec![0u8; divert::MTU_MAX];
+            while let Some((len, address)) = self.divert.recv(&mut buf) {
+                let packet = &buf[..len];
+                let Some(syn) = hold::parse_syn(packet) else {
+                    // The filter only takes SYNs; anything else goes on unchanged.
+                    let _ = self.divert.send(packet, &address);
+                    continue;
+                };
+                let settled = locked(&self.queue).settled(syn.key(), Instant::now());
+                let filters = locked(&self.filters).clone();
+                let could_ask = settled.is_none() && firewall::could_ask(&filters, syn.remote);
+                // The program is looked up only when an ask filter could cover the connection.
+                let program = if could_ask { owner(syn.local) } else { None };
+                let facts = hold::Facts {
+                    settled,
+                    could_ask,
+                    action: action(&filters, program.as_deref().unwrap_or(""), &syn),
+                    program_known: program.is_some(),
+                    can_ask: self.prompt.server.connected()
+                        && !self.stopping.load(Ordering::SeqCst),
+                };
+                let program = program.unwrap_or_else(|| "unknown program".into());
+                match hold::step(facts) {
+                    Step::Pass => {
+                        let _ = self.divert.send(packet, &address);
+                    }
+                    Step::Hold => self.ask(syn, packet, address, program),
+                    Step::Refuse(why) => self.refuse(&syn, &address, &program, why),
+                }
+            }
+        }
+
+        fn ask(&self, syn: Syn, packet: &[u8], address: Address, program: String) {
+            let offer = locked(&self.queue).offer(
+                syn,
+                packet.to_vec(),
+                (address, program.clone()),
+                Instant::now(),
+            );
+            match offer {
+                Offer::Held => {
+                    log(&format!(
+                        "holding: {} -> {}",
+                        firewall::file_name(&program),
+                        syn.remote
+                    ));
+                    self.prompt.offer_held(&program, syn.remote);
+                }
+                // The held SYN answers for its retransmissions.
+                Offer::Retransmit => {}
+                Offer::Full => {
+                    self.refuse(&syn, &address, &program, "too many connections waiting")
+                }
+            }
+        }
+
+        fn release(&self, packet: &[u8], address: &Address, program: &str, syn: &Syn) {
+            locked(&self.queue).settle(syn.key(), true, Instant::now());
+            match self.divert.send(packet, address) {
+                Ok(()) => log(&format!(
+                    "released: {} -> {}",
+                    firewall::file_name(program),
+                    syn.remote
+                )),
+                Err(err) => log(&format!(
+                    "error: {err}; {} -> {} was not released",
+                    firewall::file_name(program),
+                    syn.remote
+                )),
+            }
+        }
+
+        /// Answers the SYN with a RST: the program's connect fails at once with "connection refused".
+        fn refuse(&self, syn: &Syn, address: &Address, program: &str, why: &str) {
+            locked(&self.queue).settle(syn.key(), false, Instant::now());
+            let sent = self.divert.send(&hold::rst_for(syn), &address.reply());
+            log(&format!(
+                "refused ({why}): {} -> {}{}",
+                firewall::file_name(program),
+                syn.remote,
+                match sent {
+                    Ok(()) => String::new(),
+                    Err(err) => format!("; {err}"),
+                }
+            ));
+        }
     }
 }
 
@@ -654,6 +1035,11 @@ pub fn pid() -> Option<u32> {
 #[cfg(windows)]
 pub fn run() -> Result<(), String> {
     sys::dispatch()
+}
+
+#[cfg(not(windows))]
+fn install_windivert(_config: &Config) -> Result<Option<String>, String> {
+    Err(UNSUPPORTED.into())
 }
 
 #[cfg(not(windows))]
@@ -858,6 +1244,29 @@ mod sys {
         wait_for(&service, SERVICE_STOPPED)
     }
 
+    /// Unloads the WinDivert driver (#60), if it is loaded and nothing uses it any more. Not an error otherwise.
+    pub fn stop_windivert() {
+        use windows_sys::Win32::System::Services::SERVICE_STOP;
+        let Ok(scm) = manager(SC_MANAGER_CONNECT) else {
+            return;
+        };
+        let h = unsafe {
+            OpenServiceW(
+                scm.0,
+                wide("WinDivert").as_ptr(),
+                SERVICE_STOP | SERVICE_QUERY_STATUS,
+            )
+        };
+        if h.is_null() {
+            return;
+        }
+        let driver = Handle(h);
+        let mut status = SERVICE_STATUS::default();
+        if unsafe { ControlService(driver.0, SERVICE_CONTROL_STOP, &mut status) } != 0 {
+            let _ = wait_for(&driver, SERVICE_STOPPED);
+        }
+    }
+
     pub fn delete() -> Result<(), String> {
         let Some(service) = open(SERVICE_ALL_ACCESS)? else {
             return Ok(());
@@ -964,6 +1373,11 @@ mod sys {
         let prompt = super::start_prompt()
             .inspect_err(|err| log(&format!("error: {err}; the firewall prompt is off")))
             .ok();
+        // Holding asks through the prompt, so it starts now, with a second refresh.
+        if let Some(prompt) = &prompt {
+            super::holding::set_prompt(prompt.state.clone());
+            refresh_and_log();
+        }
         let drops = watch_drops(prompt.as_ref().map(|p| p.state.clone()))
             .inspect_err(|err| {
                 log(&format!(
@@ -973,6 +1387,7 @@ mod sys {
             .ok();
         report(handle, SERVICE_RUNNING, 0);
         serve(&rx);
+        super::holding::stop();
         if let Some(drops) = drops {
             drops.stop();
         }

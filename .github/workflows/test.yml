@@ -31,6 +31,19 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # WinDivert for the hold test (#60): the pinned release, checked by its SHA-256 before anything uses it. The
+      # test itself checks the DLL and the driver against the digests in divert.rs.
+      - name: Fetch WinDivert 2.2.2-A
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'WinDivert-2.2.2-A.zip'
+          Invoke-WebRequest https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15') {
+            throw "WinDivert-2.2.2-A.zip has SHA-256 $hash, not the pinned one"
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          "GATEWIZZ_WINDIVERT_DIR=$(Join-Path $env:RUNNER_TEMP 'WinDivert-2.2.2-A\x64')" >> $env:GITHUB_ENV
       - run: cargo test --locked
       # The release binary, so a PR that breaks the shipping build fails here rather than after merge.
       - run: cargo build --release --locked

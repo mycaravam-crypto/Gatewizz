@@ -30,6 +30,9 @@ pub struct Notice {
     pub protocol: Protocol,
     /// Attempts folded into this notice so far.
     pub count: u32,
+    /// The connection is held while the user decides (#60): it completes on allow instead of having failed.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// How long an allow or block from the prompt lasts.
@@ -143,6 +146,7 @@ impl Outstanding {
             port,
             protocol,
             count: 1,
+            held: false,
         };
         self.next_id += 1;
         self.sent.push_back((now, notice.clone()));

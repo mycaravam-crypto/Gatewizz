@@ -1,5 +1,6 @@
 # Unified SemVer policy: Git tags are authoritative; merged PR labels select bump (release:patch|minor|major|none,
-# patch by default). Each release attaches the Windows x64 binary and its SHA-256 to the GitHub release.
+# patch by default). Each release attaches the Windows x64 binary, the pinned WinDivert files for holding connections
+# (#60) and their SHA-256 to the GitHub release.
 name: release
 on:
   pull_request:
@@ -61,6 +62,19 @@ jobs:
           VERSION: ${{ needs.version.outputs.value }}
         # The tag is the source of truth; Cargo.toml's version is stamped only for this build (shown by --version).
         run: sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml && grep -m1 '^version' Cargo.toml
+      # WinDivert for holding connections (#60): the pinned release, checked by SHA-256. The tests use it, and the
+      # release ships its x64 DLL and driver unmodified, with its licence (LGPL v3 / GPL v2).
+      - name: Fetch WinDivert 2.2.2-A
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'WinDivert-2.2.2-A.zip'
+          Invoke-WebRequest https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15') {
+            throw "WinDivert-2.2.2-A.zip has SHA-256 $hash, not the pinned one"
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          "GATEWIZZ_WINDIVERT_DIR=$(Join-Path $env:RUNNER_TEMP 'WinDivert-2.2.2-A\x64')" >> $env:GITHUB_ENV
       - name: Test and build release
         run: |
           cargo test --release
@@ -71,7 +85,10 @@ jobs:
         run: |
           mkdir dist
           cp target/release/gatewizz.exe "dist/gatewizz-v$VERSION-windows-x64.exe"
-          cd dist && sha256sum *.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+          wd="$(cygpath -u "$GATEWIZZ_WINDIVERT_DIR")"
+          cp "$wd/WinDivert.dll" "$wd/WinDivert64.sys" dist/
+          cp "$wd/../LICENSE" dist/WinDivert-LICENSE.txt
+          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist

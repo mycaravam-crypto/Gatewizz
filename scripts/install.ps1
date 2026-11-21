@@ -5,8 +5,28 @@
 # %LOCALAPPDATA%\gatewizz\gatewizz.toml from the example if it does not exist
 # (an existing configuration is never overwritten) and validates it.
 # No administrator rights are needed.
+#
+# -WithWinDivert also installs WinDivert.dll, WinDivert64.sys and their licence
+# (WinDivert 2.2.2-A, attached to every release, verified the same way) next to
+# gatewizz.exe. The connection firewall needs them only for `[firewall] hold`
+# (#60); `gatewizz firewall install` checks them again before it copies them.
+param([switch] $WithWinDivert)
 
 $ErrorActionPreference = "Stop"
+
+# Downloads a release asset to the staging directory and checks it against SHA256SUMS.txt.
+function Get-VerifiedAsset($Release, [string] $Name, [string] $Sums, [string] $Dir) {
+    $asset = $Release.assets | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    if (-not $asset) { throw "The release has no $Name." }
+    $path = Join-Path $Dir $Name
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $path -UseBasicParsing
+    $pattern = "(?m)^([0-9a-fA-F]{64})\s+\*?" + [regex]::Escape($Name) + "\s*$"
+    $match = [regex]::Match((Get-Content -Raw -LiteralPath $Sums), $pattern)
+    if (-not $match.Success) { throw "No checksum entry found for $Name." }
+    $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $match.Groups[1].Value.ToLowerInvariant()) { throw "SHA-256 verification failed for $Name; nothing was installed from it." }
+    $path
+}
 
 $repo = "mycaravam-crypto/Gatewizz"
 $installDir = Join-Path $env:LOCALAPPDATA "Programs\Gatewizz"
@@ -89,6 +109,14 @@ try {
         -Wait -PassThru -NoNewWindow
     if ($validation.ExitCode -ne 0) {
         throw "Configuration validation failed (exit code $($validation.ExitCode)). Review $configPath before starting Gatewizz."
+    }
+
+    if ($WithWinDivert) {
+        foreach ($name in 'WinDivert.dll', 'WinDivert64.sys', 'WinDivert-LICENSE.txt') {
+            $file = Get-VerifiedAsset $release $name $downloadSums $tempDir
+            Move-Item -LiteralPath $file -Destination (Join-Path $installDir $name) -Force
+        }
+        Write-Host "WinDivert installed next to gatewizz.exe, for [firewall] hold."
     }
 
     if ($backupPath -and (Test-Path -LiteralPath $backupPath)) {

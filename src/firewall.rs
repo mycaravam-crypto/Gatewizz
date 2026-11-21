@@ -101,8 +101,8 @@ impl Net {
     }
 
     #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for the approval prompt, next in #59")
+        not(any(test, windows)),
+        expect(dead_code, reason = "the hold service runs on Windows only")
     )]
     pub fn contains(&self, ip: IpAddr) -> bool {
         let bits = |a: IpAddr| match a {
@@ -422,11 +422,12 @@ pub fn plan(
     for (i, rule) in rules.iter().enumerate().filter(|(_, r)| r.active(now)) {
         let (dims, narrow) = rule.specificity();
         // Specificity first, then block or ask over allow, then list order; the self rule and the default stay outside.
+        // Rule weights are odd: the even weight just above each one is free for its hold permit (see `hold_permits`).
         let weight = 1
             + (u64::from(dims) << 48)
             + (u64::from(narrow) << 32)
             + (u64::from(rule.action.blocks()) << 31)
-            + (count - i as u64);
+            + 2 * (count - i as u64);
         let mut remotes: Vec<Option<Net>> = rule.ip.iter().copied().map(Some).collect();
         for host in &rule.host {
             remotes.extend(resolved(host).into_iter().map(|ip| Some(Net::single(ip))));
@@ -490,6 +491,72 @@ pub fn plan(
     }
     out.sort_by_key(|f| std::cmp::Reverse(f.weight));
     out
+}
+
+/// The filter WFP applies to a connection: the highest-weight filter whose conditions all match, as WFP picks it
+/// within Gatewizz's sublayer. `None` means no Gatewizz filter matches, so the connection is allowed. `program` is the
+/// connecting program's full path.
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
+)]
+pub fn classify<'a>(
+    filters: &'a [Filter],
+    program: &str,
+    remote: IpAddr,
+    port: u16,
+    protocol: Protocol,
+) -> Option<&'a Filter> {
+    filters
+        .iter()
+        .filter(|f| {
+            f.program
+                .as_deref()
+                .is_none_or(|p| p.eq_ignore_ascii_case(program))
+                && f.remote.is_none_or(|net| net.contains(remote))
+                && f.port.is_none_or(|p| p == port)
+                && (f.protocol == Protocol::Any || f.protocol == protocol)
+        })
+        .max_by_key(|f| f.weight)
+}
+
+/// Whether any `ask` filter could cover a TCP connection to `remote`, whichever program opened it. When none can,
+/// the hold sends the SYN on at once, without looking up its program (#60).
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
+)]
+pub fn could_ask(filters: &[Filter], remote: std::net::SocketAddr) -> bool {
+    filters.iter().any(|f| {
+        f.action == RuleAction::Ask
+            && f.remote.is_none_or(|n| n.contains(remote.ip()))
+            && f.port.is_none_or(|p| p == remote.port())
+            && f.protocol != Protocol::Udp
+    })
+}
+
+/// The permits that let `ask` connections through WFP while the service holds them (#60): one per `ask` filter,
+/// same conditions, weight one above it. They live in a dynamic WFP session only, so WFP drops them when the service
+/// exits, and the `ask` filters block again (fail closed).
+///
+/// TCP only: holding works on the TCP SYN, so an `ask` filter for any protocol gets a TCP permit, and one for UDP
+/// none. UDP keeps being blocked and asked about afterwards, as without holding.
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
+)]
+pub fn hold_permits(filters: &[Filter]) -> Vec<Filter> {
+    filters
+        .iter()
+        .filter(|f| f.action == RuleAction::Ask && f.protocol != Protocol::Udp)
+        .map(|f| Filter {
+            rule: format!("hold:{}", f.rule),
+            protocol: Protocol::Tcp,
+            action: RuleAction::Allow,
+            weight: f.weight + 1,
+            ..f.clone()
+        })
+        .collect()
 }
 
 /// Program file names in active rules that `programs` resolves to no path: those parts of the rules are not
@@ -1213,5 +1280,155 @@ mod tests {
         // The newest survive.
         assert!(c.get("app.exe", "h.example", 20).is_some());
         assert!(c.get("app.exe", "h.example", 1).is_none());
+    }
+
+    #[test]
+    fn classify_picks_what_wfp_picks_and_hold_permits_sit_just_above_asks() {
+        let r = rules(
+            r#"
+            [[connection_rules]]
+            id = "ask-curl"
+            process = ['C:\tools\curl.exe']
+            action = "ask"
+
+            [[connection_rules]]
+            id = "allow-curl-https"
+            process = ['C:\tools\curl.exe']
+            ip = ["192.0.2.0/24"]
+            port = [443]
+            protocol = "tcp"
+            action = "allow"
+
+            [[connection_rules]]
+            id = "block-lan"
+            ip = ["10.0.0.0/8"]
+            action = "block"
+            "#,
+        );
+        let now = SystemTime::now();
+        let p = plan(
+            &r,
+            DefaultAction::Ask,
+            &own_paths(),
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        let curl = r"C:\Tools\CURL.exe";
+        let c = |ip: &str, port, proto| {
+            classify(&p, curl, ip.parse().unwrap(), port, proto).map(|f| f.rule.as_str())
+        };
+        assert_eq!(c("192.0.2.9", 443, Protocol::Tcp), Some("allow-curl-https"));
+        assert_eq!(c("192.0.2.9", 80, Protocol::Tcp), Some("ask-curl"));
+        // One pinned dimension each: the address-only block is narrower than the program-only ask, so it wins.
+        assert_eq!(c("10.1.1.1", 80, Protocol::Tcp), Some("block-lan"));
+        let other = classify(
+            &p,
+            r"C:\other.exe",
+            "10.1.1.1".parse().unwrap(),
+            80,
+            Protocol::Tcp,
+        );
+        assert_eq!(other.map(|f| f.rule.as_str()), Some("block-lan"));
+        let unmatched = classify(
+            &p,
+            r"C:\other.exe",
+            "8.8.8.8".parse().unwrap(),
+            53,
+            Protocol::Udp,
+        );
+        assert_eq!(unmatched.map(|f| f.rule.as_str()), Some("default"));
+        assert_eq!(
+            classify(&p, OWN_PATH, "10.1.1.1".parse().unwrap(), 80, Protocol::Tcp)
+                .map(|f| f.rule.as_str()),
+            Some(SELF_RULE)
+        );
+
+        // Every rule weight is odd, so a permit at weight + 1 never ties with another filter.
+        assert!(
+            p.iter()
+                .filter(|f| f.rule != SELF_RULE && f.rule != "default")
+                .all(|f| f.weight % 2 == 1)
+        );
+        let permits = hold_permits(&p);
+        assert_eq!(
+            permits.iter().map(|f| f.rule.as_str()).collect::<Vec<_>>(),
+            ["hold:ask-curl", "hold:default"]
+        );
+        let mut all = p.clone();
+        all.extend(permits);
+        assert!(all.iter().all(
+            |f| all.iter().filter(|g| g.weight == f.weight).count() == 1 || f.rule == SELF_RULE
+        ));
+        // With the permits in place, what asked is now allowed (held by the service), and nothing else changed.
+        let c2 = |ip: &str, port, proto| {
+            classify(&all, curl, ip.parse().unwrap(), port, proto).map(|f| f.rule.as_str())
+        };
+        assert_eq!(c2("192.0.2.9", 80, Protocol::Tcp), Some("hold:ask-curl"));
+        assert_eq!(
+            c2("192.0.2.9", 443, Protocol::Tcp),
+            Some("allow-curl-https")
+        );
+        let other = classify(
+            &all,
+            r"C:\other.exe",
+            "10.1.1.1".parse().unwrap(),
+            80,
+            Protocol::Tcp,
+        );
+        assert_eq!(other.map(|f| f.rule.as_str()), Some("block-lan"));
+        // UDP is never let through: it cannot be held, so it keeps being blocked and asked about.
+        assert_eq!(c2("192.0.2.9", 53, Protocol::Udp), Some("ask-curl"));
+        assert!(
+            all.iter()
+                .filter(|f| f.rule.starts_with("hold:"))
+                .all(|f| f.protocol == Protocol::Tcp)
+        );
+        let udp_only = rules(
+            "[[connection_rules]]\nid = \"ask-dns\"\nport = [53]\nprotocol = \"udp\"\naction = \"ask\"\n",
+        );
+        let p = plan(
+            &udp_only,
+            DefaultAction::Allow,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(hold_permits(&p).is_empty());
+        // could_ask: an ask filter for TCP or any protocol covers the address and port; a UDP-only one never does.
+        let p = plan(
+            &r,
+            DefaultAction::Allow,
+            &own_paths(),
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(
+            could_ask(&p, "192.0.2.9:80".parse().unwrap()),
+            "ask-curl covers any address"
+        );
+        let p = plan(
+            &udp_only,
+            DefaultAction::Allow,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(!could_ask(&p, "192.0.2.9:53".parse().unwrap()));
+        let p = plan(
+            &udp_only,
+            DefaultAction::Ask,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(
+            could_ask(&p, "192.0.2.9:443".parse().unwrap()),
+            "the ask default covers everything"
+        );
     }
 }

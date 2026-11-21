@@ -20,6 +20,8 @@
 #   -Firewall       also run the connection firewall part (#59). Needs an elevated prompt (Run as administrator). It
 #                   installs the gatewizz-fw service with test rules for curl.exe only and removes it at the end, so
 #                   it refuses to run if the firewall is already installed (that would replace your rules).
+#                   With WinDivert.dll and WinDivert64.sys (Gatewizz release assets) next to gatewizz.exe, or in
+#                   -WinDivertDir, it also checks holding connections while asking (#60).
 #   -Report         where to write the Markdown report
 param(
     [string] $Exe = (Join-Path $env:LOCALAPPDATA 'Programs\Gatewizz\gatewizz.exe'),
@@ -29,6 +31,7 @@ param(
     [switch] $SkipApproval,
     [switch] $SkipMonitor,
     [switch] $Firewall,
+    [string] $WinDivertDir = '',
     [string] $Report = (Join-Path (Get-Location) ("gatewizz-acceptance-{0:yyyyMMdd-HHmm}.md" -f (Get-Date)))
 )
 $ErrorActionPreference = 'Stop'
@@ -525,9 +528,9 @@ action = "block"
         $pin[$h] = ([System.Net.Dns]::GetHostAddresses($h) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1).ToString()
     }
     # A direct connection, past the proxy; returns curl's HTTP status ("000" when the connection is blocked).
-    function Invoke-Direct([string] $Program, [string] $HostName, [int] $ToPort, [string] $Scheme) {
+    function Invoke-Direct([string] $Program, [string] $HostName, [int] $ToPort, [string] $Scheme, [int] $MaxTime = 5) {
         $out = Join-Path $work ('direct-' + [guid]::NewGuid().ToString('N') + '.txt')
-        $arguments = @('-s', '-o', 'NUL', '-w', '%{http_code}', '--max-time', '5', '--noproxy', '*',
+        $arguments = @('-s', '-k', '-o', 'NUL', '-w', '%{http_code}', '--max-time', "$MaxTime", '--noproxy', '*',
             '--resolve', "${HostName}:${ToPort}:$($pin[$HostName])", "${Scheme}://${HostName}:${ToPort}/")
         Start-Process -FilePath $Program -ArgumentList (Join-CommandLine $arguments) -NoNewWindow -Wait -RedirectStandardOutput $out | Out-Null
         if (Test-Path $out) { (Get-Content -Raw $out).Trim() } else { '' }
@@ -577,6 +580,42 @@ action = "block"
         Check 59 'proxy enforcement: the wizz tool cannot connect past the proxy' ($bypass -eq '000') "status $bypass"
         $through = Start-Process -FilePath $wizz -ArgumentList (Join-CommandLine @('-s', '-o', 'NUL', '--max-time', '30', '-x', $proxy, 'http://example.com/')) -NoNewWindow -Wait -PassThru
         Check 59 'proxy enforcement: the wizz tool reaches the network through Gatewizz' ($through.ExitCode -eq 0) "curl exit $($through.ExitCode)"
+
+        # Holding (#60): with the WinDivert files next to gatewizz.exe, asked-about connections wait for the answer.
+        $wdFiles = 'WinDivert.dll', 'WinDivert64.sys'
+        $exeDir = Split-Path $Exe
+        if ($WinDivertDir) { foreach ($f in $wdFiles) { Copy-Item (Join-Path $WinDivertDir $f) $exeDir -Force } }
+        if (@($wdFiles | Where-Object { -not (Test-Path (Join-Path $exeDir $_)) }).Count -eq 0) {
+            $holdConfig = Join-Path $work 'firewall-hold.toml'
+            Set-Content -Path $holdConfig -Value ((Get-Content -Raw $fwConfig) + "`n[firewall]`nhold = true`n")
+            $r = Invoke-Gatewizz @('firewall', 'apply', '--config', $holdConfig)
+            Check 60 'apply with hold = true copies the verified WinDivert files' ($r.Code -eq 0 -and (Test-Path (Join-Path $fwHome 'WinDivert64.sys'))) $r.Text
+            $holding = Wait-Until { (Read-Text (Join-Path $fwHome 'service.log')) -match 'holding new connections' } 30
+            Check 60 'the service holds connections' $holding (Read-Text (Join-Path $fwHome 'service.log'))
+            Ask 60 'Microsoft Defender lets WinDivert load' 'Did Windows Security stay quiet about WinDivert (no warning, nothing quarantined)?'
+
+            Say 'curl.exe connects to example.net:443 once and waits. The window shows it as Waiting. Click "Allow once".'
+            $started = Get-Date
+            $held = Invoke-Direct $curl 'example.net' 443 'https' 30
+            Check 60 'allowed, a held connection completes on its first attempt' ($held -ne '000') "status $held after $([int]((Get-Date) - $started).TotalSeconds) s"
+            Ask 60 'the held connection showed as Waiting' 'Did the queue show curl.exe to example.net:443 as Waiting (not Blocked)?'
+
+            Say 'Next: example.org:80 waits. Click "Deny always".'
+            $started = Get-Date
+            $refused = Invoke-Direct $curl 'example.org' 80 'http' 30
+            $took = ((Get-Date) - $started).TotalSeconds
+            Check 60 'denied, a held connection is refused, not left to time out' ($refused -eq '000' -and $took -lt 25) "status $refused after $([int]$took) s"
+
+            Say 'Next: example.org:8443 waits. Do NOT answer; it is refused after 20 seconds.'
+            $started = Get-Date
+            $timedOut = Invoke-Direct $curl 'example.org' 8443 'https' 30
+            $took = ((Get-Date) - $started).TotalSeconds
+            Check 60 'unanswered, a held connection is refused after the hold timeout' ($timedOut -eq '000' -and $took -ge 15 -and $took -lt 25) "status $timedOut after $([int]$took) s"
+            $evidence.Add('Hold log lines: ' + ((((Read-Text (Join-Path $fwHome 'service.log')) -split "`n") | Where-Object { $_ -match 'holding:|released:|refused \(' } | Select-Object -Last 4) -join ' | ').Replace($env:USERNAME, '<user>'))
+        } else {
+            Record 60 'holding connections' 'skip' 'WinDivert.dll and WinDivert64.sys (from the Gatewizz release) are not next to gatewizz.exe; or pass -WinDivertDir'
+        }
+
         $log = Read-Text (Join-Path $fwHome 'service.log')
         $evidence.Add('Firewall service log, blocked lines: ' + ((($log -split "`n") | Where-Object { $_ -match 'blocked:' } | Select-Object -Last 3) -join ' | ').Replace($env:USERNAME, '<user>'))
 
@@ -597,6 +636,7 @@ $issueTitles = [ordered]@{
     '36' = 'M3.1: icon, manifest and background start'
     '57' = 'Firewall Phase 1: connection monitor'
     '59' = 'Firewall Phase 2: connection rules and prompt'
+    '60' = 'Firewall Phase 3: holding connections while asking'
 }
 $os = (Get-CimInstance Win32_OperatingSystem)
 $lines = New-Object System.Collections.Generic.List[string]
