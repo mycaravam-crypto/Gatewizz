@@ -4,10 +4,12 @@
 //! control the service anyway) and interactively logged-on users (the tray app); everyone else, network clients
 //! included, is refused. One client at a time: the tray app of the signed-in user.
 //!
+//! The access list cannot name the user at the machine: the service starts before anyone signs in. So each
+//! connection is checked too ([`admit`]): the client must run in the active console session, or be an elevated
+//! administrator. Another user signed in on the same machine (fast user switching, Remote Desktop) is refused.
+//!
 //! What crosses the pipe is metadata only (see `prompt.rs`), and the service validates every decision against the
 //! notices it sent, so access to the pipe never means access to arbitrary rules.
-// ponytail: any interactive user may connect, not only the console user; on a shared terminal server, another
-// signed-in user could answer prompts. Narrowing to the active console session's SID needs WTS calls.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 /// The pipe's name.
@@ -28,6 +30,16 @@ pub fn device_to_dos(device_path: &str, drives: &[(String, String)]) -> Option<S
         rest.starts_with('\\')
             .then(|| format!("{drive}{}", &device_path[device.len()..]))
     })
+}
+
+/// Whether a connected client may answer prompts: it runs in the active console session (the person at the machine),
+/// or it is an elevated administrator, who controls the service anyway. Unknown sessions are refused.
+pub fn admit(
+    client_session: Option<u32>,
+    console_session: Option<u32>,
+    elevated_admin: bool,
+) -> bool {
+    elevated_admin || matches!((client_session, console_session), (Some(c), Some(s)) if c == s)
 }
 
 #[cfg(windows)]
@@ -55,9 +67,11 @@ mod sys {
         QueryDosDeviceW,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientSessionId,
+        GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
     };
+    use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
@@ -216,7 +230,7 @@ mod sys {
                 while !thread_stopping.load(Ordering::SeqCst) {
                     let connected = unsafe { ConnectNamedPipe(handle, null_mut()) } != 0
                         || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
-                    if connected && !thread_stopping.load(Ordering::SeqCst) {
+                    if connected && !thread_stopping.load(Ordering::SeqCst) && admitted(handle) {
                         serve_client(handle, &thread_client, &decisions, &thread_stopping);
                     }
                     {
@@ -250,6 +264,54 @@ mod sys {
             stopping,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// [`super::admit`] for the client connected to `handle`: its session against the active console session, and,
+    /// only if that does not admit it, whether its token is an elevated administrator's.
+    fn admitted(handle: HANDLE) -> bool {
+        let mut session = 0u32;
+        let client_session =
+            (unsafe { GetNamedPipeClientSessionId(handle, &mut session) } != 0).then_some(session);
+        // 0xFFFFFFFF: no session is attached to the console right now (it is being switched).
+        let console = unsafe { WTSGetActiveConsoleSessionId() };
+        let console_session = (console != u32::MAX).then_some(console);
+        super::admit(client_session, console_session, false)
+            || super::admit(None, None, elevated_admin(handle))
+    }
+
+    /// Whether the pipe's client runs with an elevated administrator token. Fails closed: any error is "no".
+    fn elevated_admin(handle: HANDLE) -> bool {
+        use windows_sys::Win32::Security::{
+            CheckTokenMembership, CreateWellKnownSid, RevertToSelf, SECURITY_MAX_SID_SIZE,
+            TOKEN_QUERY, WinBuiltinAdministratorsSid,
+        };
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
+            return false;
+        }
+        let mut token: HANDLE = null_mut();
+        // OpenAsSelf: open the token with the service's own rights, not the client's.
+        let opened =
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+        // Always back to the service's own identity before anything else runs on this thread.
+        if unsafe { RevertToSelf() } == 0 {
+            // Still impersonating: never go on serving with the client's identity. Abort instead.
+            std::process::abort();
+        }
+        if !opened {
+            return false;
+        }
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = sid.len() as u32;
+        let mut member = 0;
+        let ok = unsafe {
+            CreateWellKnownSid(WinBuiltinAdministratorsSid, null_mut(), sid.as_mut_ptr().cast(), &mut size) != 0
+                // A filtered (not elevated) administrator token has the group as deny-only, which does not count.
+                && CheckTokenMembership(token, sid.as_mut_ptr().cast(), &mut member) != 0
+        };
+        unsafe { CloseHandle(token) };
+        ok && member != 0
     }
 
     /// Always with FILE_FLAG_FIRST_PIPE_INSTANCE: there is only ever one instance, ours, so an existing pipe of the
@@ -559,6 +621,15 @@ mod tests {
             device_to_dos(r"\device\mup\server\share\x.exe", &drives()),
             None
         );
+    }
+
+    #[test]
+    fn only_the_console_session_or_an_elevated_admin_is_admitted() {
+        assert!(admit(Some(1), Some(1), false), "the person at the machine");
+        assert!(!admit(Some(2), Some(1), false), "another signed-in user");
+        assert!(admit(Some(2), Some(1), true), "an elevated administrator");
+        assert!(!admit(None, Some(1), false), "unknown session");
+        assert!(!admit(Some(1), None, false), "console being switched");
     }
 
     #[test]
