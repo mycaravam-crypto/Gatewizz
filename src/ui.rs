@@ -1039,7 +1039,7 @@ mod app {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(RichText::new("Gatewizz").font(semibold(18.0)).color(TEXT));
                     ui.label(
-                        RichText::new("Local security gate for traffic to AI models")
+                        RichText::new("Local security gate for outgoing traffic")
                             .size(12.0)
                             .color(MUTED),
                     );

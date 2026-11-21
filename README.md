@@ -1,8 +1,10 @@
 # gatewizz
 
-A local HTTPS security gate for code sent to AI models on Windows. It is a loopback proxy for developer tools and coding agents: it attributes each connection to its process, optionally decrypts HTTPS, checks requests against local rules, and allows, blocks or holds them for approval in a tray app. Decisions are logged as metadata; request content and secrets are never stored.
+A local security gate for outgoing traffic on Windows. It is a loopback HTTPS proxy: it attributes each connection to its process, optionally decrypts HTTPS, checks requests against local rules, and allows, blocks or holds them for approval in a tray app. Decisions are logged as metadata; request content and secrets are never stored.
 
-An optional connection firewall extends this beyond the proxy: it decides every outgoing connection of every program through the Windows Filtering Platform, so AI tools can be limited to reaching the network only through gatewizz.
+An optional connection firewall extends this beyond the proxy: it decides every outgoing connection of every program through the Windows Filtering Platform, so any program can be limited to reaching the network only through gatewizz.
+
+One common use is keeping developer tools and coding agents from sending secrets or private code to AI providers unnoticed. The rules themselves work for any program and any host.
 
 **Status:** the proxy (M1–M3) and firewall Phases 1–2 are merged; Phase 3, holding a connection while asking, is in progress ([#60](https://github.com/mycaravam-crypto/Gatewizz/issues/60)). Manual acceptance on real Windows is tracked in [#66](https://github.com/mycaravam-crypto/Gatewizz/issues/66).
 
