@@ -12,7 +12,7 @@ Each request is evaluated before any upstream connection is opened. Blocked or u
 
 ## Installation and commands
 
-The release executable targets Windows 10/11 x64 and has no runtime dependencies. Download the executable and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/mycaravam-crypto/Gatewizz/releases).
+The release executable targets Windows 10/11 x64 and has no runtime dependencies. [`scripts/install.ps1`](../scripts/install.ps1) installs or updates it for the current user (see the [README](../README.md#install)); alternatively, download the executable and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/mycaravam-crypto/Gatewizz/releases).
 
 Common commands:
 
