@@ -827,7 +827,9 @@ mod holding {
             } = self;
             drop(session);
             inner.stopping.store(true, Ordering::SeqCst);
-            for held in locked(&inner.queue).take(|_| true) {
+            // Taken out first: refusing locks the queue again.
+            let waiting = locked(&inner.queue).take(|_| true);
+            for held in waiting {
                 inner.refuse(
                     &held.syn,
                     &held.address.0,
@@ -890,6 +892,17 @@ mod holding {
                     let _ = self.divert.send(packet, &address);
                     continue;
                 };
+                // A retransmission of a connection answered already: it went on, so its retransmissions do too (the
+                // network may have lost the first SYN); it was refused, so they are dropped.
+                let settled = locked(&self.queue).settled(syn.key(), Instant::now());
+                match settled {
+                    Some(true) => {
+                        let _ = self.divert.send(packet, &address);
+                        continue;
+                    }
+                    Some(false) => continue,
+                    None => {}
+                }
                 let filters = locked(&self.filters).clone();
                 if !could_ask(&filters, &syn) {
                     let _ = self.divert.send(packet, &address);
@@ -949,6 +962,7 @@ mod holding {
         }
 
         fn release(&self, packet: &[u8], address: &Address, program: &str, syn: &Syn) {
+            locked(&self.queue).settle(syn.key(), true, Instant::now());
             match self.divert.send(packet, address) {
                 Ok(()) => log(&format!(
                     "released: {} -> {}",
@@ -965,6 +979,7 @@ mod holding {
 
         /// Answers the SYN with a RST: the program's connect fails at once with "connection refused".
         fn refuse(&self, syn: &Syn, address: &Address, program: &str, why: &str) {
+            locked(&self.queue).settle(syn.key(), false, Instant::now());
             let sent = self.divert.send(&hold::rst_for(syn), &address.reply());
             log(&format!(
                 "refused ({why}): {} -> {}{}",

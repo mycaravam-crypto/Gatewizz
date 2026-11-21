@@ -13,7 +13,12 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+/// The IP protocol number of TCP.
 const TCP: u8 = 6;
+/// TTL (IPv4) and hop limit (IPv6) of the RSTs: the usual default; they never leave the machine anyway.
+const HOPS: u8 = 64;
+/// IPv4 "don't fragment", in the flags byte.
+const DONT_FRAGMENT: u8 = 0x40;
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
@@ -89,8 +94,8 @@ pub fn rst_for(syn: &Syn) -> Vec<u8> {
             let mut ip = [0u8; 20];
             ip[0] = 0x45;
             ip[2..4].copy_from_slice(&40u16.to_be_bytes());
-            ip[6] = 0x40; // don't fragment
-            ip[8] = 64;
+            ip[6] = DONT_FRAGMENT;
+            ip[8] = HOPS;
             ip[9] = TCP;
             ip[12..16].copy_from_slice(&src.octets());
             ip[16..20].copy_from_slice(&dst.octets());
@@ -106,7 +111,7 @@ pub fn rst_for(syn: &Syn) -> Vec<u8> {
             ip[0] = 0x60;
             ip[4..6].copy_from_slice(&20u16.to_be_bytes());
             ip[6] = TCP;
-            ip[7] = 64;
+            ip[7] = HOPS;
             ip[8..24].copy_from_slice(&src.octets());
             ip[24..40].copy_from_slice(&dst.octets());
             let pseudo = [
@@ -171,7 +176,16 @@ pub struct Queue<A> {
     max: usize,
     timeout: Duration,
     held: Vec<Held<A>>,
+    /// Connections answered lately, and whether they went on: their retransmitted SYNs keep arriving for a while
+    /// (Windows resends a SYN after about a second) and must not be asked about again.
+    settled: Vec<(Key, bool, Instant)>,
 }
+
+/// A connection's two ends, as [`Syn::key`] gives them.
+pub type Key = (SocketAddr, SocketAddr);
+
+/// How long an answered connection's retransmissions are recognised: longer than Windows keeps retrying a SYN.
+pub const SETTLED_TTL: Duration = Duration::from_secs(60);
 
 impl<A> Queue<A> {
     pub fn new(max: usize, timeout: Duration) -> Self {
@@ -179,7 +193,29 @@ impl<A> Queue<A> {
             max: max.max(1),
             timeout,
             held: Vec::new(),
+            settled: Vec::new(),
         }
+    }
+
+    /// Remembers that the connection `key` was answered: `released` if its SYN went on, else refused.
+    pub fn settle(&mut self, key: Key, released: bool, now: Instant) {
+        self.settled
+            .retain(|(k, _, at)| *k != key && now.duration_since(*at) < SETTLED_TTL);
+        // Bounded like the queue: the oldest answers are forgotten first.
+        if self.settled.len() >= self.max * 4 {
+            self.settled.remove(0);
+        }
+        self.settled.push((key, released, now));
+    }
+
+    /// For a SYN of a connection answered within [`SETTLED_TTL`]: `Some(true)` if it was released (let the
+    /// retransmission go on, the network may have lost the first), `Some(false)` if it was refused (drop it).
+    pub fn settled(&self, key: Key, now: Instant) -> Option<bool> {
+        self.settled
+            .iter()
+            .rev()
+            .find(|(k, _, at)| *k == key && now.duration_since(*at) < SETTLED_TTL)
+            .map(|(_, released, _)| *released)
     }
 
     pub fn offer(&mut self, syn: Syn, packet: Vec<u8>, address: A, now: Instant) -> Offer {
@@ -368,5 +404,37 @@ mod tests {
         assert!(q.is_empty() && q.next_deadline().is_none());
         // Room again once the queue drained.
         assert_eq!(q.offer(syn(3), vec![3], 0, start), Offer::Held);
+    }
+
+    #[test]
+    fn answered_connections_are_recognised_by_their_retransmissions() {
+        let start = Instant::now();
+        let syn =
+            |port| parse_syn(&v4_packet("192.0.2.10", "198.51.100.7", port, 443, 1, SYN)).unwrap();
+        let mut q: Queue<u8> = Queue::new(2, Duration::from_secs(20));
+        assert_eq!(q.settled(syn(1).key(), start), None);
+        q.settle(syn(1).key(), true, start);
+        q.settle(syn(2).key(), false, start);
+        assert_eq!(
+            q.settled(syn(1).key(), start + Duration::from_secs(1)),
+            Some(true)
+        );
+        assert_eq!(
+            q.settled(syn(2).key(), start + Duration::from_secs(1)),
+            Some(false)
+        );
+        assert_eq!(q.settled(syn(3).key(), start), None);
+        // The latest answer counts, and answers are forgotten after SETTLED_TTL.
+        q.settle(syn(1).key(), false, start + Duration::from_secs(2));
+        assert_eq!(
+            q.settled(syn(1).key(), start + Duration::from_secs(3)),
+            Some(false)
+        );
+        assert_eq!(q.settled(syn(2).key(), start + SETTLED_TTL), None);
+        // Bounded: four times the queue size at most.
+        for port in 10..30 {
+            q.settle(syn(port).key(), true, start);
+        }
+        assert!(q.settled.len() <= 8);
     }
 }

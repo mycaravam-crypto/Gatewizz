@@ -28,8 +28,9 @@ pub fn hex(bytes: &[u8]) -> String {
 /// driver injected (they were decided already). Narrower filters are for tests.
 pub const HOLD_FILTER: &str = "outbound and !loopback and !impostor and tcp.Syn and !tcp.Ack";
 
-/// `WINDIVERT_MTU_MAX`: the largest packet WinDivert hands out.
-pub const MTU_MAX: usize = 40 + 0xFFFF;
+/// `WINDIVERT_MTU_MAX`: the largest packet WinDivert hands out, an IPv6 header (40 bytes) and the largest payload
+/// its 16-bit length field allows.
+pub const MTU_MAX: usize = 40 + u16::MAX as usize;
 
 /// `WINDIVERT_ADDRESS` (80 bytes): where a packet came from and how to send it on.
 #[repr(C)]
@@ -322,6 +323,31 @@ mod tests {
         assert!(FILES.iter().all(|(_, digest)| digest.len() == 64));
     }
 
+    /// The pinned digests refuse anything else: a missing file, and a file with other bytes.
+    #[cfg(windows)]
+    #[test]
+    fn only_the_pinned_windivert_files_pass() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-divert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = verify(&dir).unwrap_err();
+        assert!(
+            missing.contains("cannot read") && missing.contains("WinDivert.dll"),
+            "{missing}"
+        );
+        for (name, _) in FILES {
+            std::fs::write(dir.join(name), b"not the driver").unwrap();
+        }
+        let wrong = verify(&dir).unwrap_err();
+        assert!(
+            wrong.contains("is not the pinned WinDivert 2.2.2-A build"),
+            "{wrong}"
+        );
+        // Divert::open checks first, so a wrong file is never loaded.
+        let refused = Divert::open(&dir, HOLD_FILTER, 0).err().unwrap();
+        assert!(refused.contains("not the pinned"), "{refused}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The elevated Windows CI test from #60: a connection is held, then released or refused. Needs the WinDivert
     /// files in `GATEWIZZ_WINDIVERT_DIR` (the CI job downloads and verifies the pinned release) and administrator
     /// rights, which GitHub's Windows runners have.
@@ -371,10 +397,18 @@ mod tests {
         assert_eq!(result, Ok(()), "the released connection completes");
         assert!(waited >= Duration::from_secs(2), "it was held: {waited:?}");
 
-        // Refused: a RST answers the held SYN, and the connect fails at once with "refused".
+        let first = syn.key();
+
+        // Refused: a RST answers the held SYN, and the connect fails at once with "refused". Windows resends a SYN
+        // after about a second, so the first connection's retransmissions can still be queued: skip those.
         let app = std::thread::spawn(connect);
-        let (len, address) = divert.recv(&mut buf).expect("the second SYN is diverted");
-        let syn = hold::parse_syn(&buf[..len]).expect("a SYN");
+        let (syn, address) = loop {
+            let (len, address) = divert.recv(&mut buf).expect("the second SYN is diverted");
+            let syn = hold::parse_syn(&buf[..len]).expect("a SYN");
+            if syn.key() != first {
+                break (syn, address);
+            }
+        };
         divert.send(&hold::rst_for(&syn), &address.reply()).unwrap();
         let (result, waited) = app.join().unwrap();
         assert_eq!(result, Err(std::io::ErrorKind::ConnectionRefused));
