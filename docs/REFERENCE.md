@@ -311,7 +311,7 @@ The executable embeds its icon and manifest via `build.rs`. The manifest request
 
 ## Acceptance testing on Windows
 
-Some checks need a real Windows session: the icon, the tray, approvals clicked by a person, Ctrl+C in a console and the Windows certificate dialogs. [`scripts/windows-acceptance.ps1`](../scripts/windows-acceptance.ps1) covers the open acceptance items of #17, #22, #35, #36, #57 and, with `-Firewall`, #59. It measures what it can, asks y/n questions for what only a person can see, and writes a Markdown report to paste into the issues.
+Some checks need a real Windows session: the icon, the tray, approvals clicked by a person, Ctrl+C in a console and the Windows certificate dialogs. [`scripts/windows-acceptance.ps1`](../scripts/windows-acceptance.ps1) covers the open acceptance items of #17, #22, #35, #36, #57 and, with `-Firewall`, #59 and #60 (holding, when the WinDivert files are next to `gatewizz.exe` or in `-WinDivertDir`). It measures what it can, asks y/n questions for what only a person can see, and writes a Markdown report to paste into the issues.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1
