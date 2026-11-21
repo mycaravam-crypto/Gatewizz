@@ -4,7 +4,7 @@ A local HTTPS security gate for code sent to AI models on Windows.
 
 gatewizz is a loopback proxy for developer tools and coding agents. It attributes connections to processes, optionally decrypts HTTPS, checks requests against local rules, and allows, blocks or holds them for approval. Decisions are logged as metadata; request content and secrets are never persisted.
 
-**Status:** M1–M3 implementation is merged. Real-Windows acceptance of proxy integrations and tray/approval interactions is still open: [#17](https://github.com/mycaravam-crypto/Gatewizz/issues/17), [#22](https://github.com/mycaravam-crypto/Gatewizz/issues/22), [#35](https://github.com/mycaravam-crypto/Gatewizz/issues/35), [#36](https://github.com/mycaravam-crypto/Gatewizz/issues/36).
+**Status:** The proxy (M1–M3) and the optional [connection firewall](#connection-firewall-optional-administrator) Phases 1–2 (monitor; block-then-ask) are merged. Phase 3, holding a new connection while asking, is in progress ([#60](https://github.com/mycaravam-crypto/Gatewizz/issues/60)). Manual acceptance on a real Windows machine is tracked in [#66](https://github.com/mycaravam-crypto/Gatewizz/issues/66).
 
 ## Install on Windows
 
@@ -192,6 +192,17 @@ Windows displays a certificate trust confirmation. Administrator rights are not 
 
 Certificate-pinned and mutual-TLS endpoints may need to be listed in `tunnel_hosts`; those connections remain encrypted tunnels and cannot be inspected.
 
+## Connection monitor (optional)
+
+To see every TCP connection on the computer, not only proxied ones, add this to your configuration and restart Gatewizz:
+
+```toml
+[monitor]
+enabled = true
+```
+
+The tray app's **Network** tab then lists current connections grouped by program, with hostname, address, port and direction, and marks a program's first connection to a host as **New**. Opened and closed connections are logged as metadata only; no connection content is read. It needs no administrator rights. Details and limits: [Connection monitor](docs/REFERENCE.md#connection-monitor).
+
 ## Connection firewall (optional, administrator)
 
 The proxy sees only tools that use it. The optional connection firewall decides every outgoing connection of every program, by program, address, port and protocol, through the Windows Filtering Platform. With it, the AI tools can be limited to reaching the network only through Gatewizz.
@@ -217,7 +228,7 @@ See [Configuration and rules](docs/REFERENCE.md#configuration-and-rules) for mat
 
 ## Documentation
 
-- [Reference](docs/REFERENCE.md): CA lifecycle, HTTPS inspection, rules, approvals, event records, tool integration, limitations, build and CI.
+- [Reference](docs/REFERENCE.md): CA lifecycle, HTTPS inspection, rules, approvals, connection monitor and firewall, event records, tool integration, limitations, build and CI.
 - [Engineering plan](PLAN.md): scope, non-goals, engineering rules, architecture and milestone status.
 - [Example configuration](config/gatewizz.example.toml)
 - [GitHub Releases](https://github.com/mycaravam-crypto/Gatewizz/releases)
