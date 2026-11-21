@@ -523,6 +523,9 @@ pub fn classify<'a>(
 /// The permits that let `ask` connections through WFP while the service holds them (#60): one per `ask` filter,
 /// same conditions, weight one above it. They live in a dynamic WFP session only, so WFP drops them when the service
 /// exits, and the `ask` filters block again (fail closed).
+///
+/// TCP only: holding works on the TCP SYN, so an `ask` filter for any protocol gets a TCP permit, and one for UDP
+/// none. UDP keeps being blocked and asked about afterwards, as without holding.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "for the hold service, next in #60")
@@ -530,9 +533,10 @@ pub fn classify<'a>(
 pub fn hold_permits(filters: &[Filter]) -> Vec<Filter> {
     filters
         .iter()
-        .filter(|f| f.action == RuleAction::Ask)
+        .filter(|f| f.action == RuleAction::Ask && f.protocol != Protocol::Udp)
         .map(|f| Filter {
             rule: format!("hold:{}", f.rule),
+            protocol: Protocol::Tcp,
             action: RuleAction::Allow,
             weight: f.weight + 1,
             ..f.clone()
@@ -1358,5 +1362,24 @@ mod tests {
             Protocol::Tcp,
         );
         assert_eq!(other.map(|f| f.rule.as_str()), Some("block-lan"));
+        // UDP is never let through: it cannot be held, so it keeps being blocked and asked about.
+        assert_eq!(c2("192.0.2.9", 53, Protocol::Udp), Some("ask-curl"));
+        assert!(
+            all.iter()
+                .filter(|f| f.rule.starts_with("hold:"))
+                .all(|f| f.protocol == Protocol::Tcp)
+        );
+        let udp_only = rules(
+            "[[connection_rules]]\nid = \"ask-dns\"\nport = [53]\nprotocol = \"udp\"\naction = \"ask\"\n",
+        );
+        let p = plan(
+            &udp_only,
+            DefaultAction::Allow,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(hold_permits(&p).is_empty());
     }
 }
