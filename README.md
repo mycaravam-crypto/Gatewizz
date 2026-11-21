@@ -196,7 +196,7 @@ Certificate-pinned and mutual-TLS endpoints may need to be listed in `tunnel_hos
 
 The proxy sees only tools that use it. The optional connection firewall decides every outgoing connection of every program, by program, address, port and protocol, through the Windows Filtering Platform. With it, the AI tools can be limited to reaching the network only through Gatewizz.
 
-It is the one part of Gatewizz that needs administrator rights. Everything above keeps working without it. Add `[[connection_rules]]` to your configuration (see the commented proxy-enforcement example in [config/gatewizz.example.toml](config/gatewizz.example.toml)), then, from an **elevated** PowerShell (Run as administrator):
+It is the one part of Gatewizz that needs administrator rights. Everything above keeps working without it. Add `[[connection_rules]]` to your configuration (see the commented proxy-enforcement example in [config/gatewizz.example.toml](config/gatewizz.example.toml)), then run these from PowerShell. Each one asks for administrator rights through the UAC prompt:
 
 ```powershell
 & $gatewizz firewall install --config $config   # install the gatewizz-fw service and apply the rules

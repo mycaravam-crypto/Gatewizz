@@ -13,6 +13,7 @@ mod config;
 mod connections;
 mod detect;
 mod dns;
+mod elevate;
 mod event;
 mod firewall;
 mod pipe;
@@ -54,10 +55,11 @@ Usage:
   gatewizz startup install [--config <path>]   start Gatewizz automatically at user login
   gatewizz startup remove                     remove automatic startup
   gatewizz startup status                     show automatic startup configuration
-  gatewizz firewall install [--config <path>]  install the firewall service that keeps the rules current (elevated)
-  gatewizz firewall apply [--config <path>]   enforce [[connection_rules]] with Windows filters (elevated)
-  gatewizz firewall remove                    remove the service and every Gatewizz firewall filter (elevated)
+  gatewizz firewall install [--config <path>]  install the firewall service that keeps the rules current
+  gatewizz firewall apply [--config <path>]   enforce [[connection_rules]] with Windows filters
+  gatewizz firewall remove                    remove the service and every Gatewizz firewall filter
   gatewizz firewall status                    show the firewall filters and service
+                                              (the firewall commands ask for administrator rights through UAC)
   gatewizz --version | --help
 
 Options:
@@ -308,6 +310,17 @@ fn run_with_ui(config: Config) -> Result<(), String> {
     run_proxy(&config, None, Default::default(), cancelled())
 }
 
+/// Runs a command that needs administrator rights. From a normal prompt, on Windows, it asks for them through UAC and
+/// runs the command in an elevated copy of gatewizz, which reports back to this one.
+fn elevated(command: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    #[cfg(windows)]
+    if !elevate::is_elevated() {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return elevate::relaunch(&args);
+    }
+    command()
+}
+
 fn run(command: Command) -> Result<ExitCode, String> {
     match command {
         Command::Version => println!("gatewizz {VERSION}"),
@@ -325,10 +338,14 @@ fn run(command: Command) -> Result<ExitCode, String> {
             Some(command) => println!("Gatewizz starts at user login: {command}"),
             None => println!("Gatewizz is not registered for automatic startup."),
         },
-        Command::FirewallInstall(path) => println!("{}", service::install(path.as_deref())?),
-        Command::FirewallApply(path) => println!("{}", service::apply(path.as_deref())?),
-        Command::FirewallRemove => println!("{}", service::uninstall()?),
-        Command::FirewallStatus => println!("{}", service::describe()?),
+        Command::FirewallInstall(path) => {
+            println!("{}", elevated(|| service::install(path.as_deref()))?)
+        }
+        Command::FirewallApply(path) => {
+            println!("{}", elevated(|| service::apply(path.as_deref()))?)
+        }
+        Command::FirewallRemove => println!("{}", elevated(service::uninstall)?),
+        Command::FirewallStatus => println!("{}", elevated(service::describe)?),
         Command::FirewallService => service::run()?,
         Command::CheckConfig(path) => {
             let config = load(path)?;
@@ -388,6 +405,17 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     let console = attach_parent_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The elevated copy started by `elevated`: run the command and report to the caller's pipe, nothing else.
+    #[cfg(windows)]
+    if let (args, Some(pipe)) = elevate::split_output(&args) {
+        let outcome = elevated_command(args);
+        let reported = elevate::report(pipe, &outcome);
+        return ExitCode::from(if outcome.is_ok() && reported {
+            0
+        } else {
+            EXIT_FAILURE
+        });
+    }
     match parse(&args).and_then(run) {
         Ok(code) => code,
         Err(err) => {
@@ -398,6 +426,21 @@ fn main() -> ExitCode {
             }
             ExitCode::from(EXIT_FAILURE)
         }
+    }
+}
+
+/// In the elevated copy: only the firewall commands that elevate, and only once (an elevated copy never relaunches).
+#[cfg(windows)]
+fn elevated_command(args: &[String]) -> Result<String, String> {
+    if !elevate::is_elevated() {
+        return Err("[firewall] the elevated copy is not elevated".into());
+    }
+    match parse(args)? {
+        Command::FirewallInstall(path) => service::install(path.as_deref()),
+        Command::FirewallApply(path) => service::apply(path.as_deref()),
+        Command::FirewallRemove => service::uninstall(),
+        Command::FirewallStatus => service::describe(),
+        _ => Err("[usage] only firewall install, apply, remove and status run elevated".into()),
     }
 }
 

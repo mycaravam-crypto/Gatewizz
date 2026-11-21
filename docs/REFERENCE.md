@@ -27,10 +27,10 @@ gatewizz startup install
 gatewizz startup install --config .\gatewizz.toml
 gatewizz startup status
 gatewizz startup remove
-gatewizz firewall install --config .\gatewizz.toml # elevated prompt
-gatewizz firewall apply --config .\gatewizz.toml   # elevated prompt
-gatewizz firewall status
-gatewizz firewall remove                           # elevated prompt
+gatewizz firewall install --config .\gatewizz.toml # asks for administrator rights (UAC)
+gatewizz firewall apply --config .\gatewizz.toml   # asks for administrator rights (UAC)
+gatewizz firewall status                           # asks for administrator rights (UAC)
+gatewizz firewall remove                           # asks for administrator rights (UAC)
 ```
 
 - `gatewizz`: starts the proxy and tray application; Ctrl+C or **Quit** in the tray stops it (exit 130).
@@ -202,7 +202,7 @@ Limits:
 
 ## Connection firewall
 
-The connection firewall turns `[[connection_rules]]` into Windows Filtering Platform (WFP) filters. Those filters allow or block outgoing connections per program, address, port and protocol, for every program, whether or not it uses the proxy. It is Phase 2 of #56 and needs an elevated (Run as administrator) prompt. Nothing else in Gatewizz does.
+The connection firewall turns `[[connection_rules]]` into Windows Filtering Platform (WFP) filters. Those filters allow or block outgoing connections per program, address, port and protocol, for every program, whether or not it uses the proxy. It is Phase 2 of #56 and needs administrator rights. Nothing else in Gatewizz does. From a normal prompt, the `firewall` commands ask for them through the UAC prompt, run in an elevated copy of `gatewizz.exe`, and print its output in the same console. That output comes back over a private pipe that accepts only the elevated process this command started, and nothing is written to disk. From an elevated prompt they run directly. Declining the UAC prompt changes nothing.
 
 ```powershell
 gatewizz firewall install --config .\gatewizz.toml # install the service that keeps the rules current
@@ -214,7 +214,7 @@ gatewizz firewall remove                           # remove the service, every f
 - **The service (`gatewizz-fw`):** `firewall install` sets up a Windows service that keeps the rules current.
   - It resolves program paths and host addresses again every 60 seconds, and at once after `firewall apply`.
   - It starts automatically at boot, before anyone signs in.
-  - It runs as LocalSystem, so it never runs or reads anything a normal user can write. `install` copies `gatewizz.exe` and the validated configuration into `%ProgramFiles%\Gatewizz`, which only administrators can change, and the service runs from that copy. `firewall apply` updates the copy, again from an elevated prompt. Editing your own configuration file changes nothing until you run `apply`.
+  - It runs as LocalSystem, so it never runs or reads anything a normal user can write. `install` copies `gatewizz.exe` and the validated configuration into `%ProgramFiles%\Gatewizz`, which only administrators can change, and the service runs from that copy. `firewall apply` updates the copy, again with administrator rights. Editing your own configuration file changes nothing until you run `apply`.
   - It writes each refresh, and any error, to `%ProgramFiles%\Gatewizz\service.log`. That file rotates at 256 KiB.
   - It logs each connection Gatewizz's filters block: `blocked: <program> -> <address>:<port> <protocol> (<program path>)`. Retries of the same program, host and port within a minute count as one. Drops by other firewalls are not logged. The service turns on WFP's net event collection for this, which Windows keeps in memory only.
   - When a refresh fails, or the service stops, the last filters stay in force (fail closed).
@@ -230,14 +230,14 @@ gatewizz firewall remove                           # remove the service, every f
   - Block filters are hard blocks, so other software cannot override them.
   - Filters are persistent: they stay in force after a reboot, or when Gatewizz is not running, until `firewall remove`.
   - `apply` replaces the whole set in one transaction, so a failed apply leaves the previous rules in place.
-- **Names:** WFP works with full program paths and IP addresses, so names are resolved on every apply and every service refresh. A program file name covers the copies on `PATH` and those running at that moment. A host covers the addresses it resolves to at that moment. `apply` warns about anything it could not resolve, since that part of a rule is not enforced until a later refresh finds it. Use full paths in `process`, and `ip`, for what must always be covered.
+- **Names:** WFP works with full program paths and IP addresses, so names are resolved on every apply and every service refresh. A program file name covers the copies on `PATH` and those running at that moment. A host covers the addresses it resolves to at that moment. A wildcard host (`*.example.com`) covers the addresses of the matching names in the Windows DNS cache, that is the names this machine has looked up lately. A name looked up for the first time is covered from the next refresh, at most 60 seconds later with the service. `apply` warns about anything it could not resolve, since that part of a rule is not enforced until a later refresh finds it. Use full paths in `process`, and `ip`, for what must always be covered.
 - **Gatewizz itself** is always allowed: the service's copy, and the copy that ran `install` or `apply` (your tray app and proxy). No rule can block it.
 - **`default`:**
   - `allow` (the default) filters only what rules name.
   - `block` blocks every program without a matching allow rule, Windows services included. Use it only with allow rules for everything that must keep working.
   - `ask` blocks like `block`, and offers each blocked connection to the prompt.
 
-- **The prompt pipe:** the service serves `\\.\pipe\gatewizz-fw`, which only SYSTEM, administrators and interactively logged-on users can open. Remote clients are rejected, and one client is served at a time. While a client is connected, each new connection blocked by an `ask` rule or the `ask` default is sent to it as a notice: program, path, address, port and protocol. Connections blocked by `block` rules, including "Deny always" answers, are only logged. The client answers with a decision.
+- **The prompt pipe:** the service serves `\\.\pipe\gatewizz-fw`, which only SYSTEM, administrators and interactively logged-on users can open. Each connection is checked too: the client must run in the active console session (the person at the machine) or be an elevated administrator. Another user signed in at the same time, by fast user switching or Remote Desktop, is refused; over Remote Desktop, start the tray app elevated to answer prompts. Remote clients are rejected, and one client is served at a time. While a client is connected, each new connection blocked by an `ask` rule or the `ask` default is sent to it as a notice: program, path, address, port and protocol. Connections blocked by `block` rules, including "Deny always" answers, are only logged. The client answers with a decision.
   - **What the service accepts:** only answers to notices it sent itself, within the last 10 minutes. The program, address and port always come from that notice. An answer may only widen to "any host" or "any port", choose allow or block, and pick "once" (2 minutes), 5, 15, 60 or 480 minutes, or "always".
   - **Where the rules go:** "always" rules are appended to the protected configuration as `[[connection_rules]]` (your text and comments stay) and validated first. Timed rules stay in the service's memory until they expire.
   - **The service only asks:** with no client connected, nothing is asked and the connection stays blocked.

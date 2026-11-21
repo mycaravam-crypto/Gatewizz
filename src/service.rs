@@ -56,6 +56,9 @@ fn self_paths_file() -> PathBuf {
 pub fn apply_config(config: &Config, own_paths: &[String]) -> Result<String, String> {
     let rules = &config.connection_rules;
     let now = SystemTime::now();
+    // Read once per apply: the names wildcard host rules expand to.
+    let cached = crate::dns::cached_hosts();
+    let resolve_host = |host: &str| resolve_host(host, &cached, lookup);
     let filters = firewall::plan(
         rules,
         config.firewall.default,
@@ -109,8 +112,8 @@ fn summary(
     }
     for host in unresolved_hosts {
         out.push_str(&format!(
-            "\nwarning: {host} has no IP address now (wildcards never do), so its rules are not enforced. Use `ip` \
-             for addresses that must be covered."
+            "\nwarning: {host} has no IP address now (a wildcard covers only names in the DNS cache), so its rules \
+             are not enforced yet. Use `ip` for addresses that must be covered."
         ));
     }
     for path in &applied.skipped {
@@ -121,18 +124,35 @@ fn summary(
     out
 }
 
-/// The addresses a host name resolves to now. Wildcards name no single host and resolve to nothing.
-fn resolve_host(host: &str) -> Vec<IpAddr> {
-    if host.starts_with("*.") {
-        return Vec::new();
-    }
-    let mut ips: Vec<IpAddr> = (host, 0)
-        .to_socket_addrs()
-        .map(|addrs| addrs.map(|a| a.ip()).collect())
-        .unwrap_or_default();
+/// The addresses a host name resolves to now. A wildcard (`*.example.com`) resolves through the matching names in
+/// `cached`, the DNS Client cache's names.
+fn resolve_host(
+    host: &str,
+    cached: &[String],
+    lookup: impl Fn(&str) -> Vec<IpAddr>,
+) -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = if host.starts_with("*.") {
+        // A wildcard names no single host: it covers the matching names this machine has looked up lately, as the
+        // DNS Client cache lists them. A name looked up later is covered from the next refresh (60 s) on.
+        cached
+            .iter()
+            .filter(|name| crate::tls::host_matches(host, name))
+            .flat_map(|name| lookup(name))
+            .collect()
+    } else {
+        lookup(host)
+    };
     ips.sort();
     ips.dedup();
     ips
+}
+
+/// The addresses a host name resolves to now, through the system resolver.
+fn lookup(host: &str) -> Vec<IpAddr> {
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default()
 }
 
 fn current_exe() -> Result<String, String> {
@@ -1000,9 +1020,30 @@ mod tests {
     }
 
     #[test]
-    fn wildcards_resolve_to_nothing_and_ips_are_deduplicated() {
-        assert!(resolve_host("*.example.com").is_empty());
-        let local = resolve_host("localhost");
+    fn wildcards_resolve_through_cached_names_and_ips_are_deduplicated() {
+        let cached: Vec<String> = [
+            "api.example.com",
+            "cdn.example.com",
+            "example.com",
+            "other.org",
+        ]
+        .map(String::from)
+        .to_vec();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let lookup = |host: &str| match host {
+            "api.example.com" => vec![ip("192.0.2.2"), ip("192.0.2.1")],
+            "cdn.example.com" => vec![ip("192.0.2.1")],
+            "other.org" => vec![ip("198.51.100.1")],
+            _ => Vec::new(),
+        };
+        // Only the names under the suffix (not example.com itself), each address once, sorted.
+        assert_eq!(
+            resolve_host("*.example.com", &cached, lookup),
+            [ip("192.0.2.1"), ip("192.0.2.2")]
+        );
+        assert!(resolve_host("*.example.net", &cached, lookup).is_empty());
+        assert_eq!(resolve_host("other.org", &[], lookup), [ip("198.51.100.1")]);
+        let local = resolve_host("localhost", &[], super::lookup);
         let mut sorted = local.clone();
         sorted.sort();
         sorted.dedup();
