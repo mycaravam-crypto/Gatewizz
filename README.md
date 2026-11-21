@@ -40,7 +40,7 @@ The proxy variables apply only to this window and its children; Windows-wide pro
 - **Approvals:** held requests appear in the tray app with program, host and rule: allow once, deny, or allow the program for N minutes. Timeouts block.
 - **HTTPS inspection (opt-in):** by default HTTPS is a blind tunnel. With `[tls] intercept = true` and `gatewizz ca install`, a per-user local CA (key protected by DPAPI) lets gatewizz inspect request content. Pinned or mutual-TLS hosts stay tunnels via `tunnel_hosts`.
 - **Connection monitor (opt-in, `[monitor] enabled = true`):** the **Network** tab shows every TCP connection on the machine by program, hostname and port, and flags a program's first connection to a host.
-- **Connection firewall (opt-in, administrator):** `[[connection_rules]]` by program, address, port and protocol, enforced by the `gatewizz-fw` service from `%ProgramFiles%\Gatewizz`. `ask` rules put blocked connections into the tray's approval queue: allow once, for a while or always, or deny. Manage it with `gatewizz firewall install|apply|status|remove`.
+- **Connection firewall (opt-in, administrator):** `[[connection_rules]]` by program, address, port and protocol, enforced by the `gatewizz-fw` service from `%ProgramFiles%\Gatewizz`. `ask` rules put blocked connections into the tray's approval queue: allow once, for a while or always, or deny; with `[firewall] hold = true` (opt-in; install with `-WithWinDivert`), new TCP connections wait for your answer instead of failing their first attempt. Manage it with `gatewizz firewall install|apply|status|remove`.
 - **Activity history:** recent decisions from the event log, filterable by host, program and decision, and copyable as CSV.
 
 ## Project boundaries
