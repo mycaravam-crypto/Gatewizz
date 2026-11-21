@@ -255,7 +255,7 @@ gatewizz firewall remove                           # remove the service, every f
   - **Setup:** run `scripts/install.ps1 -WithWinDivert`, which downloads `WinDivert.dll`, `WinDivert64.sys` and `WinDivert-LICENSE.txt` from the release and checks them against its `SHA256SUMS.txt` (or download them yourself and put them next to `gatewizz.exe`), set `hold = true`, and run `firewall install` or `firewall apply`. Gatewizz checks both files against the SHA-256 of WinDivert 2.2.2-A before it copies or loads them, and refuses any other build. `firewall remove` unloads the driver and deletes the files.
   - **Limits:**
     - Holding is TCP only; UDP keeps block-then-ask.
-    - It is off by default, because Microsoft Defender may flag packet-interception drivers (WinDivert is sometimes reported as `HackTool:Win64/WinDivert`). If Defender removes or blocks the files, holding stays off and asking falls back to block-then-ask.
+    - It is off by default because endpoint protection may flag packet-interception drivers. In [upstream WinDivert issue #411](https://github.com/basil00/WinDivert/issues/411), opened in October 2026, a user reports Microsoft Defender quarantining the official 2.2.2-A archive as `Misleading:Win32/Malgent!AMTB`; other reports mention `HackTool:Win64/WinDivert`. This is an unresolved compatibility risk, not a reason to disable Defender. If Defender removes or blocks the files, holding stays off and asking falls back to block-then-ask. Real-machine acceptance must be performed with Defender enabled and recorded in #66.
     - Every new outbound TCP connection's first packet passes through the service once. Later packets never do.
     - WinDivert is licensed LGPL v3 / GPL v2 and ships unmodified with its licence.
 
@@ -332,7 +332,7 @@ GitHub Actions run tests on pull requests and `main`:
 - **test**: formatting, Clippy and tests on Linux; Clippy, tests and a release build on Windows.
 - **security**: Trivy dependency vulnerability scan of `Cargo.lock`, also scheduled weekly. A fixable critical finding fails the job.
 - **smartwizz**: AI review of pull requests; high or critical findings fail the check. This workflow requires a valid `SMARTWIZZ_API_KEY` repository secret.
-- **release**: each merged pull request into `main` can publish the next SemVer version. The release contains `gatewizz-vX.Y.Z-windows-x64.exe` and `SHA256SUMS.txt`. Git tags are authoritative. Labels select the version bump: `release:patch` (default), `release:minor`, `release:major`, or `release:none`.
+- **release**: each merged pull request into `main` can publish the next SemVer version. The release contains `gatewizz-vX.Y.Z-windows-x64.exe`, `WinDivert.dll`, `WinDivert64.sys`, `WinDivert-LICENSE.txt` and `SHA256SUMS.txt`. The WinDivert 2.2.2-A archive is pinned and hash-verified before packaging. Git tags are authoritative. Labels select the version bump: `release:patch` (default), `release:minor`, `release:major`, or `release:none`.
 
 ## Known limitations and boundaries
 
