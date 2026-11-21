@@ -660,7 +660,7 @@ impl PromptState {
 mod holding {
     use super::{PromptState, firewall, home, log, wfp};
     use crate::divert::{self, Address, Divert};
-    use crate::hold::{self, Offer, Queue, Syn};
+    use crate::hold::{self, Offer, Queue, Step, Syn};
     use firewall::{Filter, Protocol, RuleAction};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
@@ -799,13 +799,15 @@ mod holding {
                 .replace(wfp::KEYS, &firewall::hold_permits(&filters))?;
             *locked(&self.inner.filters) = filters;
             let filters = locked(&self.inner.filters).clone();
-            let decided = locked(&self.inner.queue)
-                .take(|h| action(&filters, &h.address.1, &h.syn) != Some(RuleAction::Ask));
+            let next = |h: &hold::Held<(Address, String)>| {
+                hold::after_change(action(&filters, &h.address.1, &h.syn))
+            };
+            let decided = locked(&self.inner.queue).take(|h| next(h).is_some());
             for held in decided {
-                match action(&filters, &held.address.1, &held.syn) {
-                    Some(RuleAction::Block) => {
+                match next(&held) {
+                    Some(Step::Refuse(why)) => {
                         self.inner
-                            .refuse(&held.syn, &held.address.0, &held.address.1, "denied")
+                            .refuse(&held.syn, &held.address.0, &held.address.1, why)
                     }
                     _ => self.inner.release(
                         &held.packet,
@@ -856,17 +858,6 @@ mod holding {
         .map(|f| f.action)
     }
 
-    /// Whether any `ask` filter could cover a connection to `syn.remote`, whichever program opened it. When none
-    /// can, the SYN goes on at once, without looking up its program: decided connections pay nothing more.
-    fn could_ask(filters: &[Filter], syn: &Syn) -> bool {
-        filters.iter().any(|f| {
-            f.action == RuleAction::Ask
-                && f.remote.is_none_or(|n| n.contains(syn.remote.ip()))
-                && f.port.is_none_or(|p| p == syn.remote.port())
-                && f.protocol != Protocol::Udp
-        })
-    }
-
     /// The DOS path of the program that opened the connection from `local`: its row in the TCP table, which lists
     /// a connection from its SYN on.
     fn owner(local: std::net::SocketAddr) -> Option<String> {
@@ -892,52 +883,32 @@ mod holding {
                     let _ = self.divert.send(packet, &address);
                     continue;
                 };
-                // A retransmission of a connection answered already: it went on, so its retransmissions do too (the
-                // network may have lost the first SYN); it was refused, so they are dropped.
                 let settled = locked(&self.queue).settled(syn.key(), Instant::now());
-                match settled {
-                    Some(true) => {
-                        let _ = self.divert.send(packet, &address);
-                        continue;
-                    }
-                    Some(false) => continue,
-                    None => {}
-                }
                 let filters = locked(&self.filters).clone();
-                if !could_ask(&filters, &syn) {
-                    let _ = self.divert.send(packet, &address);
-                    continue;
-                }
-                let program = owner(syn.local);
-                let decided = action(&filters, program.as_deref().unwrap_or(""), &syn);
-                match (decided, program) {
-                    (Some(RuleAction::Ask), Some(program)) => {
-                        self.ask(syn, packet, address, program)
-                    }
-                    // An ask with no program to name in a rule cannot be answered: refuse it (fail closed).
-                    (Some(RuleAction::Ask), None) => {
-                        self.refuse(&syn, &address, "unknown program", "its program is unknown")
-                    }
-                    (Some(RuleAction::Block), Some(program)) => {
-                        self.refuse(&syn, &address, &program, "blocked")
-                    }
-                    (Some(RuleAction::Block), None) => {
-                        self.refuse(&syn, &address, "unknown program", "blocked")
-                    }
-                    _ => {
+                let could_ask = settled.is_none() && firewall::could_ask(&filters, syn.remote);
+                // The program is looked up only when an ask filter could cover the connection.
+                let program = if could_ask { owner(syn.local) } else { None };
+                let facts = hold::Facts {
+                    settled,
+                    could_ask,
+                    action: action(&filters, program.as_deref().unwrap_or(""), &syn),
+                    program_known: program.is_some(),
+                    can_ask: self.prompt.server.connected()
+                        && !self.stopping.load(Ordering::SeqCst),
+                };
+                let program = program.unwrap_or_else(|| "unknown program".into());
+                match hold::step(facts) {
+                    Step::Pass => {
                         let _ = self.divert.send(packet, &address);
                     }
+                    Step::Drop => {}
+                    Step::Hold => self.ask(syn, packet, address, program),
+                    Step::Refuse(why) => self.refuse(&syn, &address, &program, why),
                 }
             }
         }
 
         fn ask(&self, syn: Syn, packet: &[u8], address: Address, program: String) {
-            if self.stopping.load(Ordering::SeqCst) {
-                return self.refuse(&syn, &address, &program, "the service stopped");
-            }
-            if !self.prompt.server.connected() {
-                return self.refuse(&syn, &address, &program, "no tray app to ask");
-            }
             let offer = locked(&self.queue).offer(
                 syn,
                 packet.to_vec(),

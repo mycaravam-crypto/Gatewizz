@@ -520,6 +520,21 @@ pub fn classify<'a>(
         .max_by_key(|f| f.weight)
 }
 
+/// Whether any `ask` filter could cover a TCP connection to `remote`, whichever program opened it. When none can,
+/// the hold sends the SYN on at once, without looking up its program (#60).
+#[cfg_attr(
+    not(any(test, windows)),
+    expect(dead_code, reason = "the hold service runs on Windows only")
+)]
+pub fn could_ask(filters: &[Filter], remote: std::net::SocketAddr) -> bool {
+    filters.iter().any(|f| {
+        f.action == RuleAction::Ask
+            && f.remote.is_none_or(|n| n.contains(remote.ip()))
+            && f.port.is_none_or(|p| p == remote.port())
+            && f.protocol != Protocol::Udp
+    })
+}
+
 /// The permits that let `ask` connections through WFP while the service holds them (#60): one per `ask` filter,
 /// same conditions, weight one above it. They live in a dynamic WFP session only, so WFP drops them when the service
 /// exits, and the `ask` filters block again (fail closed).
@@ -1381,5 +1396,39 @@ mod tests {
             no_paths,
         );
         assert!(hold_permits(&p).is_empty());
+        // could_ask: an ask filter for TCP or any protocol covers the address and port; a UDP-only one never does.
+        let p = plan(
+            &r,
+            DefaultAction::Allow,
+            &own_paths(),
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(
+            could_ask(&p, "192.0.2.9:80".parse().unwrap()),
+            "ask-curl covers any address"
+        );
+        let p = plan(
+            &udp_only,
+            DefaultAction::Allow,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(!could_ask(&p, "192.0.2.9:53".parse().unwrap()));
+        let p = plan(
+            &udp_only,
+            DefaultAction::Ask,
+            &[],
+            now,
+            |_| Vec::new(),
+            no_paths,
+        );
+        assert!(
+            could_ask(&p, "192.0.2.9:443".parse().unwrap()),
+            "the ask default covers everything"
+        );
     }
 }

@@ -147,6 +147,66 @@ fn checksum(parts: &[&[u8]]) -> u16 {
     !(sum as u16)
 }
 
+/// What to do with one SYN the hold took off the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Send it on unchanged.
+    Pass,
+    /// Drop it: a retransmission of a connection refused already.
+    Drop,
+    /// Hold it and ask.
+    Hold,
+    /// Answer with a RST, for this reason (logged).
+    Refuse(&'static str),
+}
+
+/// The facts about a SYN that decide its [`Step`].
+#[derive(Clone, Copy, Debug)]
+pub struct Facts {
+    /// [`Queue::settled`]: the connection was answered lately, and whether it went on.
+    pub settled: Option<bool>,
+    /// Whether any `ask` filter covers its address and port at all (`firewall::could_ask`); if not, nothing else is
+    /// looked up.
+    pub could_ask: bool,
+    /// What the filters say for its program: `firewall::classify`'s action, `None` when no filter matches.
+    pub action: Option<crate::firewall::RuleAction>,
+    /// Whether its program was found in the TCP table.
+    pub program_known: bool,
+    /// Whether someone can be asked: the tray app is connected and the service is not stopping.
+    pub can_ask: bool,
+}
+
+/// The hold's decision for one SYN. Fail closed: what asks but cannot be asked, or names no program a rule could
+/// name, is refused.
+pub fn step(f: Facts) -> Step {
+    use crate::firewall::RuleAction;
+    match f.settled {
+        Some(true) => return Step::Pass,
+        Some(false) => return Step::Drop,
+        None => {}
+    }
+    if !f.could_ask {
+        return Step::Pass;
+    }
+    match f.action {
+        Some(RuleAction::Block) => Step::Refuse("blocked"),
+        Some(RuleAction::Ask) if !f.program_known => Step::Refuse("its program is unknown"),
+        Some(RuleAction::Ask) if !f.can_ask => Step::Refuse("no tray app to ask"),
+        Some(RuleAction::Ask) => Step::Hold,
+        Some(RuleAction::Allow) | None => Step::Pass,
+    }
+}
+
+/// What becomes of a held connection when the rules change: `None` keeps it waiting (still asking).
+pub fn after_change(action: Option<crate::firewall::RuleAction>) -> Option<Step> {
+    use crate::firewall::RuleAction;
+    match action {
+        Some(RuleAction::Ask) => None,
+        Some(RuleAction::Block) => Some(Step::Refuse("denied")),
+        Some(RuleAction::Allow) | None => Some(Step::Pass),
+    }
+}
+
 /// One held connection: its SYN, the packet and address to send it on with, and since when it waits.
 #[derive(Debug)]
 pub struct Held<A> {
@@ -404,6 +464,85 @@ mod tests {
         assert!(q.is_empty() && q.next_deadline().is_none());
         // Room again once the queue drained.
         assert_eq!(q.offer(syn(3), vec![3], 0, start), Offer::Held);
+    }
+
+    #[test]
+    fn each_syn_gets_one_step_and_asking_fails_closed() {
+        use crate::firewall::RuleAction::{Allow, Ask, Block};
+        let ask = Facts {
+            settled: None,
+            could_ask: true,
+            action: Some(Ask),
+            program_known: true,
+            can_ask: true,
+        };
+        assert_eq!(step(ask), Step::Hold);
+        // Answered lately: retransmissions follow the answer, whatever the rules say now.
+        assert_eq!(
+            step(Facts {
+                settled: Some(true),
+                ..ask
+            }),
+            Step::Pass
+        );
+        assert_eq!(
+            step(Facts {
+                settled: Some(false),
+                ..ask
+            }),
+            Step::Drop
+        );
+        // No ask filter for the address: sent on without looking further.
+        assert_eq!(
+            step(Facts {
+                could_ask: false,
+                action: Some(Block),
+                ..ask
+            }),
+            Step::Pass
+        );
+        // Fail closed when asking is not possible.
+        assert_eq!(
+            step(Facts {
+                program_known: false,
+                ..ask
+            }),
+            Step::Refuse("its program is unknown")
+        );
+        assert_eq!(
+            step(Facts {
+                can_ask: false,
+                ..ask
+            }),
+            Step::Refuse("no tray app to ask")
+        );
+        // Decided by the rules.
+        assert_eq!(
+            step(Facts {
+                action: Some(Block),
+                ..ask
+            }),
+            Step::Refuse("blocked")
+        );
+        assert_eq!(
+            step(Facts {
+                action: Some(Allow),
+                ..ask
+            }),
+            Step::Pass
+        );
+        assert_eq!(
+            step(Facts {
+                action: None,
+                ..ask
+            }),
+            Step::Pass
+        );
+
+        assert_eq!(after_change(Some(Ask)), None, "still asking: keeps waiting");
+        assert_eq!(after_change(Some(Block)), Some(Step::Refuse("denied")));
+        assert_eq!(after_change(Some(Allow)), Some(Step::Pass));
+        assert_eq!(after_change(None), Some(Step::Pass));
     }
 
     #[test]
