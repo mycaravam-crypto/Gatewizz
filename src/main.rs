@@ -12,6 +12,7 @@ mod ca;
 mod config;
 mod connections;
 mod detect;
+mod divert;
 mod dns;
 mod elevate;
 mod event;
