@@ -16,6 +16,7 @@ mod dns;
 mod elevate;
 mod event;
 mod firewall;
+mod hold;
 mod pipe;
 mod process;
 mod prompt;

@@ -30,12 +30,28 @@ web UI or API, AI analysis, Linux.
 - **Fail closed:** WFP filters are persistent, so they keep enforcing when the service is down. `default = "ask"`
   blocks when no window can ask. Gatewizz's own program is always allowed, and that rule can't be edited.
 - **Still out:** our own kernel driver and packet interception. Holding a connection while the user decides is
-  Phase 3 (#60), decided separately.
+  Phase 3 (#60), decided separately (below).
 - **Order:** the pure rule core lands first (`firewall.rs`, every OS). Next is `firewall apply/remove/status`,
   which installs the rules as WFP filters from an elevated prompt (`wfp.rs`; Windows CI runs elevated). The
   `[firewall]` and `[[connection_rules]]` keys arrive in that step, because it is the first one that uses them.
   Then come the service and the pipe, which keep program paths and host IPs current, and last the prompt and
   config write-back.
+
+**Decision (2026-11-21, #60): hold new connections while asking, with WinDivert, opt-in.**
+- **Why:** with block-then-ask, the first attempt fails before the user answers, and apps that don't retry show an
+  error. Holding the connection until the answer removes that.
+- **How:** WinDivert 2.2.2 (signed driver, LGPL v3/GPL v2, loaded dynamically, files verified by SHA-256) takes
+  the SYN of each new outbound TCP connection that an `ask` filter covers and holds it. Allow re-injects the SYN;
+  deny or a 20 s timeout injects a RST ("connection refused"). The SOCKET layer can only drop connects, never
+  release them, so the hold is at the NETWORK layer, and the process comes from the TCP table. Our own WFP callout
+  driver stays out: it would need EV/attestation signing and kernel code.
+- **Fail closed:** the persistent `ask` filters keep blocking at connect. Only while the service holds does it add
+  permits above them, in a dynamic WFP session that WFP removes when the service exits. With no tray app,
+  connections are refused at once.
+- **Limits:** TCP only; UDP keeps block-then-ask. Off by default (`[firewall] hold`), because Defender may flag
+  packet-interception drivers. Allowed flows cross the packet path once, for their SYN.
+- **Order:** the pure core (`hold.rs`, `firewall::classify`), then the WinDivert binding with an elevated CI test,
+  then the service integration, then release assets and acceptance.
 
 ## 2. YAGNI and engineering rules
 
@@ -75,6 +91,7 @@ src/
 ├── connections.rs # connection monitor: TCP table sampling, snapshot diff, rate limit, live list (#57)
 ├── wfp.rs       # WFP provider, sublayer and filters for `firewall apply/remove/status` (Windows, elevated; #59)
 ├── dns.rs       # IP → hostname cache for the monitor, filled from the Windows DNS Client cache (#57)
+├── hold.rs      # hold-and-ask core: SYN parsing, RST construction with checksums, the held-connection queue (#60)
 ├── firewall.rs  # connection rules: matching, precedence, expiry, WFP filter plan, notice coalescing (pure; #59)
 ├── detect.rs    # body buffering up to max_body_bytes; secret and AI-request detectors, kinds and counts only (#20)
 ├── elevate.rs   # UAC self-elevation for the firewall commands; output relayed over a private pipe (#59)
@@ -103,6 +120,7 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 | **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
 | **F1: See every connection** (#56 Phase 1) | Read-only connection monitor: TCP tables per process, DNS-cache hostnames, `connection` events, Network tab | Every outgoing TCP connection is visible with its process and, where the DNS cache knows it, its hostname, without admin rights | implemented (#57); Windows CI test for the sampler; manual acceptance and overhead measurement pending |
 | **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); `firewall apply/remove/status` installs persistent WFP filters (`wfp.rs`, elevated Windows CI test); `firewall install` runs the `gatewizz-fw` service from `%ProgramFiles%\Gatewizz` and keeps the filters current (`service.rs`, CI service smoke test); the service logs connections its filters block (WFP drop events, elevated CI test); it serves the prompt pipe, validates decisions and writes rules back (`pipe.rs`, `prompt.rs`, pipe ACL test); `ask` rules prompt and `block` rules stay silent; the tray app asks in the Overview queue (`ui.rs`, pipe client test); manual Windows acceptance next (#59) |
+| **F3: Hold while asking** (#56 Phase 3) | Opt-in WinDivert hold of new outbound TCP connections that an `ask` filter covers, released on allow, refused on deny or timeout | The first connection to a new host waits for the prompt and then succeeds, without the app retrying | decided (#60); pure core in (`hold.rs`, `firewall::classify`, `firewall::hold_permits`); WinDivert binding next |
 
 ## 6. Quality gates
 
