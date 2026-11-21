@@ -92,8 +92,8 @@
 [firewall]
 # Connection firewall (Windows, #59). Nothing here takes effect until
 # `gatewizz firewall install --config <this file>` (service that keeps the rules
-# current) or `gatewizz firewall apply --config <this file>` runs from an
-# elevated prompt. Editing this file changes nothing until the next `apply`;
+# current) or `gatewizz firewall apply --config <this file>` runs (they ask
+# for administrator rights through UAC). Editing this file changes nothing until the next `apply`;
 # `gatewizz firewall remove` takes the service and every filter away again.
 #
 # What happens to a connection no rule matches: "allow", "block" or "ask".
@@ -112,7 +112,9 @@
 # process: file names ("smartwizz.exe") or full paths. A file name covers the
 #   copies on PATH or running when `firewall apply` runs.
 # host: exact names or "*.suffix", enforced through the IPs they resolve to
-#   at apply time (wildcards have none; use ip for addresses that must match).
+#   at apply time; a wildcard covers the matching names in the DNS cache, so
+#   names looked up later count from the next refresh (use ip for addresses
+#   that must always match).
 # ip: addresses or prefixes ("10.0.0.0/8", "2001:db8::/32").
 # port: remote ports. protocol: "any" (default), "tcp" or "udp".
 #

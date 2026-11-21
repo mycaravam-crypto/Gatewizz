@@ -206,6 +206,24 @@ pub fn refresh(_cache: &mut Cache, _now: Instant) -> Result<(), String> {
     Err("[monitor] the DNS cache is read only on Windows".into())
 }
 
+/// The host names the Windows DNS Client cache holds now (A and AAAA records), for wildcard connection rules (#59).
+/// Empty when the cache cannot be read: a wildcard then covers nothing until a later refresh.
+#[cfg(windows)]
+pub fn cached_hosts() -> Vec<String> {
+    let mut names: Vec<String> = sys::listed()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.dedup();
+    names
+}
+
+#[cfg(not(windows))]
+pub fn cached_hosts() -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(windows)]
 mod sys {
     use super::Answer;
