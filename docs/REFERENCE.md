@@ -195,7 +195,7 @@ enabled = true
 
 Limits:
 
-- **Short connections:** connections that open and close between two samples are missed. Lower `poll_ms` if that matters. Phase 2 (#59) will see every connection through Windows Filtering Platform events.
+- **Short connections:** connections that open and close between two samples are missed. Lower `poll_ms` if that matters. Phase 2 (#59) adds WFP connection filtering; the manual acceptance for both phases is tracked in #66.
 - **UDP and QUIC:** these are not shown. The Windows UDP table lists local sockets only, without a remote address.
 - **Hostnames are best effort:** apps that resolve names themselves (DNS over HTTPS in a browser, hard-coded IPs) show an IP only. A CDN address shared by many sites shows the name that was looked up most recently. The DNS cache does not say which program asked.
 - **Overhead:** the CPU cost at the default interval still has to be measured on a real machine (#57). Reading the tables is one system call per address family per sample.
@@ -315,9 +315,9 @@ Some checks need a real Windows session: the icon, the tray, approvals clicked b
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1
-# Optional: also run smartwizz through Gatewizz (#17); skip the CA part (#22) or the approval part (#35).
+# Optional: include a SmartWizz review; skip the CA or approval checks if already covered.
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1 -SmartwizzRepo C:\src\repo -SkipCa
-# From an elevated prompt (Run as administrator): also the connection firewall and its prompt (#59).
+# From an elevated prompt (Run as administrator): also the connection firewall and its prompt. Results belong in #66.
 powershell -ExecutionPolicy Bypass -File scripts\windows-acceptance.ps1 -Firewall
 ```
 
