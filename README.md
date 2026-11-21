@@ -6,7 +6,7 @@ An optional connection firewall extends this beyond the proxy: it decides every 
 
 One common use is keeping developer tools and coding agents from sending secrets or private code to AI providers unnoticed. The rules themselves work for any program and any host.
 
-**Status:** the proxy (M1–M3) and firewall Phases 1–2 are merged; Phase 3, holding a connection while asking, is in progress ([#60](https://github.com/mycaravam-crypto/Gatewizz/issues/60)). Manual acceptance on real Windows is tracked in [#66](https://github.com/mycaravam-crypto/Gatewizz/issues/66).
+**Status:** the proxy (M1–M3) and firewall Phases 1–3 are implemented and merged. Phase 3 release packaging is configured; real-Windows and Microsoft Defender acceptance remains open in [#66](https://github.com/mycaravam-crypto/Gatewizz/issues/66).
 
 ## Install
 
@@ -18,7 +18,7 @@ notepad install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies `gatewizz.exe` against `SHA256SUMS.txt`, installs it to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update.
+[`scripts/install.ps1`](scripts/install.ps1) downloads the latest [release](https://github.com/mycaravam-crypto/Gatewizz/releases), verifies `gatewizz.exe` against `SHA256SUMS.txt`, installs it to `%LOCALAPPDATA%\Programs\Gatewizz` and creates `%LOCALAPPDATA%\gatewizz\gatewizz.toml` from the example without overwriting an existing one. Run it again to update. To install the optional WinDivert files needed for `[firewall] hold = true`, run `.\install.ps1 -WithWinDivert` from the directory containing the downloaded installer. This option is not needed for the default block-then-ask firewall.
 
 ## Quick start
 

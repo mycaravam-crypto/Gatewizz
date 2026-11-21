@@ -10,8 +10,8 @@ The motivating case is tools that send code to AI models (smartwizz, testwizz, `
 but rules are not tied to AI hosts. It decrypts each request with a local CA, checks it against a few TOML rules,
 and allows, blocks or holds it for approval before any byte goes upstream. Every decision is logged; content never is.
 
-**Out until a concrete need:** system-wide proxy, Windows service, WFP/transparent capture, HTTP/2, QUIC, database,
-web UI or API, AI analysis, Linux.
+**Out until a concrete need:** system-wide proxy, our own kernel driver, HTTP/2, QUIC, database, web UI or API,
+AI analysis, Linux. The optional Windows service/WFP firewall and WinDivert-backed TCP holding are in scope below.
 
 **Connection firewall (#56):** Phase 1, a read-only, no-admin connection monitor (`[monitor]`, #57), is in.
 
@@ -52,7 +52,7 @@ web UI or API, AI analysis, Linux.
 - **Limits:** TCP only; UDP keeps block-then-ask. Off by default (`[firewall] hold`), because Defender may flag
   packet-interception drivers. Allowed flows cross the packet path once, for their SYN.
 - **Order:** the pure core (`hold.rs`, `firewall::classify`), then the WinDivert binding with an elevated CI test,
-  then the service integration, then release assets and acceptance.
+  then the service integration, release packaging, and real-Windows acceptance (#66).
 
 ## 2. YAGNI and engineering rules
 
@@ -121,8 +121,8 @@ about request boundaries (no smuggling). Tests in `proxy.rs` drive the real list
 | **M2: Block it** | CA, TLS interception, detectors, `allow`/`block` rules | A test API key in a smartwizz diff is blocked for an unlisted endpoint and passes for an allowlisted one; the key is nowhere on disk | code complete; automated acceptance covered by `m2_secret_reaches_only_the_allowlisted_model_host`; real-Windows smartwizz acceptance pending (#22) |
 | **M3: Ask first** | `approve` action, egui approval window, tray icon and menu (pause/resume, open log, copy proxy address, quit), app icon and manifest | A held request sends zero bytes upstream until allowed; deny and timeout both block; the tray shows and opens a waiting approval | implementation merged (#37–#43); approval lifecycle regression tests and embedded manifest-resource verification added; per-user login startup and single-instance lifecycle implemented and CI-verified in #46; workspace with activity history and redesign merged (#51, #53–#55, #58); real-Windows UI and startup acceptance remain open in #35 and #36 |
 | **F1: See every connection** (#56 Phase 1) | Read-only connection monitor: TCP tables per process, DNS-cache hostnames, `connection` events, Network tab | Every outgoing TCP connection is visible with its process and, where the DNS cache knows it, its hostname, without admin rights | implemented (#57); Windows CI test for the sampler; manual acceptance and overhead measurement pending |
-| **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); `firewall apply/remove/status` installs persistent WFP filters (`wfp.rs`, elevated Windows CI test); `firewall install` runs the `gatewizz-fw` service from `%ProgramFiles%\Gatewizz` and keeps the filters current (`service.rs`, CI service smoke test); the service logs connections its filters block (WFP drop events, elevated CI test); it serves the prompt pipe, validates decisions and writes rules back (`pipe.rs`, `prompt.rs`, pipe ACL test); `ask` rules prompt and `block` rules stay silent; the tray app asks in the Overview queue (`ui.rs`, pipe client test); manual Windows acceptance next (#59) |
-| **F3: Hold while asking** (#56 Phase 3) | Opt-in WinDivert hold of new outbound TCP connections that an `ask` filter covers, released on allow, refused on deny or timeout | The first connection to a new host waits for the prompt and then succeeds, without the app retrying | decided (#60); pure core in (`hold.rs`, `firewall::classify`, `firewall::hold_permits`); WinDivert binding with an elevated CI hold test (`divert.rs`); the service holds with `[firewall] hold` (dynamic WFP permits, TCP-table owner lookup, held notices in the tray, CI service smoke test); release assets next |
+| **F2: Decide every connection** (#56 Phase 2) | Optional elevated service with WFP per-app rules, block-then-ask prompt, proxy-enforcement preset | Unknown connections are blocked and prompted; rules persist; the wizz tools reach the network only through the proxy | rule core in (`firewall.rs`); `firewall apply/remove/status` installs persistent WFP filters (`wfp.rs`, elevated Windows CI test); `firewall install` runs the `gatewizz-fw` service from `%ProgramFiles%\Gatewizz` and keeps the filters current (`service.rs`, CI service smoke test); the service logs connections its filters block (WFP drop events, elevated CI test); it serves the prompt pipe, validates decisions and writes rules back (`pipe.rs`, `prompt.rs`, pipe ACL test); `ask` rules prompt and `block` rules stay silent; the tray app asks in the Overview queue (`ui.rs`, pipe client test); real-Windows acceptance remains in #66 |
+| **F3: Hold while asking** (#56 Phase 3) | Opt-in WinDivert hold of new outbound TCP connections that an `ask` filter covers, released on allow, refused on deny or timeout | The first connection to a new host waits for the prompt and then succeeds, without the app retrying | decided (#60); pure core in (`hold.rs`, `firewall::classify`, `firewall::hold_permits`); WinDivert binding with an elevated CI hold test (`divert.rs`); the service holds with `[firewall] hold` (dynamic WFP permits, TCP-table owner lookup, held notices in the tray, CI service smoke test); the release workflow packages the pinned WinDivert DLL, driver and licence; real-Windows/Defender acceptance remains in #66 |
 
 ## 6. Quality gates
 
@@ -135,4 +135,4 @@ bash .github/scripts/semver-next.test.sh
 
 **Performance budget:** under 5 ms added p50 for requests without a body (from M1). `proxy::tests::bodyless_requests_stay_within_the_latency_budget` checks it on every CI run (direct vs proxied keep-alive GETs on loopback; print the numbers with `cargo test --release latency -- --nocapture`). Real-world overhead is measured with powerwizz.
 
-**Manual acceptance:** `scripts/windows-acceptance.ps1` runs the remaining real-Windows checks of M1–M3 (#17, #22, #35, #36), the monitor (#57) and, with `-Firewall`, F2 (#59) and writes a report for the issues; CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.
+**Manual acceptance:** `scripts/windows-acceptance.ps1` covers the remaining real-Windows checks for the proxy, TLS, tray/startup, connection monitor and firewall. The single acceptance tracker is #66; use `-Firewall` from an elevated prompt for firewall checks. Phase 3 additionally requires a release with the packaged WinDivert files and Defender-enabled testing. CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.
