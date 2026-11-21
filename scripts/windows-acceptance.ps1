@@ -532,7 +532,9 @@ action = "block"
         Start-Process -FilePath $Program -ArgumentList (Join-CommandLine $arguments) -NoNewWindow -Wait -RedirectStandardOutput $out | Out-Null
         if (Test-Path $out) { (Get-Content -Raw $out).Trim() } else { '' }
     }
-    function Protected-Config { Get-Content -Raw (Join-Path $fwHome 'firewall.toml') }
+    # Missing files read as empty: a failed install then fails its checks instead of ending the run.
+    function Read-Text([string] $Path) { if (Test-Path -LiteralPath $Path) { Get-Content -Raw -LiteralPath $Path } else { '' } }
+    function Protected-Config { Read-Text (Join-Path $fwHome 'firewall.toml') }
 
     # The test rules come off again whatever happens, so a failed check never leaves them installed.
     try {
@@ -575,7 +577,7 @@ action = "block"
         Check 59 'proxy enforcement: the wizz tool cannot connect past the proxy' ($bypass -eq '000') "status $bypass"
         $through = Start-Process -FilePath $wizz -ArgumentList (Join-CommandLine @('-s', '-o', 'NUL', '--max-time', '30', '-x', $proxy, 'http://example.com/')) -NoNewWindow -Wait -PassThru
         Check 59 'proxy enforcement: the wizz tool reaches the network through Gatewizz' ($through.ExitCode -eq 0) "curl exit $($through.ExitCode)"
-        $log = Get-Content -Raw (Join-Path $fwHome 'service.log')
+        $log = Read-Text (Join-Path $fwHome 'service.log')
         $evidence.Add('Firewall service log, blocked lines: ' + ((($log -split "`n") | Where-Object { $_ -match 'blocked:' } | Select-Object -Last 3) -join ' | ').Replace($env:USERNAME, '<user>'))
 
     } finally {
