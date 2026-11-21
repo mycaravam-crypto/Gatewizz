@@ -135,4 +135,4 @@ bash .github/scripts/semver-next.test.sh
 
 **Performance budget:** under 5 ms added p50 for requests without a body (from M1). `proxy::tests::bodyless_requests_stay_within_the_latency_budget` checks it on every CI run (direct vs proxied keep-alive GETs on loopback; print the numbers with `cargo test --release latency -- --nocapture`). Real-world overhead is measured with powerwizz.
 
-**Manual acceptance:** `scripts/windows-acceptance.ps1` runs the remaining real-Windows checks of M1–M3 (#17, #22, #35, #36), the monitor (#57) and, with `-Firewall`, F2 (#59) and writes a report for the issues; CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.
+**Manual acceptance:** `scripts/windows-acceptance.ps1` covers the remaining real-Windows checks for the proxy, TLS, tray/startup, connection monitor and firewall. The single acceptance tracker is #66; use `-Firewall` from an elevated prompt for firewall checks. Phase 3 additionally requires a release with the packaged WinDivert files and Defender-enabled testing. CI smoke-tests the release binary's CLI with `.github/scripts/windows-cli-smoke.ps1`.
