@@ -901,7 +901,6 @@ mod holding {
                     Step::Pass => {
                         let _ = self.divert.send(packet, &address);
                     }
-                    Step::Drop => {}
                     Step::Hold => self.ask(syn, packet, address, program),
                     Step::Refuse(why) => self.refuse(&syn, &address, &program, why),
                 }

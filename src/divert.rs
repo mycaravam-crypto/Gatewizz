@@ -399,24 +399,31 @@ mod tests {
 
         let first = syn.key();
 
-        // Refused: a RST answers the held SYN, and the connect fails at once with "refused". Windows resends a SYN
-        // after about a second, so the first connection's retransmissions can still be queued: skip those.
+        // Refused: a RST answers the held SYN, and the connect fails with "refused", not a timeout. Windows answers a
+        // RST on a connection attempt by trying again a few times before it reports "refused", so every SYN of the
+        // second connection gets its RST until the program gives up. Retransmissions of the first connection, which
+        // may still be queued, are skipped.
         let app = std::thread::spawn(connect);
-        let (syn, address) = loop {
-            let (len, address) = divert.recv(&mut buf).expect("the second SYN is diverted");
-            let syn = hold::parse_syn(&buf[..len]).expect("a SYN");
-            if syn.key() != first {
-                break (syn, address);
-            }
-        };
-        divert.send(&hold::rst_for(&syn), &address.reply()).unwrap();
-        let (result, waited) = app.join().unwrap();
-        assert_eq!(result, Err(std::io::ErrorKind::ConnectionRefused));
-        assert!(
-            waited < Duration::from_secs(10),
-            "refused at once, not timed out: {waited:?}"
-        );
-
-        divert.stop();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut buf = vec![0u8; MTU_MAX];
+                while let Some((len, address)) = divert.recv(&mut buf) {
+                    let Some(syn) = hold::parse_syn(&buf[..len]) else {
+                        continue;
+                    };
+                    if syn.key() != first {
+                        divert.send(&hold::rst_for(&syn), &address.reply()).unwrap();
+                    }
+                }
+            });
+            let (result, waited) = app.join().unwrap();
+            // Ends the receiving thread.
+            divert.stop();
+            assert_eq!(result, Err(std::io::ErrorKind::ConnectionRefused));
+            assert!(
+                waited < Duration::from_secs(10),
+                "refused, not timed out: {waited:?}"
+            );
+        });
     }
 }

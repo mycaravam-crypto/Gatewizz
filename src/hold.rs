@@ -152,8 +152,6 @@ fn checksum(parts: &[&[u8]]) -> u16 {
 pub enum Step {
     /// Send it on unchanged.
     Pass,
-    /// Drop it: a retransmission of a connection refused already.
-    Drop,
     /// Hold it and ask.
     Hold,
     /// Answer with a RST, for this reason (logged).
@@ -182,7 +180,9 @@ pub fn step(f: Facts) -> Step {
     use crate::firewall::RuleAction;
     match f.settled {
         Some(true) => return Step::Pass,
-        Some(false) => return Step::Drop,
+        // Windows answers a RST on a connection attempt by trying again a few times before it reports "refused":
+        // each retry gets its RST, or the program ends with a timeout instead.
+        Some(false) => return Step::Refuse("refused before"),
         None => {}
     }
     if !f.could_ask {
@@ -269,7 +269,8 @@ impl<A> Queue<A> {
     }
 
     /// For a SYN of a connection answered within [`SETTLED_TTL`]: `Some(true)` if it was released (let the
-    /// retransmission go on, the network may have lost the first), `Some(false)` if it was refused (drop it).
+    /// retransmission go on, the network may have lost the first), `Some(false)` if it was refused (refuse
+    /// the retry too).
     pub fn settled(&self, key: Key, now: Instant) -> Option<bool> {
         self.settled
             .iter()
@@ -490,7 +491,7 @@ mod tests {
                 settled: Some(false),
                 ..ask
             }),
-            Step::Drop
+            Step::Refuse("refused before")
         );
         // No ask filter for the address: sent on without looking further.
         assert_eq!(
