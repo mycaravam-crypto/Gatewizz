@@ -192,6 +192,7 @@ mod app {
     use crate::rules::Action;
 
     // Design tokens: one dark theme. Surfaces step up in lightness; status colours are used for meaning only.
+    // Text tiers TEXT > MUTED > SUBTLE all meet WCAG AA (4.5:1) on every surface.
     const BG: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x14);
     const SURFACE: Color32 = Color32::from_rgb(0x12, 0x16, 0x1f);
     const RAISED: Color32 = Color32::from_rgb(0x1a, 0x20, 0x2c);
@@ -199,7 +200,7 @@ mod app {
     const BORDER_STRONG: Color32 = Color32::from_rgb(0x35, 0x3f, 0x52);
     const TEXT: Color32 = Color32::from_rgb(0xe8, 0xec, 0xf3);
     const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb6);
-    const SUBTLE: Color32 = Color32::from_rgb(0x6b, 0x75, 0x88);
+    const SUBTLE: Color32 = Color32::from_rgb(0x7d, 0x87, 0x9a);
     const BLUE: Color32 = Color32::from_rgb(0x6e, 0x9d, 0xff);
     const GREEN: Color32 = Color32::from_rgb(0x41, 0xc4, 0x83);
     const AMBER: Color32 = Color32::from_rgb(0xf0, 0xab, 0x3e);
@@ -227,6 +228,7 @@ mod app {
     const SPACE_L: f32 = 16.0;
     const SPACE_XL: f32 = 24.0;
     const SPACE_XXL: f32 = 40.0;
+    const CONTROL_H_LG: f32 = 40.0;
     const CONTROL_H: f32 = 32.0;
     const CONTROL_H_SM: f32 = 28.0;
     /// How long "Copied" confirmations stay visible.
@@ -636,7 +638,12 @@ mod app {
 
     /// Small uppercase heading above a group of content.
     fn caption(ui: &mut egui::Ui, text: &str) {
-        ui.label(RichText::new(text).font(semibold(CAPTION)).color(SUBTLE));
+        ui.label(
+            RichText::new(text)
+                .font(semibold(CAPTION))
+                .extra_letter_spacing(0.6)
+                .color(MUTED),
+        );
     }
 
     /// Glyph-free status dot: painted, so it renders with any font.
@@ -1567,7 +1574,7 @@ mod app {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     let deny = button("Deny always", tint(RED), RED)
                         .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(deny)
                         .on_hover_text("Keep blocking, and stop asking")
@@ -1576,7 +1583,7 @@ mod app {
                         answer = Some((RuleAction::Block, Lasting::Always));
                     }
                     let allow = button("Allow once", GREEN_FILL, Color32::WHITE)
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(allow)
                         .on_hover_text(
@@ -1758,11 +1765,11 @@ mod app {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     let deny = button("Deny", tint(RED), RED)
                         .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(deny).on_hover_text("Block this request").clicked() {
                         verdict = Some(Verdict::Deny);
                     }
-                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, 38.0));
+                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(allow).on_hover_text("Send this request only").clicked() {
                         verdict = Some(Verdict::AllowOnce);
                     }
