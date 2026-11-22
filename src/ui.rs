@@ -1368,7 +1368,7 @@ mod app {
                             if badge > 0 {
                                 button = button.right_text(
                                     RichText::new(badge.to_string())
-                                        .font(semibold(SMALL))
+                                        .font(mono(SMALL))
                                         .color(colors().amber),
                                 );
                             }
@@ -1895,18 +1895,12 @@ mod app {
                 });
                 ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
-                    let grant = button(
-                        &format!("Allow for {}", duration_label(self.notice_minutes)),
-                        colors().raised,
-                        colors().text,
-                    )
-                    .stroke(Stroke::new(1.0, colors().border_strong))
-                    .min_size(egui::vec2(150.0, CONTROL_H));
+                    let grant = quiet_button(&format!("Allow for {}", duration_label(self.notice_minutes)))
+                        .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         answer = Some((RuleAction::Allow, Lasting::Minutes(self.notice_minutes)));
                     }
-                    let always = button("Allow always", colors().raised, colors().text)
-                        .stroke(Stroke::new(1.0, colors().border_strong))
+                    let always = quiet_button("Allow always")
                         .min_size(egui::vec2(120.0, CONTROL_H));
                     if ui
                         .add(always)
@@ -2111,13 +2105,8 @@ mod app {
                 });
                 ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
-                    let grant = button(
-                        &format!("Allow for {}", duration_label(self.minutes)),
-                        colors().raised,
-                        colors().text,
-                    )
-                    .stroke(Stroke::new(1.0, colors().border_strong))
-                    .min_size(egui::vec2(150.0, CONTROL_H));
+                    let grant = quiet_button(&format!("Allow for {}", duration_label(self.minutes)))
+                        .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         verdict = Some(Verdict::AllowFor(Duration::from_secs(
                             u64::from(self.minutes) * 60,
@@ -2301,7 +2290,7 @@ mod app {
                                     ui.label(RichText::new(name).font(semibold(SUBHEAD)).color(colors().text));
                                     ui.label(
                                         RichText::new(format!("{}", list.len()))
-                                            .size(SMALL)
+                                            .font(mono(SMALL))
                                             .color(colors().subtle),
                                     );
                                     // Several instances of one program share a group; name the PID only
