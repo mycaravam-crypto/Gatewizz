@@ -2364,7 +2364,7 @@ mod app {
                 }
                 history_header(ui);
                 ui.spacing_mut().item_spacing.y = 3.0;
-                let rows = ((ui.available_height() - 8.0) / 44.0).max(1.0) as usize;
+                let rows = ((ui.available_height() - 8.0) / 45.0).max(1.0) as usize;
                 let mut open = None;
                 for (index, event) in self.history.iter().enumerate().take(rows) {
                     if history_row(ui, event, false).clicked() {
