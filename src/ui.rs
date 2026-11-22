@@ -200,21 +200,173 @@ mod app {
     use crate::prompt::{Decision, Inbox, Lasting, Message, Notice};
     use crate::rules::Action;
 
-    // Design tokens: one dark theme. Surfaces step up in lightness; status colours are used for meaning only.
-    // Text tiers TEXT > MUTED > SUBTLE all meet WCAG AA (4.5:1) on every surface.
-    const BG: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x14);
-    const SURFACE: Color32 = Color32::from_rgb(0x12, 0x16, 0x1f);
-    const RAISED: Color32 = Color32::from_rgb(0x1a, 0x20, 0x2c);
-    const BORDER: Color32 = Color32::from_rgb(0x24, 0x2b, 0x39);
-    const BORDER_STRONG: Color32 = Color32::from_rgb(0x35, 0x3f, 0x52);
-    const TEXT: Color32 = Color32::from_rgb(0xe8, 0xec, 0xf3);
-    const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb6);
-    const SUBTLE: Color32 = Color32::from_rgb(0x7d, 0x87, 0x9a);
-    const BLUE: Color32 = Color32::from_rgb(0x6e, 0x9d, 0xff);
-    const GREEN: Color32 = Color32::from_rgb(0x41, 0xc4, 0x83);
-    const AMBER: Color32 = Color32::from_rgb(0xf0, 0xab, 0x3e);
-    const RED: Color32 = Color32::from_rgb(0xef, 0x63, 0x63);
-    const GREEN_FILL: Color32 = Color32::from_rgb(0x1d, 0x8a, 0x58);
+    // Palette values are refreshed from the Windows personalization settings while the app runs.
+    // The dark palette remains the safe fallback when registry values are unavailable.
+    const ACCENT_FALLBACK: Color32 = Color32::from_rgb(0x6e, 0x9d, 0xff);
+    const SYMBOLS: &str = "gatewizz-system-icons";
+
+    #[derive(Clone, Copy, PartialEq)]
+    struct Palette {
+        light: bool,
+        bg: Color32,
+        surface: Color32,
+        raised: Color32,
+        border: Color32,
+        border_strong: Color32,
+        text: Color32,
+        muted: Color32,
+        subtle: Color32,
+        blue: Color32,
+        green: Color32,
+        amber: Color32,
+        red: Color32,
+        green_fill: Color32,
+        extreme: Color32,
+    }
+
+    impl Palette {
+        fn dark(accent: Color32) -> Self {
+            let accent = themed_accent(accent, false);
+            Self {
+                light: false,
+                bg: Color32::from_rgb(0x0b, 0x0e, 0x14),
+                surface: Color32::from_rgb(0x12, 0x16, 0x1f),
+                raised: Color32::from_rgb(0x1a, 0x20, 0x2c),
+                border: Color32::from_rgb(0x24, 0x2b, 0x39),
+                border_strong: Color32::from_rgb(0x35, 0x3f, 0x52),
+                text: Color32::from_rgb(0xe8, 0xec, 0xf3),
+                muted: Color32::from_rgb(0x9a, 0xa4, 0xb6),
+                subtle: Color32::from_rgb(0x7d, 0x87, 0x9a),
+                blue: accent,
+                green: Color32::from_rgb(0x41, 0xc4, 0x83),
+                amber: Color32::from_rgb(0xf0, 0xab, 0x3e),
+                red: Color32::from_rgb(0xef, 0x63, 0x63),
+                green_fill: Color32::from_rgb(0x17, 0x74, 0x4a),
+                extreme: Color32::from_rgb(0x0e, 0x12, 0x1a),
+            }
+        }
+
+        fn light(accent: Color32) -> Self {
+            let accent = themed_accent(accent, true);
+            Self {
+                light: true,
+                bg: Color32::from_rgb(0xf3, 0xf5, 0xf8),
+                surface: Color32::from_rgb(0xff, 0xff, 0xff),
+                raised: Color32::from_rgb(0xe9, 0xee, 0xf5),
+                border: Color32::from_rgb(0xd7, 0xde, 0xe8),
+                border_strong: Color32::from_rgb(0xb8, 0xc3, 0xd2),
+                text: Color32::from_rgb(0x1b, 0x24, 0x32),
+                muted: Color32::from_rgb(0x4b, 0x57, 0x68),
+                subtle: Color32::from_rgb(0x5c, 0x68, 0x79),
+                blue: accent,
+                green: Color32::from_rgb(0x17, 0x74, 0x4a),
+                amber: Color32::from_rgb(0x8a, 0x53, 0x00),
+                red: Color32::from_rgb(0xb4, 0x23, 0x18),
+                green_fill: Color32::from_rgb(0x17, 0x74, 0x4a),
+                extreme: Color32::from_rgb(0xea, 0xed, 0xf2),
+            }
+        }
+    }
+
+    fn relative_luminance(color: Color32) -> f32 {
+        let channel = |value: u8| {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    fn themed_accent(mut accent: Color32, light: bool) -> Color32 {
+        let background = if light {
+            Color32::from_rgb(0xe9, 0xee, 0xf5)
+        } else {
+            Color32::from_rgb(0x1a, 0x20, 0x2c)
+        };
+        for _ in 0..24 {
+            if contrast_ratio(accent, background) >= 4.5 {
+                return accent;
+            }
+            let adjust = |value: u8| {
+                if light {
+                    (f32::from(value) * 0.86) as u8
+                } else {
+                    (f32::from(value) + (255.0 - f32::from(value)) * 0.14) as u8
+                }
+            };
+            accent = Color32::from_rgb(adjust(accent.r()), adjust(accent.g()), adjust(accent.b()));
+        }
+        if light {
+            Color32::from_rgb(0x1d, 0x4e, 0x89)
+        } else {
+            Color32::from_rgb(0x9b, 0xb9, 0xff)
+        }
+    }
+
+    std::thread_local! {
+        static PALETTE: std::cell::Cell<Palette> = std::cell::Cell::new(Palette::dark(ACCENT_FALLBACK));
+    }
+
+    fn colors() -> Palette {
+        PALETTE.with(std::cell::Cell::get)
+    }
+
+    fn set_colors(palette: Palette) {
+        PALETTE.with(|current| current.set(palette));
+    }
+
+    fn registry_dword(subkey: &str, value: &str) -> Option<u32> {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegGetValueW};
+
+        let subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut data = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // Read the DWORD directly. Spawning reg.exe from a GUI process can flash a console window.
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                0x10, // RRF_RT_REG_DWORD
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        (result == 0).then_some(data)
+    }
+
+    fn system_palette() -> Palette {
+        let light = registry_dword(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            "AppsUseLightTheme",
+        ) == Some(1);
+        let accent = registry_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor")
+            .map(|argb| {
+                // DWM stores AccentColor as ABGR, not ARGB.
+                Color32::from_rgb(
+                    (argb & 0xff) as u8,
+                    ((argb >> 8) & 0xff) as u8,
+                    ((argb >> 16) & 0xff) as u8,
+                )
+            })
+            .unwrap_or(ACCENT_FALLBACK);
+        if light {
+            Palette::light(accent)
+        } else {
+            Palette::dark(accent)
+        }
+    }
     /// Font family name for headings and labels; falls back to the regular face.
     const SEMIBOLD: &str = "semibold";
 
@@ -261,13 +413,20 @@ mod app {
         proxy: impl FnOnce(tokio::sync::oneshot::Receiver<()>) -> Result<(), String> + Send + 'static,
     ) -> Result<(), String> {
         let (quit, stop) = tokio::sync::oneshot::channel();
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_title("Gatewizz")
+            .with_app_id("gatewizz")
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size([820.0, 580.0])
+            .with_resizable(true)
+            .with_visible(false);
+        if let Some(geometry) = geometry_path().as_deref().and_then(load_geometry) {
+            viewport = viewport
+                .with_inner_size([geometry.width, geometry.height])
+                .with_position([geometry.x, geometry.y]);
+        }
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_title("Gatewizz")
-                .with_inner_size([1040.0, 720.0])
-                .with_min_inner_size([820.0, 580.0])
-                .with_resizable(true)
-                .with_visible(false),
+            viewport,
             ..Default::default()
         };
         let ui = eframe::run_native(
@@ -361,6 +520,70 @@ mod app {
         notice_minutes: u32,
         /// The service's answer to the last decision, shown in the status bar for a while.
         firewall_result: Option<(Instant, bool, String)>,
+        icons_available: bool,
+        last_theme_check: Instant,
+        geometry_path: Option<PathBuf>,
+        last_geometry_save: Instant,
+        saved_geometry: Option<WindowGeometry>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct WindowGeometry {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    }
+
+    fn geometry_path() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("gatewizz").join("window.json"))
+    }
+
+    fn clamp_geometry(mut geometry: WindowGeometry) -> WindowGeometry {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN) as f32,
+                GetSystemMetrics(SM_YVIRTUALSCREEN) as f32,
+                GetSystemMetrics(SM_CXVIRTUALSCREEN).max(820) as f32,
+                GetSystemMetrics(SM_CYVIRTUALSCREEN).max(580) as f32,
+            )
+        };
+        geometry.width = geometry.width.clamp(820.0, width);
+        geometry.height = geometry.height.clamp(580.0, height);
+        geometry.x = geometry
+            .x
+            .clamp(left - geometry.width + 120.0, left + width - 120.0);
+        geometry.y = geometry
+            .y
+            .clamp(top - geometry.height + 64.0, top + height - 64.0);
+        geometry
+    }
+
+    fn load_geometry(path: &Path) -> Option<WindowGeometry> {
+        let bytes = std::fs::read(path).ok()?;
+        let geometry = serde_json::from_slice::<WindowGeometry>(&bytes).ok()?;
+        Some(clamp_geometry(geometry))
+    }
+
+    fn save_geometry(path: &Path, geometry: WindowGeometry) -> std::io::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "window path has no parent",
+            )
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&geometry)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(temporary, path)
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -445,7 +668,10 @@ mod app {
             + Send
             + 'static,
         ) -> Result<Self, String> {
-            setup_style(&cc.egui_ctx);
+            set_colors(system_palette());
+            let icons_available = setup_style(&cc.egui_ctx);
+            let geometry_path = geometry_path();
+            let saved_geometry = geometry_path.as_deref().and_then(load_geometry);
             let (tx, wake) = mpsc::channel();
             for kind in [true, false] {
                 let (tx, ctx) = (tx.clone(), cc.egui_ctx.clone());
@@ -572,6 +798,11 @@ mod app {
                 scope_for: None,
                 notice_minutes: NOTICE_MINUTES,
                 firewall_result: None,
+                icons_available,
+                last_theme_check: Instant::now(),
+                geometry_path,
+                last_geometry_save: Instant::now(),
+                saved_geometry,
             })
         }
 
@@ -642,8 +873,8 @@ mod app {
 
     fn card() -> egui::Frame {
         egui::Frame::new()
-            .fill(SURFACE)
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(colors().surface)
+            .stroke(Stroke::new(1.0, colors().border))
             .corner_radius(R_CARD)
             .inner_margin(pad(SPACE_L, SPACE_L))
     }
@@ -654,7 +885,7 @@ mod app {
             RichText::new(text)
                 .font(semibold(CAPTION))
                 .extra_letter_spacing(0.6)
-                .color(MUTED),
+                .color(colors().muted),
         );
     }
 
@@ -740,18 +971,26 @@ mod app {
     }
 
     fn quiet_button(text: &str) -> egui::Button<'static> {
-        egui::Button::new(RichText::new(text).size(SMALL).color(MUTED))
+        egui::Button::new(RichText::new(text).size(SMALL).color(colors().muted))
             .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, BORDER))
+            .stroke(Stroke::new(1.0, colors().border))
             .corner_radius(R_CONTROL)
     }
 
     /// A toggle chip: filters and duration presets.
     fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
         let (fill, stroke, color) = if selected {
-            (tint(BLUE), Stroke::new(1.0, BLUE), TEXT)
+            (
+                tint(colors().blue),
+                Stroke::new(1.0, colors().blue),
+                colors().text,
+            )
         } else {
-            (Color32::TRANSPARENT, Stroke::new(1.0, BORDER), MUTED)
+            (
+                Color32::TRANSPARENT,
+                Stroke::new(1.0, colors().border),
+                colors().muted,
+            )
         };
         ui.add(
             egui::Button::new(RichText::new(text).size(SMALL).color(color))
@@ -768,14 +1007,21 @@ mod app {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 dot(ui, color, 4.0);
-                ui.label(RichText::new(label).font(semibold(SMALL)).color(MUTED));
+                ui.label(
+                    RichText::new(label)
+                        .font(semibold(SMALL))
+                        .color(colors().muted),
+                );
             });
             ui.label(
                 RichText::new(value.to_string())
-                    .font(semibold(HERO))
-                    .color(TEXT),
+                    .font(mono(HERO))
+                    .color(colors().text),
             );
-            ui.add(egui::Label::new(RichText::new(hint).size(CAPTION).color(SUBTLE)).truncate());
+            ui.add(
+                egui::Label::new(RichText::new(hint).size(CAPTION).color(colors().subtle))
+                    .truncate(),
+            );
         });
     }
 
@@ -787,8 +1033,11 @@ mod app {
             .spacing([SPACE_XL, SPACE_S])
             .show(ui, |ui| {
                 for (key, value) in rows {
-                    ui.label(RichText::new(*key).size(SMALL).color(SUBTLE));
-                    ui.add(egui::Label::new(RichText::new(*value).size(BODY).color(TEXT)).wrap());
+                    ui.label(RichText::new(*key).size(SMALL).color(colors().subtle));
+                    ui.add(
+                        egui::Label::new(RichText::new(*value).size(BODY).color(colors().text))
+                            .wrap(),
+                    );
                     ui.end_row();
                 }
             });
@@ -796,16 +1045,20 @@ mod app {
 
     fn decision_style(event: &HistoryEvent) -> (&'static str, Color32) {
         match event.decision() {
-            "allow" => ("Allowed", GREEN),
-            "block" if event.action == Some(Action::Approve) => ("Denied", RED),
-            "block" => ("Blocked", RED),
-            "approve" => ("Approved", AMBER),
-            _ => ("Unknown", SUBTLE),
+            "allow" => ("Allowed", colors().green),
+            "block" if event.action == Some(Action::Approve) => ("Denied", colors().red),
+            "block" => ("Blocked", colors().red),
+            "approve" => ("Approved", colors().amber),
+            _ => ("Unknown", colors().subtle),
         }
     }
 
     fn urgency(left: Duration) -> Color32 {
-        if left.as_secs() < 15 { RED } else { AMBER }
+        if left.as_secs() < 15 {
+            colors().red
+        } else {
+            colors().amber
+        }
     }
 
     /// Column rectangles of an activity row: time, program, destination, decision, status.
@@ -832,10 +1085,19 @@ mod app {
                 .iter()
                 .zip(["TIME (UTC)", "PROGRAM", "DESTINATION", "DECISION", "STATUS"])
         {
-            paint_cell(ui.painter(), *column, title, semibold(CAPTION), SUBTLE);
+            paint_cell(
+                ui.painter(),
+                *column,
+                title,
+                semibold(CAPTION),
+                colors().subtle,
+            );
         }
-        ui.painter()
-            .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, BORDER));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            Stroke::new(1.0, colors().border),
+        );
     }
 
     /// One clickable, full-width activity row.
@@ -845,9 +1107,9 @@ mod app {
         let response = response.on_hover_cursor(CursorIcon::PointingHand);
         let painter = ui.painter();
         if active {
-            painter.rect_filled(rect, 6, tint(BLUE));
+            painter.rect_filled(rect, 6, tint(colors().blue));
         } else if response.hovered() {
-            painter.rect_filled(rect, R_CONTROL, RAISED);
+            painter.rect_filled(rect, R_CONTROL, colors().raised);
         }
         let [time, program, host, decision, status] = history_columns(rect);
         let (label, color) = decision_style(event);
@@ -857,18 +1119,22 @@ mod app {
             time,
             when.trim_end_matches('Z'),
             mono(SMALL),
-            MUTED,
+            colors().muted,
         );
         paint_cell(
             painter,
             program,
             &event.process_name(),
             FontId::proportional(13.5),
-            TEXT,
+            colors().text,
         );
-        paint_cell(painter, host, &event.host, mono(SMALL), BLUE);
+        paint_cell(painter, host, &event.host, mono(SMALL), colors().blue);
         paint_badge(painter, decision, label, color);
-        let status_color = if event.status >= 400 { RED } else { MUTED };
+        let status_color = if event.status >= 400 {
+            colors().red
+        } else {
+            colors().muted
+        };
         paint_cell(
             painter,
             status,
@@ -996,7 +1262,7 @@ mod app {
 
     /// Prefers the Windows UI fonts (Segoe UI, Segoe UI Semibold, Consolas) from the system font folder, so text looks
     /// native and crisp. Each missing face falls back to egui's bundled fonts, which also cover glyphs Segoe UI lacks.
-    fn setup_fonts(ctx: &egui::Context) {
+    fn setup_fonts(ctx: &egui::Context) -> bool {
         let mut fonts = egui::FontDefinitions::default();
         let dir = std::env::var_os("WINDIR").map(|windows| PathBuf::from(windows).join("Fonts"));
         let mut load = |name: &str, file: &str| -> Option<String> {
@@ -1009,6 +1275,8 @@ mod app {
         let regular = load("segoe-ui", "segoeui.ttf");
         let semibold = load("segoe-ui-semibold", "seguisb.ttf");
         let mono = load("consolas", "consola.ttf");
+        let symbols = load("system-icons", "SegoeIcons.ttf")
+            .or_else(|| load("system-icons-mdl2", "segmdl2.ttf"));
         let family = |fonts: &mut egui::FontDefinitions, family: FontFamily| {
             fonts.families.entry(family).or_default().clone()
         };
@@ -1025,12 +1293,24 @@ mod app {
             .families
             .insert(FontFamily::Name(SEMIBOLD.into()), heading);
         fonts.families.insert(FontFamily::Monospace, monospace);
+        let icons_available = symbols.is_some();
+        if let Some(symbols) = symbols {
+            fonts
+                .families
+                .insert(FontFamily::Name(SYMBOLS.into()), vec![symbols]);
+        }
         ctx.set_fonts(fonts);
+        icons_available
     }
 
-    fn setup_style(ctx: &egui::Context) {
-        setup_fonts(ctx);
-        ctx.set_theme(egui::Theme::Dark);
+    fn setup_style(ctx: &egui::Context) -> bool {
+        let icons_available = setup_fonts(ctx);
+        let palette = colors();
+        ctx.set_theme(if palette.light {
+            egui::Theme::Light
+        } else {
+            egui::Theme::Dark
+        });
         ctx.all_styles_mut(|style| {
             use egui::TextStyle;
             style.text_styles = [
@@ -1041,39 +1321,100 @@ mod app {
                 (TextStyle::Monospace, mono(SMALL)),
             ]
             .into();
+            style.animation_time = 0.12;
             style.spacing.item_spacing = egui::vec2(SPACE_S, SPACE_S);
             style.spacing.button_padding = egui::vec2(SPACE_L, SPACE_XS);
             style.spacing.interact_size.y = CONTROL_H_SM;
             style.interaction.selectable_labels = false;
             let visuals = &mut style.visuals;
-            visuals.panel_fill = BG;
-            visuals.window_fill = SURFACE;
-            visuals.window_stroke = Stroke::new(1.0, BORDER);
+            visuals.panel_fill = colors().bg;
+            visuals.window_fill = colors().surface;
+            visuals.window_stroke = Stroke::new(1.0, colors().border);
             visuals.window_corner_radius = CornerRadius::same(R_CARD);
             visuals.menu_corner_radius = CornerRadius::same(R_CONTROL);
-            visuals.extreme_bg_color = Color32::from_rgb(0x0e, 0x12, 0x1a);
-            visuals.faint_bg_color = SURFACE;
+            visuals.extreme_bg_color = colors().extreme;
+            visuals.faint_bg_color = colors().surface;
             visuals.override_text_color = None;
-            visuals.selection.bg_fill = tint(BLUE);
-            visuals.selection.stroke = Stroke::new(1.0, BLUE);
-            visuals.hyperlink_color = BLUE;
+            visuals.selection.bg_fill = tint(colors().blue);
+            visuals.selection.stroke = Stroke::new(1.0, colors().blue);
+            visuals.hyperlink_color = colors().blue;
             let widgets = &mut visuals.widgets;
-            widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-            widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+            widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors().border);
+            widgets.noninteractive.fg_stroke = Stroke::new(1.0, colors().text);
             for (state, fill, stroke) in [
-                (&mut widgets.inactive, SURFACE, BORDER),
-                (&mut widgets.hovered, RAISED, BORDER_STRONG),
-                (&mut widgets.active, RAISED, BLUE),
-                (&mut widgets.open, RAISED, BORDER_STRONG),
+                (&mut widgets.inactive, colors().surface, colors().border),
+                (
+                    &mut widgets.hovered,
+                    colors().raised,
+                    colors().border_strong,
+                ),
+                (&mut widgets.active, colors().raised, colors().blue),
+                (&mut widgets.open, colors().raised, colors().border_strong),
             ] {
                 state.bg_fill = fill;
                 state.weak_bg_fill = fill;
                 state.bg_stroke = Stroke::new(1.0, stroke);
-                state.fg_stroke = Stroke::new(1.0, TEXT);
+                state.fg_stroke = Stroke::new(1.0, colors().text);
                 state.corner_radius = CornerRadius::same(R_CONTROL);
                 state.expansion = 0.0;
             }
         });
+        icons_available
+    }
+
+    fn tab_icon(ui: &mut egui::Ui, tab: Tab, font_available: bool, color: Color32) {
+        let glyph = match tab {
+            Tab::Overview => '\u{e80f}',
+            Tab::Activity => '\u{e81c}',
+            Tab::Network => '\u{e968}',
+        };
+        if font_available {
+            ui.label(
+                RichText::new(glyph.to_string())
+                    .font(FontId::new(16.0, FontFamily::Name(SYMBOLS.into())))
+                    .color(color),
+            );
+            return;
+        }
+
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
+        let painter = ui.painter();
+        let center = rect.center();
+        let stroke = Stroke::new(1.5, color);
+        match tab {
+            Tab::Overview => {
+                for offset in [
+                    egui::vec2(-4.0, -4.0),
+                    egui::vec2(4.0, -4.0),
+                    egui::vec2(-4.0, 4.0),
+                    egui::vec2(4.0, 4.0),
+                ] {
+                    painter.rect_filled(
+                        Rect::from_center_size(center + offset, egui::vec2(5.0, 5.0)),
+                        1.0,
+                        color,
+                    );
+                }
+            }
+            Tab::Activity => {
+                painter.circle_stroke(center, 7.0, stroke);
+                painter.line_segment([center, center + egui::vec2(0.0, -4.0)], stroke);
+                painter.line_segment([center, center + egui::vec2(4.0, 2.0)], stroke);
+            }
+            Tab::Network => {
+                let nodes = [
+                    center + egui::vec2(-5.0, -4.0),
+                    center + egui::vec2(5.0, -4.0),
+                    center + egui::vec2(0.0, 5.0),
+                ];
+                painter.line_segment([nodes[0], nodes[1]], stroke);
+                painter.line_segment([nodes[0], nodes[2]], stroke);
+                painter.line_segment([nodes[1], nodes[2]], stroke);
+                for node in nodes {
+                    painter.circle_filled(node, 2.5, color);
+                }
+            }
+        }
     }
 
     /// Workspace views. Each draws one region; all decisions go through `Approvals`.
@@ -1081,7 +1422,7 @@ mod app {
         fn header(&mut self, ui: &mut egui::Ui, state: TrayState, waiting: usize) {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), Sense::hover());
-                ui.painter().rect_filled(rect, 9, BLUE);
+                ui.painter().rect_filled(rect, 9, colors().blue);
                 ui.painter().text(
                     rect.center(),
                     Align2::CENTER_CENTER,
@@ -1092,26 +1433,32 @@ mod app {
                 ui.add_space(SPACE_XS);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("Gatewizz").font(semibold(TITLE)).color(TEXT));
+                    ui.label(
+                        RichText::new("Gatewizz")
+                            .font(semibold(TITLE))
+                            .color(colors().text),
+                    );
                     ui.label(
                         RichText::new("Local security gate for outgoing traffic")
                             .size(SMALL)
-                            .color(MUTED),
+                            .color(colors().muted),
                     );
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (text, color) = match state {
-                        TrayState::Running => ("Proxy running".to_string(), GREEN),
-                        TrayState::Paused => ("Approvals paused".to_string(), MUTED),
-                        TrayState::Waiting => (format!("{waiting} awaiting review"), AMBER),
+                        TrayState::Running => ("Proxy running".to_string(), colors().green),
+                        TrayState::Paused => ("Approvals paused".to_string(), colors().muted),
+                        TrayState::Waiting => {
+                            (format!("{waiting} awaiting review"), colors().amber)
+                        }
                     };
                     status_pill(ui, &text, color);
                 });
             });
             ui.add_space(SPACE_L);
             egui::Frame::new()
-                .fill(SURFACE)
-                .stroke(Stroke::new(1.0, BORDER))
+                .fill(colors().surface)
+                .stroke(Stroke::new(1.0, colors().border))
                 .corner_radius(R_CARD)
                 .inner_margin(pad(SPACE_XS, SPACE_XS))
                 .show(ui, |ui| {
@@ -1123,37 +1470,57 @@ mod app {
                             (Tab::Network, "Network", 0),
                         ] {
                             let selected = self.tab == tab;
-                            let mut button = egui::Button::new(
-                                RichText::new(label)
-                                    .font(semibold(BODY))
-                                    .color(if selected { TEXT } else { MUTED }),
-                            )
-                            .corner_radius(R_CONTROL)
-                            .min_size(egui::vec2(96.0, CONTROL_H_SM))
-                            .fill(if selected {
-                                RAISED
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(if selected {
-                                Stroke::new(1.0, BORDER_STRONG)
-                            } else {
-                                Stroke::NONE
-                            });
+                            let progress = ui.ctx().animate_bool_with_time(
+                                egui::Id::new(("tab-selected", label)),
+                                selected,
+                                0.12,
+                            );
+                            let mut button =
+                                egui::Button::new(RichText::new(label).font(semibold(BODY)).color(
+                                    if selected {
+                                        colors().text
+                                    } else {
+                                        colors().muted
+                                    },
+                                ))
+                                .corner_radius(R_CONTROL)
+                                .min_size(egui::vec2(112.0, CONTROL_H_SM))
+                                .fill(Color32::from_rgba_unmultiplied(
+                                    colors().raised.r(),
+                                    colors().raised.g(),
+                                    colors().raised.b(),
+                                    (progress * 255.0) as u8,
+                                ))
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    colors().border_strong.gamma_multiply(progress),
+                                ));
                             if badge > 0 {
                                 button = button.right_text(
                                     RichText::new(badge.to_string())
-                                        .font(semibold(SMALL))
-                                        .color(AMBER),
+                                        .font(mono(SMALL))
+                                        .color(colors().amber),
                                 );
                             }
-                            if ui
-                                .add(button)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                self.tab = tab;
-                            }
+                            ui.horizontal(|ui| {
+                                tab_icon(
+                                    ui,
+                                    tab,
+                                    self.icons_available,
+                                    if selected {
+                                        colors().text
+                                    } else {
+                                        colors().muted
+                                    },
+                                );
+                                if ui
+                                    .add(button)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    self.tab = tab;
+                                }
+                            });
                         }
                     });
                 });
@@ -1163,11 +1530,19 @@ mod app {
         fn status_bar(&mut self, ui: &mut egui::Ui, state: TrayState) {
             ui.horizontal(|ui| {
                 let paused = state == TrayState::Paused;
-                dot(ui, if paused { SUBTLE } else { GREEN }, 4.0);
+                dot(
+                    ui,
+                    if paused {
+                        colors().subtle
+                    } else {
+                        colors().green
+                    },
+                    4.0,
+                );
                 ui.label(
                     RichText::new(format!("Proxy on http://{}", self.listen))
                         .size(SMALL)
-                        .color(MUTED),
+                        .color(colors().muted),
                 );
                 let copied = self
                     .address_copied
@@ -1190,9 +1565,13 @@ mod app {
                 }
                 if self.firewall_connected {
                     ui.add_space(SPACE_S);
-                    dot(ui, GREEN, 4.0);
-                    ui.label(RichText::new("Firewall prompt on").size(SMALL).color(MUTED))
-                        .on_hover_text("Connected to the Gatewizz firewall service");
+                    dot(ui, colors().green, 4.0);
+                    ui.label(
+                        RichText::new("Firewall prompt on")
+                            .size(SMALL)
+                            .color(colors().muted),
+                    )
+                    .on_hover_text("Connected to the Gatewizz firewall service");
                 }
                 if let Some((at, ok, message)) = &self.firewall_result {
                     let shown = RESULT_SHOWN;
@@ -1202,7 +1581,7 @@ mod app {
                             egui::Label::new(
                                 RichText::new(format!("Firewall: {message}"))
                                     .size(SMALL)
-                                    .color(if *ok { GREEN } else { RED }),
+                                    .color(if *ok { colors().green } else { colors().red }),
                             )
                             .truncate(),
                         );
@@ -1235,23 +1614,26 @@ mod app {
 
         fn paused_banner(&mut self, ui: &mut egui::Ui) {
             egui::Frame::new()
-                .fill(tint(AMBER))
-                .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.45)))
+                .fill(tint(colors().amber))
+                .stroke(Stroke::new(1.0, colors().amber.gamma_multiply(0.45)))
                 .corner_radius(R_CARD)
                 .inner_margin(pad(SPACE_L, SPACE_S))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        dot(ui, AMBER, 4.0);
+                        dot(ui, colors().amber, 4.0);
                         ui.label(
                             RichText::new(
                                 "Approvals are paused. Requests that need approval are blocked.",
                             )
                             .size(BODY)
-                            .color(TEXT),
+                            .color(colors().text),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(button("Resume", AMBER, BG)).clicked() {
+                            if ui
+                                .add(button("Resume", colors().amber, colors().bg))
+                                .clicked()
+                            {
                                 self.set_paused(false);
                             }
                         });
@@ -1289,7 +1671,7 @@ mod app {
                     ui.horizontal_wrapped(|ui| {
                         caption(ui, "SYSTEM COMPONENTS");
                         ui.add_space(SPACE_S);
-                        status_pill(ui, "Proxy running", GREEN);
+                        status_pill(ui, "Proxy running", colors().green);
                         status_pill(
                             ui,
                             if self.firewall_connected {
@@ -1298,9 +1680,9 @@ mod app {
                                 "Firewall not connected"
                             },
                             if self.firewall_connected {
-                                GREEN
+                                colors().green
                             } else {
-                                SUBTLE
+                                colors().subtle
                             },
                         );
                         status_pill(
@@ -1311,26 +1693,32 @@ mod app {
                                 "Connection monitor off"
                             },
                             if self.network.is_some() {
-                                GREEN
+                                colors().green
                             } else {
-                                SUBTLE
+                                colors().subtle
                             },
                         );
                     });
                 });
                 ui.add_space(SPACE_M);
                 ui.columns(4, |columns| {
-                    stat_card(&mut columns[0], "Loaded events", loaded, BLUE, source);
-                    stat_card(&mut columns[1], "Allowed", allowed, GREEN, source);
-                    stat_card(&mut columns[2], "Blocked", blocked, RED, source);
+                    stat_card(
+                        &mut columns[0],
+                        "Loaded events",
+                        loaded,
+                        colors().blue,
+                        source,
+                    );
+                    stat_card(&mut columns[1], "Allowed", allowed, colors().green, source);
+                    stat_card(&mut columns[2], "Blocked", blocked, colors().red, source);
                     stat_card(
                         &mut columns[3],
                         "Live connections",
                         live_connections.unwrap_or(0),
                         if live_connections.is_some() {
-                            GREEN
+                            colors().green
                         } else {
-                            SUBTLE
+                            colors().subtle
                         },
                         if live_connections.is_some() {
                             "currently observed"
@@ -1372,8 +1760,8 @@ mod app {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new((pending.len() + self.inbox.len()).to_string())
-                            .font(semibold(SMALL))
-                            .color(MUTED),
+                            .font(mono(SMALL))
+                            .color(colors().muted),
                     );
                 });
             });
@@ -1383,12 +1771,12 @@ mod app {
                     ui.set_width(ui.available_width());
                     ui.vertical_centered(|ui| {
                         ui.add_space(SPACE_L);
-                        check_icon(ui, GREEN, 40.0);
+                        check_icon(ui, colors().green, 40.0);
                         ui.add_space(SPACE_S);
                         ui.label(
                             RichText::new("Queue is clear")
                                 .font(semibold(SUBHEAD))
-                                .color(TEXT),
+                                .color(colors().text),
                         );
                         ui.label(
                             RichText::new(if self.firewall_connected {
@@ -1397,7 +1785,7 @@ mod app {
                                 "Held requests appear here and open this window."
                             })
                             .size(SMALL)
-                            .color(MUTED),
+                            .color(colors().muted),
                         );
                         ui.add_space(SPACE_L);
                     });
@@ -1410,10 +1798,18 @@ mod app {
                     for (id, held, left) in pending {
                         let active = self.selected == Some(*id);
                         let response = egui::Frame::new()
-                            .fill(if active { RAISED } else { SURFACE })
+                            .fill(if active {
+                                colors().raised
+                            } else {
+                                colors().surface
+                            })
                             .stroke(Stroke::new(
                                 if active { 1.5 } else { 1.0 },
-                                if active { BLUE } else { BORDER },
+                                if active {
+                                    colors().blue
+                                } else {
+                                    colors().border
+                                },
                             ))
                             .corner_radius(R_CARD)
                             .inner_margin(pad(SPACE_M, SPACE_M))
@@ -1424,7 +1820,7 @@ mod app {
                                         egui::Label::new(
                                             RichText::new(program(&held.process))
                                                 .font(semibold(SUBHEAD))
-                                                .color(TEXT),
+                                                .color(colors().text),
                                         )
                                         .truncate(),
                                     );
@@ -1434,14 +1830,16 @@ mod app {
                                 });
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&held.host).font(mono(SMALL)).color(MUTED),
+                                        RichText::new(&held.host)
+                                            .font(mono(SMALL))
+                                            .color(colors().muted),
                                     )
                                     .truncate(),
                                 );
                                 let (findings, color) = match held.findings.len() {
-                                    0 => ("Held by rule".to_string(), SUBTLE),
-                                    1 => ("1 finding".to_string(), AMBER),
-                                    n => (format!("{n} findings"), AMBER),
+                                    0 => ("Held by rule".to_string(), colors().subtle),
+                                    1 => ("1 finding".to_string(), colors().amber),
+                                    n => (format!("{n} findings"), colors().amber),
                                 };
                                 ui.label(RichText::new(findings).size(SMALL).color(color));
                             })
@@ -1458,10 +1856,18 @@ mod app {
                         let active =
                             self.selected.is_none() && self.notice_selected == Some(notice.id);
                         let response = egui::Frame::new()
-                            .fill(if active { RAISED } else { SURFACE })
+                            .fill(if active {
+                                colors().raised
+                            } else {
+                                colors().surface
+                            })
                             .stroke(Stroke::new(
                                 if active { 1.5 } else { 1.0 },
-                                if active { BLUE } else { BORDER },
+                                if active {
+                                    colors().blue
+                                } else {
+                                    colors().border
+                                },
                             ))
                             .corner_radius(R_CARD)
                             .inner_margin(pad(SPACE_M, SPACE_M))
@@ -1472,15 +1878,15 @@ mod app {
                                         egui::Label::new(
                                             RichText::new(&notice.program)
                                                 .font(semibold(SUBHEAD))
-                                                .color(TEXT),
+                                                .color(colors().text),
                                         )
                                         .truncate(),
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if notice.held {
-                                            badge(ui, "Waiting", AMBER);
+                                            badge(ui, "Waiting", colors().amber);
                                         } else {
-                                            badge(ui, "Blocked", RED);
+                                            badge(ui, "Blocked", colors().red);
                                         }
                                     });
                                 });
@@ -1492,7 +1898,7 @@ mod app {
                                             notice.protocol,
                                         ))
                                         .font(mono(SMALL))
-                                        .color(MUTED),
+                                        .color(colors().muted),
                                     )
                                     .truncate(),
                                 );
@@ -1500,7 +1906,9 @@ mod app {
                                     1 => "Connection · 1 attempt".to_string(),
                                     n => format!("Connection · {n} attempts"),
                                 };
-                                ui.label(RichText::new(attempts).size(SMALL).color(SUBTLE));
+                                ui.label(
+                                    RichText::new(attempts).size(SMALL).color(colors().subtle),
+                                );
                             })
                             .response
                             .interact(Sense::click())
@@ -1554,15 +1962,15 @@ mod app {
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if notice.held {
-                                    badge(ui, "Held", AMBER);
+                                    badge(ui, "Held", colors().amber);
                                 } else {
-                                    badge(ui, "Firewall", RED);
+                                    badge(ui, "Firewall", colors().red);
                                 }
                             });
                         });
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&notice.program).font(semibold(DISPLAY)).color(TEXT),
+                                RichText::new(&notice.program).font(semibold(DISPLAY)).color(colors().text),
                             )
                             .truncate(),
                         );
@@ -1570,7 +1978,7 @@ mod app {
                             egui::Label::new(
                                 RichText::new(destination(notice.remote, notice.port, notice.protocol))
                                     .font(mono(SUBHEAD))
-                                    .color(BLUE),
+                                    .color(colors().blue),
                             )
                             .wrap(),
                         );
@@ -1586,7 +1994,7 @@ mod app {
                                  has failed; most programs retry once a rule allows them."
                             })
                             .size(BODY)
-                            .color(MUTED),
+                            .color(colors().muted),
                         );
                         ui.add_space(SPACE_L);
                         caption(ui, "CONNECTION");
@@ -1631,8 +2039,8 @@ mod app {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    let deny = button("Deny always", tint(RED), RED)
-                        .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
+                    let deny = button("Deny always", Color32::TRANSPARENT, colors().red)
+                        .stroke(Stroke::new(1.0, colors().red.gamma_multiply(0.7)))
                         .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(deny)
@@ -1641,7 +2049,7 @@ mod app {
                     {
                         answer = Some((RuleAction::Block, Lasting::Always));
                     }
-                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE)
+                    let allow = button("Allow once", colors().green_fill, Color32::WHITE)
                         .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(allow)
@@ -1655,7 +2063,11 @@ mod app {
                 });
                 ui.add_space(SPACE_M);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Or allow for").size(SMALL).color(MUTED));
+                    ui.label(
+                        RichText::new("Or allow for")
+                            .size(SMALL)
+                            .color(colors().muted),
+                    );
                     // Only the service's durations: it refuses any other.
                     for minutes in crate::prompt::PRESETS {
                         if chip(ui, &duration_label(minutes), self.notice_minutes == minutes)
@@ -1667,19 +2079,16 @@ mod app {
                 });
                 ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
-                    let grant = button(
-                        &format!("Allow for {}", duration_label(self.notice_minutes)),
-                        RAISED,
-                        TEXT,
-                    )
-                    .stroke(Stroke::new(1.0, BORDER_STRONG))
+                    let grant = quiet_button(&format!(
+                        "Allow for {}",
+                        duration_label(self.notice_minutes)
+                    ))
                     .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         answer = Some((RuleAction::Allow, Lasting::Minutes(self.notice_minutes)));
                     }
-                    let always = button("Allow always", RAISED, TEXT)
-                        .stroke(Stroke::new(1.0, BORDER_STRONG))
-                        .min_size(egui::vec2(120.0, CONTROL_H));
+                    let always =
+                        quiet_button("Allow always").min_size(egui::vec2(120.0, CONTROL_H));
                     if ui
                         .add(always)
                         .on_hover_text("Add a permanent rule to the firewall configuration")
@@ -1711,7 +2120,7 @@ mod app {
                             }
                         ))
                         .size(SMALL)
-                        .color(SUBTLE),
+                        .color(colors().subtle),
                     )
                     .wrap(),
                 );
@@ -1767,13 +2176,13 @@ mod app {
                         });
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&name).font(semibold(DISPLAY)).color(TEXT),
+                                RichText::new(&name).font(semibold(DISPLAY)).color(colors().text),
                             )
                             .truncate(),
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&held.host).font(mono(SUBHEAD)).color(BLUE),
+                                RichText::new(&held.host).font(mono(SUBHEAD)).color(colors().blue),
                             )
                             .wrap(),
                         );
@@ -1786,12 +2195,12 @@ mod app {
                                 held.rule
                             ))
                             .size(BODY)
-                            .color(MUTED),
+                            .color(colors().muted),
                         );
                         } else {
                             ui.horizontal_wrapped(|ui| {
                                 for finding in &held.findings {
-                                    badge(ui, finding, AMBER);
+                                    badge(ui, finding, colors().amber);
                                 }
                             });
                         }
@@ -1813,7 +2222,7 @@ mod app {
                             Some(text) => {
                                 egui::Frame::new()
                                     .fill(ui.visuals().extreme_bg_color)
-                                    .stroke(Stroke::new(1.0, BORDER))
+                                    .stroke(Stroke::new(1.0, colors().border))
                                     .corner_radius(R_CONTROL)
                                     .inner_margin(pad(SPACE_M, SPACE_S))
                                     .show(ui, |ui| {
@@ -1826,7 +2235,7 @@ mod app {
                                                     egui::Label::new(
                                                         RichText::new(text)
                                                             .font(mono(SMALL))
-                                                            .color(MUTED),
+                                                            .color(colors().muted),
                                                     )
                                                     .wrap(),
                                                 );
@@ -1840,7 +2249,7 @@ mod app {
                                          (intercept = true) to see a request before you allow it.",
                                     )
                                     .size(BODY)
-                                    .color(MUTED),
+                                    .color(colors().muted),
                                 );
                             }
                         }
@@ -1859,20 +2268,20 @@ mod app {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-                    let deny = button("Deny", tint(RED), RED)
-                        .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
+                    let deny = button("Deny", Color32::TRANSPARENT, colors().red)
+                        .stroke(Stroke::new(1.0, colors().red.gamma_multiply(0.7)))
                         .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(deny).on_hover_text("Block this request").clicked() {
                         verdict = Some(Verdict::Deny);
                     }
-                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, CONTROL_H_LG));
+                    let allow = button("Allow once", colors().green_fill, Color32::WHITE).min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(allow).on_hover_text("Send this request only").clicked() {
                         verdict = Some(Verdict::AllowOnce);
                     }
                 });
                 ui.add_space(SPACE_M);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Or allow for").size(SMALL).color(MUTED));
+                    ui.label(RichText::new("Or allow for").size(SMALL).color(colors().muted));
                     for minutes in [5, 15, 60, 480] {
                         if chip(ui, &duration_label(minutes), self.minutes == minutes).clicked() {
                             self.minutes = minutes;
@@ -1883,13 +2292,8 @@ mod app {
                 });
                 ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
-                    let grant = button(
-                        &format!("Allow for {}", duration_label(self.minutes)),
-                        RAISED,
-                        TEXT,
-                    )
-                    .stroke(Stroke::new(1.0, BORDER_STRONG))
-                    .min_size(egui::vec2(150.0, CONTROL_H));
+                    let grant = quiet_button(&format!("Allow for {}", duration_label(self.minutes)))
+                        .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         verdict = Some(Verdict::AllowFor(Duration::from_secs(
                             u64::from(self.minutes) * 60,
@@ -1902,7 +2306,7 @@ mod app {
                                 "Covers only {name} connecting to {host}. Closing the window or letting the timer run out denies the request."
                             ))
                             .size(SMALL)
-                            .color(SUBTLE),
+                            .color(colors().subtle),
                         )
                         .wrap(),
                     );
@@ -1928,17 +2332,17 @@ mod app {
                 if self.history.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(SPACE_XXL);
-                        check_icon(ui, GREEN, 48.0);
+                        check_icon(ui, colors().green, 48.0);
                         ui.add_space(SPACE_S);
                         ui.label(
                             RichText::new("You're all caught up")
                                 .font(semibold(TITLE))
-                                .color(TEXT),
+                                .color(colors().text),
                         );
                         ui.label(
                             RichText::new(self.empty_history_message())
                                 .size(SMALL)
-                                .color(MUTED),
+                                .color(colors().muted),
                         );
                     });
                     return;
@@ -1972,19 +2376,19 @@ mod app {
                              the hostname where Windows' DNS cache knows it. It only watches; nothing is blocked.",
                         )
                         .size(BODY)
-                        .color(MUTED),
+                        .color(colors().muted),
                     );
                     ui.add_space(SPACE_S);
                     ui.label(
                         RichText::new("[monitor]\nenabled = true")
                             .font(mono(SMALL))
-                            .color(TEXT),
+                            .color(colors().text),
                     );
                     ui.add_space(SPACE_XS);
                     ui.label(
                         RichText::new("Add this to your configuration file and restart Gatewizz.")
                             .size(SMALL)
-                            .color(SUBTLE),
+                            .color(colors().subtle),
                     );
                 });
                 return;
@@ -2009,8 +2413,8 @@ mod app {
                         state.connections.len(),
                         groups.len()
                     ))
-                    .size(SMALL)
-                    .color(MUTED),
+                    .font(mono(SMALL))
+                    .color(colors().muted),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let age = state.sampled.map(|at| at.elapsed().as_secs());
@@ -2019,7 +2423,7 @@ mod app {
                         Some(secs) => format!("Updated {secs} s ago"),
                         None => "Starting…".to_string(),
                     };
-                    ui.label(RichText::new(text).size(SMALL).color(SUBTLE));
+                    ui.label(RichText::new(text).size(SMALL).color(colors().subtle));
                 });
             });
             ui.add_space(SPACE_M);
@@ -2027,19 +2431,19 @@ mod app {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        dot(ui, RED, 4.0);
-                        ui.label(RichText::new(error).size(BODY).color(TEXT));
+                        dot(ui, colors().red, 4.0);
+                        ui.label(RichText::new(error).size(BODY).color(colors().text));
                     });
                 });
                 ui.add_space(SPACE_M);
             }
             if let Some(error) = &state.dns_error {
                 ui.horizontal(|ui| {
-                    dot(ui, AMBER, 3.5);
+                    dot(ui, colors().amber, 3.5);
                     ui.label(
                         RichText::new(format!("Hostnames unavailable: {error}"))
                             .size(SMALL)
-                            .color(MUTED),
+                            .color(colors().muted),
                     );
                 });
                 ui.add_space(SPACE_S);
@@ -2047,6 +2451,8 @@ mod app {
             if groups.is_empty() {
                 ui.add_space(SPACE_XL);
                 ui.vertical_centered(|ui| {
+                    check_icon(ui, colors().green, 40.0);
+                    ui.add_space(SPACE_S);
                     ui.label(
                         RichText::new(if self.network_filter.trim().is_empty() {
                             "No outgoing connections right now."
@@ -2054,7 +2460,7 @@ mod app {
                             "No connection matches the search."
                         })
                         .size(BODY)
-                        .color(MUTED),
+                        .color(colors().muted),
                     );
                 });
                 return;
@@ -2068,11 +2474,11 @@ mod app {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(name).font(semibold(SUBHEAD)).color(TEXT));
+                                    ui.label(RichText::new(name).font(semibold(SUBHEAD)).color(colors().text));
                                     ui.label(
                                         RichText::new(format!("{}", list.len()))
-                                            .size(SMALL)
-                                            .color(SUBTLE),
+                                            .font(mono(SMALL))
+                                            .color(colors().subtle),
                                     );
                                     // Several instances of one program share a group; name the PID only
                                     // when there is one.
@@ -2083,7 +2489,7 @@ mod app {
                                     };
                                     if let Some(label) = label {
                                         ui.label(
-                                            RichText::new(label).font(mono(CAPTION)).color(SUBTLE),
+                                            RichText::new(label).font(mono(CAPTION)).color(colors().subtle),
                                         );
                                     }
                                 });
@@ -2101,13 +2507,13 @@ mod app {
                                             .unwrap_or_else(|| conn.remote.ip().to_string());
                                         dot(
                                             ui,
-                                            if conn.first_seen { AMBER } else { GREEN },
+                                            if conn.first_seen { colors().amber } else { colors().green },
                                             3.5,
                                         );
                                         ui.add_sized(
                                             [host_width, 20.0],
                                             egui::Label::new(
-                                                RichText::new(host).size(BODY).color(TEXT),
+                                                RichText::new(host).size(BODY).color(colors().text),
                                             )
                                             .truncate(),
                                         );
@@ -2116,7 +2522,7 @@ mod app {
                                             egui::Label::new(
                                                 RichText::new(conn.remote.to_string())
                                                     .font(mono(SMALL))
-                                                    .color(MUTED),
+                                                    .color(colors().muted),
                                             )
                                             .truncate(),
                                         );
@@ -2126,10 +2532,10 @@ mod app {
                                                 Direction::Inbound => "TCP in",
                                             })
                                             .size(SMALL)
-                                            .color(SUBTLE),
+                                            .color(colors().subtle),
                                         );
                                         if conn.first_seen {
-                                            badge(ui, "New", AMBER);
+                                            badge(ui, "New", colors().amber);
                                         }
                                     })
                                     .response
@@ -2198,8 +2604,8 @@ mod app {
                     }
                     ui.label(
                         RichText::new(format!("{} of {}", filtered.len(), rows.len()))
-                            .size(SMALL)
-                            .color(SUBTLE),
+                            .font(mono(SMALL))
+                            .color(colors().subtle),
                     );
                 });
             });
@@ -2212,7 +2618,7 @@ mod app {
                     ui.label(
                         RichText::new("Metadata only. Request bodies, header values, query strings and secrets are never stored or exported.")
                             .size(CAPTION)
-                            .color(SUBTLE),
+                            .color(colors().subtle),
                     );
                 });
 
@@ -2247,8 +2653,22 @@ mod app {
                                 "Try another search or decision filter.",
                             )
                         };
-                        ui.label(RichText::new(title).font(semibold(SUBHEAD)).color(TEXT));
-                        ui.label(RichText::new(message).size(SMALL).color(MUTED));
+                        check_icon(
+                            ui,
+                            if rows.is_empty() {
+                                colors().green
+                            } else {
+                                colors().blue
+                            },
+                            40.0,
+                        );
+                        ui.add_space(SPACE_S);
+                        ui.label(
+                            RichText::new(title)
+                                .font(semibold(SUBHEAD))
+                                .color(colors().text),
+                        );
+                        ui.label(RichText::new(message).size(SMALL).color(colors().muted));
                     });
                     return;
                 }
@@ -2302,7 +2722,7 @@ mod app {
                 egui::Label::new(
                     RichText::new(event.process_name())
                         .font(semibold(TITLE))
-                        .color(TEXT),
+                        .color(colors().text),
                 )
                 .truncate(),
             );
@@ -2310,7 +2730,7 @@ mod app {
                 egui::Label::new(
                     RichText::new(format!("{}:{}", event.host, event.port))
                         .font(mono(BODY))
-                        .color(BLUE),
+                        .color(colors().blue),
                 )
                 .wrap(),
             );
@@ -2321,7 +2741,11 @@ mod app {
                 badge(
                     ui,
                     &format!("HTTP {}", event.status),
-                    if event.status >= 400 { RED } else { SUBTLE },
+                    if event.status >= 400 {
+                        colors().red
+                    } else {
+                        colors().subtle
+                    },
                 );
             });
             ui.add_space(SPACE_M);
@@ -2351,6 +2775,40 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if self.shown && self.last_theme_check.elapsed() >= Duration::from_secs(3) {
+                self.last_theme_check = Instant::now();
+                let palette = system_palette();
+                if palette != colors() {
+                    set_colors(palette);
+                    let _ = setup_style(ctx);
+                }
+            }
+            if self.shown && self.last_geometry_save.elapsed() >= Duration::from_secs(2) {
+                self.last_geometry_save = Instant::now();
+                let (outer_rect, inner_rect) = ctx.input(|input| {
+                    let viewport = input.viewport();
+                    (viewport.outer_rect, viewport.inner_rect)
+                });
+                if let (Some(path), Some(outer), Some(inner)) =
+                    (self.geometry_path.as_deref(), outer_rect, inner_rect)
+                {
+                    let geometry = clamp_geometry(WindowGeometry {
+                        x: outer.left(),
+                        y: outer.top(),
+                        width: inner.width(),
+                        height: inner.height(),
+                    });
+                    let changed = self.saved_geometry.is_none_or(|previous| {
+                        (previous.x - geometry.x).abs() > 2.0
+                            || (previous.y - geometry.y).abs() > 2.0
+                            || (previous.width - geometry.width).abs() > 2.0
+                            || (previous.height - geometry.height).abs() > 2.0
+                    });
+                    if changed && save_geometry(path, geometry).is_ok() {
+                        self.saved_geometry = Some(geometry);
+                    }
+                }
+            }
             while let Ok(history) = self.history_rx.try_recv() {
                 self.history = history;
             }
@@ -2447,7 +2905,7 @@ mod app {
 
             egui::Panel::top("header")
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(BG).inner_margin(Margin {
+                .frame(egui::Frame::new().fill(colors().bg).inner_margin(Margin {
                     left: 20,
                     right: 20,
                     top: 16,
@@ -2457,12 +2915,12 @@ mod app {
             egui::Panel::bottom("status_bar")
                 .frame(
                     egui::Frame::new()
-                        .fill(SURFACE)
+                        .fill(colors().surface)
                         .inner_margin(pad(SPACE_XL, SPACE_S)),
                 )
                 .show(ui, |ui| self.status_bar(ui, state));
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(BG).inner_margin(Margin {
+                .frame(egui::Frame::new().fill(colors().bg).inner_margin(Margin {
                     left: 20,
                     right: 20,
                     top: 0,
