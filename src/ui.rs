@@ -1297,7 +1297,11 @@ mod app {
                             } else {
                                 "Firewall not connected"
                             },
-                            if self.firewall_connected { GREEN } else { SUBTLE },
+                            if self.firewall_connected {
+                                GREEN
+                            } else {
+                                SUBTLE
+                            },
                         );
                         status_pill(
                             ui,
@@ -1306,7 +1310,11 @@ mod app {
                             } else {
                                 "Connection monitor off"
                             },
-                            if self.network.is_some() { GREEN } else { SUBTLE },
+                            if self.network.is_some() {
+                                GREEN
+                            } else {
+                                SUBTLE
+                            },
                         );
                     });
                 });
@@ -1319,7 +1327,11 @@ mod app {
                         &mut columns[3],
                         "Live connections",
                         live_connections.unwrap_or(0),
-                        if live_connections.is_some() { GREEN } else { SUBTLE },
+                        if live_connections.is_some() {
+                            GREEN
+                        } else {
+                            SUBTLE
+                        },
                         if live_connections.is_some() {
                             "currently observed"
                         } else {
