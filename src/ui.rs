@@ -294,10 +294,10 @@ mod app {
 
     fn system_palette() -> Palette {
         let light = registry_dword(
-            r"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
             "AppsUseLightTheme",
         ) == Some(1);
-        let accent = registry_dword(r"HKCU\\Software\\Microsoft\\Windows\\DWM", "AccentColor")
+        let accent = registry_dword(r"HKCU\Software\Microsoft\Windows\DWM", "AccentColor")
             .map(|argb| {
                 Color32::from_rgb(
                     ((argb >> 16) & 0xff) as u8,
@@ -1194,13 +1194,14 @@ mod app {
             .families
             .insert(FontFamily::Name(SEMIBOLD.into()), heading);
         fonts.families.insert(FontFamily::Monospace, monospace);
+        let icons_available = symbols.is_some();
         if let Some(symbols) = symbols {
             fonts
                 .families
                 .insert(FontFamily::Name(SYMBOLS.into()), vec![symbols]);
         }
         ctx.set_fonts(fonts);
-        symbols.is_some()
+        icons_available
     }
 
     fn setup_style(ctx: &egui::Context) -> bool {
@@ -1228,7 +1229,7 @@ mod app {
             visuals.window_stroke = Stroke::new(1.0, colors().border);
             visuals.window_corner_radius = CornerRadius::same(R_CARD);
             visuals.menu_corner_radius = CornerRadius::same(R_CONTROL);
-            visuals.extreme_bg_color = Color32::from_rgb(0x0e, 0x12, 0x1a);
+            visuals.extreme_bg_color = colors().extreme;
             visuals.faint_bg_color = colors().surface;
             visuals.override_text_color = None;
             visuals.selection.bg_fill = tint(colors().blue);
