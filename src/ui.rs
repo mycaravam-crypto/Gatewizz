@@ -518,7 +518,9 @@ mod app {
         })?;
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec(&geometry)?)?;
+        let bytes = serde_json::to_vec(&geometry)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        std::fs::write(&temporary, bytes)?;
         std::fs::rename(temporary, path)
     }
 
@@ -2581,7 +2583,7 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            if self.last_theme_check.elapsed() >= Duration::from_secs(3) {
+            if self.shown && self.last_theme_check.elapsed() >= Duration::from_secs(3) {
                 self.last_theme_check = Instant::now();
                 let palette = system_palette();
                 if palette != colors() {
