@@ -2785,15 +2785,18 @@ mod app {
             }
             if self.shown && self.last_geometry_save.elapsed() >= Duration::from_secs(2) {
                 self.last_geometry_save = Instant::now();
-                if let (Some(path), Some(rect)) = (
-                    self.geometry_path.as_deref(),
-                    ctx.input(|input| input.viewport().outer_rect),
-                ) {
+                let (outer_rect, inner_rect) = ctx.input(|input| {
+                    let viewport = input.viewport();
+                    (viewport.outer_rect, viewport.inner_rect)
+                });
+                if let (Some(path), Some(outer), Some(inner)) =
+                    (self.geometry_path.as_deref(), outer_rect, inner_rect)
+                {
                     let geometry = clamp_geometry(WindowGeometry {
-                        x: rect.left(),
-                        y: rect.top(),
-                        width: rect.width(),
-                        height: rect.height(),
+                        x: outer.left(),
+                        y: outer.top(),
+                        width: inner.width(),
+                        height: inner.height(),
                     });
                     let changed = self.saved_geometry.is_none_or(|previous| {
                         (previous.x - geometry.x).abs() > 2.0
