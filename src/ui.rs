@@ -229,14 +229,14 @@ mod app {
             let accent = themed_accent(accent, false);
             Self {
                 light: false,
-                bg: Color32::from_rgb(0x0b, 0x0e, 0x14),
-                surface: Color32::from_rgb(0x12, 0x16, 0x1f),
-                raised: Color32::from_rgb(0x1a, 0x20, 0x2c),
-                border: Color32::from_rgb(0x24, 0x2b, 0x39),
-                border_strong: Color32::from_rgb(0x35, 0x3f, 0x52),
-                text: Color32::from_rgb(0xe8, 0xec, 0xf3),
-                muted: Color32::from_rgb(0x9a, 0xa4, 0xb6),
-                subtle: Color32::from_rgb(0x7d, 0x87, 0x9a),
+                bg: Color32::from_rgb(0x10, 0x13, 0x19),
+                surface: Color32::from_rgb(0x18, 0x1d, 0x26),
+                raised: Color32::from_rgb(0x22, 0x29, 0x35),
+                border: Color32::from_rgb(0x2d, 0x36, 0x45),
+                border_strong: Color32::from_rgb(0x43, 0x4e, 0x60),
+                text: Color32::from_rgb(0xf0, 0xf3, 0xf8),
+                muted: Color32::from_rgb(0xb0, 0xb9, 0xc8),
+                subtle: Color32::from_rgb(0x8f, 0x9a, 0xac),
                 blue: accent,
                 green: Color32::from_rgb(0x41, 0xc4, 0x83),
                 amber: Color32::from_rgb(0xf0, 0xab, 0x3e),
@@ -250,14 +250,14 @@ mod app {
             let accent = themed_accent(accent, true);
             Self {
                 light: true,
-                bg: Color32::from_rgb(0xf3, 0xf5, 0xf8),
+                bg: Color32::from_rgb(0xf4, 0xf6, 0xf9),
                 surface: Color32::from_rgb(0xff, 0xff, 0xff),
-                raised: Color32::from_rgb(0xe9, 0xee, 0xf5),
-                border: Color32::from_rgb(0xd7, 0xde, 0xe8),
-                border_strong: Color32::from_rgb(0xb8, 0xc3, 0xd2),
-                text: Color32::from_rgb(0x1b, 0x24, 0x32),
-                muted: Color32::from_rgb(0x4b, 0x57, 0x68),
-                subtle: Color32::from_rgb(0x5c, 0x68, 0x79),
+                raised: Color32::from_rgb(0xea, 0xef, 0xf6),
+                border: Color32::from_rgb(0xd5, 0xdd, 0xe8),
+                border_strong: Color32::from_rgb(0xb7, 0xc3, 0xd2),
+                text: Color32::from_rgb(0x17, 0x20, 0x2d),
+                muted: Color32::from_rgb(0x45, 0x52, 0x64),
+                subtle: Color32::from_rgb(0x5b, 0x68, 0x7a),
                 blue: accent,
                 green: Color32::from_rgb(0x17, 0x74, 0x4a),
                 amber: Color32::from_rgb(0x8a, 0x53, 0x00),
@@ -371,27 +371,27 @@ mod app {
     const SEMIBOLD: &str = "semibold";
 
     // Type scale: every text size in the workspace is one of these.
-    const CAPTION: f32 = 11.5;
-    const SMALL: f32 = 12.5;
-    const BODY: f32 = 13.5;
-    const SUBHEAD: f32 = 15.0;
-    const TITLE: f32 = 18.0;
-    const DISPLAY: f32 = 22.0;
-    const HERO: f32 = 28.0;
+    const CAPTION: f32 = 12.0;
+    const SMALL: f32 = 13.0;
+    const BODY: f32 = 14.5;
+    const SUBHEAD: f32 = 16.0;
+    const TITLE: f32 = 20.0;
+    const DISPLAY: f32 = 24.0;
+    const HERO: f32 = 30.0;
     // Corner radii: controls, cards and banners, chips and badges.
-    const R_CONTROL: u8 = 6;
-    const R_CARD: u8 = 10;
+    const R_CONTROL: u8 = 7;
+    const R_CARD: u8 = 9;
     const R_PILL: u8 = 255;
     // Spacing grid (multiples of 4) and control heights.
     const SPACE_XS: f32 = 4.0;
     const SPACE_S: f32 = 8.0;
     const SPACE_M: f32 = 12.0;
-    const SPACE_L: f32 = 16.0;
+    const SPACE_L: f32 = 18.0;
     const SPACE_XL: f32 = 24.0;
     const SPACE_XXL: f32 = 40.0;
-    const CONTROL_H_LG: f32 = 40.0;
-    const CONTROL_H: f32 = 32.0;
-    const CONTROL_H_SM: f32 = 28.0;
+    const CONTROL_H_LG: f32 = 44.0;
+    const CONTROL_H: f32 = 36.0;
+    const CONTROL_H_SM: f32 = 32.0;
     /// How long "Copied" confirmations stay visible.
     const FEEDBACK: Duration = Duration::from_secs(2);
     /// Blocked connections the queue keeps waiting at most; the oldest goes first.
@@ -918,7 +918,7 @@ mod app {
         let galley = ui
             .painter()
             .layout_no_wrap(text.to_owned(), semibold(SMALL), color);
-        let size = egui::vec2(galley.size().x + 40.0, 30.0);
+        let size = egui::vec2(galley.size().x + 44.0, 32.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::same(R_PILL), tint(color));
@@ -1078,7 +1078,7 @@ mod app {
 
     fn history_header(ui: &mut egui::Ui) {
         let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::hover());
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::hover());
         let columns = history_columns(rect);
         for (column, title) in
             columns
@@ -1103,7 +1103,7 @@ mod app {
     /// One clickable, full-width activity row.
     fn history_row(ui: &mut egui::Ui, event: &HistoryEvent, active: bool) -> egui::Response {
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), Sense::click());
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), Sense::click());
         let response = response.on_hover_cursor(CursorIcon::PointingHand);
         let painter = ui.painter();
         if active {
@@ -1321,9 +1321,9 @@ mod app {
                 (TextStyle::Monospace, mono(SMALL)),
             ]
             .into();
-            style.animation_time = 0.12;
-            style.spacing.item_spacing = egui::vec2(SPACE_S, SPACE_S);
-            style.spacing.button_padding = egui::vec2(SPACE_L, SPACE_XS);
+            style.animation_time = 0.14;
+            style.spacing.item_spacing = egui::vec2(10.0, SPACE_S);
+            style.spacing.button_padding = egui::vec2(14.0, 7.0);
             style.spacing.interact_size.y = CONTROL_H_SM;
             style.interaction.selectable_labels = false;
             let visuals = &mut style.visuals;
@@ -1492,16 +1492,20 @@ mod app {
                                     },
                                 ))
                                 .corner_radius(R_CONTROL)
-                                .min_size(egui::vec2(112.0, CONTROL_H_SM))
-                                .fill(Color32::from_rgba_unmultiplied(
-                                    colors().raised.r(),
-                                    colors().raised.g(),
-                                    colors().raised.b(),
-                                    (progress * 255.0) as u8,
-                                ))
+                                .min_size(egui::vec2(124.0, CONTROL_H_SM))
+                                .fill(if selected {
+                                    Color32::from_rgba_unmultiplied(
+                                        colors().blue.r(),
+                                        colors().blue.g(),
+                                        colors().blue.b(),
+                                        (progress * 42.0) as u8,
+                                    )
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
                                 .stroke(Stroke::new(
                                     1.0,
-                                    colors().border_strong.gamma_multiply(progress),
+                                    colors().blue.gamma_multiply(progress * 0.65),
                                 ));
                             if badge > 0 {
                                 button = button.right_text(
@@ -1740,12 +1744,15 @@ mod app {
 
             egui::Panel::left("approval_queue")
                 .resizable(false)
-                .exact_size(290.0)
+                .exact_size(304.0)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().inner_margin(Margin {
-                    right: 16,
-                    ..Margin::ZERO
-                }))
+                .frame(
+                    egui::Frame::new()
+                        .fill(colors().raised)
+                        .stroke(Stroke::new(1.0, colors().border))
+                        .corner_radius(R_CARD)
+                        .inner_margin(pad(SPACE_M, SPACE_M)),
+                )
                 .show(ui, |ui| self.queue(ui, pending));
 
             let selected = self
@@ -2356,8 +2363,8 @@ mod app {
                     return;
                 }
                 history_header(ui);
-                ui.spacing_mut().item_spacing.y = 2.0;
-                let rows = ((ui.available_height() - 8.0) / 38.0).max(1.0) as usize;
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let rows = ((ui.available_height() - 8.0) / 45.0).max(1.0) as usize;
                 let mut open = None;
                 for (index, event) in self.history.iter().enumerate().take(rows) {
                     if history_row(ui, event, false).clicked() {
@@ -2684,7 +2691,7 @@ mod app {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show_rows(ui, 36.0, filtered.len(), |ui, range| {
+                    .show_rows(ui, 42.0, filtered.len(), |ui, range| {
                         for event in &filtered[range] {
                             let index = rows
                                 .iter()
