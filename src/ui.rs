@@ -1744,12 +1744,15 @@ mod app {
 
             egui::Panel::left("approval_queue")
                 .resizable(false)
-                .exact_size(290.0)
+                .exact_size(304.0)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().inner_margin(Margin {
-                    right: 16,
-                    ..Margin::ZERO
-                }))
+                .frame(
+                    egui::Frame::new()
+                        .fill(colors().raised)
+                        .stroke(Stroke::new(1.0, colors().border))
+                        .corner_radius(R_CARD)
+                        .inner_margin(pad(SPACE_M, SPACE_M)),
+                )
                 .show(ui, |ui| self.queue(ui, pending));
 
             let selected = self
@@ -2688,7 +2691,7 @@ mod app {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show_rows(ui, 36.0, filtered.len(), |ui, range| {
+                    .show_rows(ui, 42.0, filtered.len(), |ui, range| {
                         for event in &filtered[range] {
                             let index = rows
                                 .iter()
