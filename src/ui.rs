@@ -241,7 +241,7 @@ mod app {
                 green: Color32::from_rgb(0x41, 0xc4, 0x83),
                 amber: Color32::from_rgb(0xf0, 0xab, 0x3e),
                 red: Color32::from_rgb(0xef, 0x63, 0x63),
-                green_fill: Color32::from_rgb(0x1d, 0x8a, 0x58),
+                green_fill: Color32::from_rgb(0x17, 0x74, 0x4a),
                 extreme: Color32::from_rgb(0x0e, 0x12, 0x1a),
             }
         }
@@ -288,9 +288,9 @@ mod app {
 
     fn themed_accent(mut accent: Color32, light: bool) -> Color32 {
         let background = if light {
-            Color32::from_rgb(0xf3, 0xf5, 0xf8)
+            Color32::from_rgb(0xe9, 0xee, 0xf5)
         } else {
-            Color32::from_rgb(0x0b, 0x0e, 0x14)
+            Color32::from_rgb(0x1a, 0x20, 0x2c)
         };
         for _ in 0..24 {
             if contrast_ratio(accent, background) >= 4.5 {
