@@ -277,9 +277,7 @@ mod app {
                 ((value + 0.055) / 1.055).powf(2.4)
             }
         };
-        0.2126 * channel(color.r())
-            + 0.7152 * channel(color.g())
-            + 0.0722 * channel(color.b())
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
     }
 
     fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
@@ -305,11 +303,7 @@ mod app {
                     (f32::from(value) + (255.0 - f32::from(value)) * 0.14) as u8
                 }
             };
-            accent = Color32::from_rgb(
-                adjust(accent.r()),
-                adjust(accent.g()),
-                adjust(accent.b()),
-            );
+            accent = Color32::from_rgb(adjust(accent.r()), adjust(accent.g()), adjust(accent.b()));
         }
         if light {
             Color32::from_rgb(0x1d, 0x4e, 0x89)
