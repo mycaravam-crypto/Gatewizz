@@ -524,6 +524,8 @@ mod app {
         last_theme_check: Instant,
         geometry_path: Option<PathBuf>,
         last_geometry_save: Instant,
+        /// Set once the first frame has asked to hide the window again (see `logic`).
+        first_frame_done: bool,
         saved_geometry: Option<WindowGeometry>,
     }
 
@@ -802,6 +804,7 @@ mod app {
                 last_theme_check: Instant::now(),
                 geometry_path,
                 last_geometry_save: Instant::now(),
+                first_frame_done: false,
                 saved_geometry,
             })
         }
@@ -2790,6 +2793,14 @@ mod app {
 
     impl eframe::App for App {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // eframe shows the window after painting its first frame, whatever the viewport builder said
+            // (`EpiIntegration::post_rendering`). Viewport commands are applied after that in the same frame, so
+            // hiding here keeps Gatewizz in the tray at start, unless a waiting request has already opened it.
+            // ponytail: the first frame can still blink for ~30 ms; cloak the HWND with DwmSetWindowAttribute(DWMWA_CLOAK)
+            // in the creator and uncloak in `show` if that ever matters.
+            if !std::mem::replace(&mut self.first_frame_done, true) && !self.shown {
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
             if self.shown && self.last_theme_check.elapsed() >= Duration::from_secs(3) {
                 self.last_theme_check = Instant::now();
                 let palette = system_palette();
