@@ -226,6 +226,7 @@ mod app {
 
     impl Palette {
         fn dark(accent: Color32) -> Self {
+            let accent = themed_accent(accent, false);
             Self {
                 light: false,
                 bg: Color32::from_rgb(0x0b, 0x0e, 0x14),
@@ -246,7 +247,7 @@ mod app {
         }
 
         fn light(accent: Color32) -> Self {
-            let accent = accent.gamma_multiply(0.78);
+            let accent = themed_accent(accent, true);
             Self {
                 light: true,
                 bg: Color32::from_rgb(0xf3, 0xf5, 0xf8),
@@ -264,6 +265,50 @@ mod app {
                 green_fill: Color32::from_rgb(0x17, 0x74, 0x4a),
                 extreme: Color32::from_rgb(0xea, 0xed, 0xf2),
             }
+        }
+    }
+
+    fn relative_luminance(color: Color32) -> f32 {
+        let channel = |value: u8| {
+            let value = f32::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    fn themed_accent(mut accent: Color32, light: bool) -> Color32 {
+        let background = if light {
+            Color32::from_rgb(0xf3, 0xf5, 0xf8)
+        } else {
+            Color32::from_rgb(0x0b, 0x0e, 0x14)
+        };
+        for _ in 0..24 {
+            if contrast_ratio(accent, background) >= 4.5 {
+                return accent;
+            }
+            let adjust = |value: u8| {
+                if light {
+                    (f32::from(value) * 0.86) as u8
+                } else {
+                    (f32::from(value) + (255.0 - f32::from(value)) * 0.14) as u8
+                }
+            };
+            accent = Color32::from_rgb(adjust(accent.r()), adjust(accent.g()), adjust(accent.b()));
+        }
+        if light {
+            Color32::from_rgb(0x1d, 0x4e, 0x89)
+        } else {
+            Color32::from_rgb(0x9b, 0xb9, 0xff)
         }
     }
 
@@ -308,10 +353,11 @@ mod app {
         ) == Some(1);
         let accent = registry_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor")
             .map(|argb| {
+                // DWM stores AccentColor as ABGR, not ARGB.
                 Color32::from_rgb(
-                    ((argb >> 16) & 0xff) as u8,
-                    ((argb >> 8) & 0xff) as u8,
                     (argb & 0xff) as u8,
+                    ((argb >> 8) & 0xff) as u8,
+                    ((argb >> 16) & 0xff) as u8,
                 )
             })
             .unwrap_or(ACCENT_FALLBACK);
