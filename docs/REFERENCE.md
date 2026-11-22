@@ -72,7 +72,9 @@ Each `[[rules]]` entry has an optional `match` object. All supplied match condit
 
 Actions are `allow`, `block` or `approve`. Precedence is **block, approve, allow**. If no rule matches, `[general].default_action` applies (default: `allow`).
 
-A blocked request receives HTTP 403 with the deciding rule, severity and event time. No request is sent upstream. An approval request waits in the Windows approval window; it is blocked if denied, unanswered, paused, queued without a window, or rejected because the queue is full.
+A blocked request receives HTTP 403 with the deciding rule, severity and event time. No request is sent upstream. An approval request waits in the Windows approval window; it is blocked if denied, unanswered, paused, queued without a window, or rejected because the queue is full. Its card shows the request line, headers and the first 4 KiB of the body, so you can see what you are allowing. Credential headers (`Authorization`, `Cookie`, API-key headers) and detected secrets are shown as `[redacted]`, and a body with a secret that cannot be masked is hidden. The preview exists only while the request waits; it is never logged or written to disk. A blind HTTPS tunnel shows no content: enable TLS interception to see it.
+
+A client that is not a Windows process, such as a program in WSL with mirrored networking, has no entry in the Windows TCP table, so Gatewizz cannot name it; it is shown as "WSL / VM" and `process` rules do not match it.
 
 Example: block detected secrets from every host except the approved internal model gateway:
 

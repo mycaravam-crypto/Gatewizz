@@ -57,6 +57,15 @@ fn icon_rgba(rgb: [u8; 3], size: u32) -> Vec<u8> {
 }
 
 /// The program's file name, for the window: `smartwizz.exe` rather than its full path.
+/// A client Gatewizz cannot name. WSL and VMs get their own label: that is expected, not a failure.
+fn unknown_label(why: &str) -> String {
+    if why == crate::process::OUTSIDE_WINDOWS {
+        "WSL / VM".into()
+    } else {
+        format!("unknown ({why})")
+    }
+}
+
 fn program(process: &Process) -> String {
     match process {
         Process::Known { image, .. } => image
@@ -64,7 +73,7 @@ fn program(process: &Process) -> String {
             .next()
             .unwrap_or(image)
             .to_string(),
-        Process::Unknown(why) => format!("unknown ({why})"),
+        Process::Unknown(why) => unknown_label(why),
     }
 }
 
@@ -181,7 +190,7 @@ mod app {
 
     use super::{
         TrayState, countdown, destination, duration_label, icon_rgba, network_groups, process_ids,
-        program, prompt_scope,
+        program, prompt_scope, unknown_label,
     };
     use crate::approve::{Approvals, Held, Verdict, Window};
     use crate::connections::{Direction, Live};
@@ -192,6 +201,7 @@ mod app {
     use crate::rules::Action;
 
     // Design tokens: one dark theme. Surfaces step up in lightness; status colours are used for meaning only.
+    // Text tiers TEXT > MUTED > SUBTLE all meet WCAG AA (4.5:1) on every surface.
     const BG: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x14);
     const SURFACE: Color32 = Color32::from_rgb(0x12, 0x16, 0x1f);
     const RAISED: Color32 = Color32::from_rgb(0x1a, 0x20, 0x2c);
@@ -199,7 +209,7 @@ mod app {
     const BORDER_STRONG: Color32 = Color32::from_rgb(0x35, 0x3f, 0x52);
     const TEXT: Color32 = Color32::from_rgb(0xe8, 0xec, 0xf3);
     const MUTED: Color32 = Color32::from_rgb(0x9a, 0xa4, 0xb6);
-    const SUBTLE: Color32 = Color32::from_rgb(0x6b, 0x75, 0x88);
+    const SUBTLE: Color32 = Color32::from_rgb(0x7d, 0x87, 0x9a);
     const BLUE: Color32 = Color32::from_rgb(0x6e, 0x9d, 0xff);
     const GREEN: Color32 = Color32::from_rgb(0x41, 0xc4, 0x83);
     const AMBER: Color32 = Color32::from_rgb(0xf0, 0xab, 0x3e);
@@ -207,6 +217,29 @@ mod app {
     const GREEN_FILL: Color32 = Color32::from_rgb(0x1d, 0x8a, 0x58);
     /// Font family name for headings and labels; falls back to the regular face.
     const SEMIBOLD: &str = "semibold";
+
+    // Type scale: every text size in the workspace is one of these.
+    const CAPTION: f32 = 11.5;
+    const SMALL: f32 = 12.5;
+    const BODY: f32 = 13.5;
+    const SUBHEAD: f32 = 15.0;
+    const TITLE: f32 = 18.0;
+    const DISPLAY: f32 = 22.0;
+    const HERO: f32 = 28.0;
+    // Corner radii: controls, cards and banners, chips and badges.
+    const R_CONTROL: u8 = 6;
+    const R_CARD: u8 = 10;
+    const R_PILL: u8 = 255;
+    // Spacing grid (multiples of 4) and control heights.
+    const SPACE_XS: f32 = 4.0;
+    const SPACE_S: f32 = 8.0;
+    const SPACE_M: f32 = 12.0;
+    const SPACE_L: f32 = 16.0;
+    const SPACE_XL: f32 = 24.0;
+    const SPACE_XXL: f32 = 40.0;
+    const CONTROL_H_LG: f32 = 40.0;
+    const CONTROL_H: f32 = 32.0;
+    const CONTROL_H_SM: f32 = 28.0;
     /// How long "Copied" confirmations stay visible.
     const FEEDBACK: Duration = Duration::from_secs(2);
     /// Blocked connections the queue keeps waiting at most; the oldest goes first.
@@ -380,15 +413,18 @@ mod app {
                     .next()
                     .unwrap_or(image)
                     .to_string(),
-                HistoryProcess::Unknown(reason) => format!("unknown ({reason})"),
+                HistoryProcess::Unknown(reason) => unknown_label(reason),
                 HistoryProcess::Unavailable => "unknown".into(),
             }
         }
 
+        /// What happened to the request, not which rule matched: an approval that was denied or timed out, and a
+        /// request refused before any rule (bad CONNECT port, oversized body), were blocked too.
         fn decision(&self) -> &'static str {
             match self.action {
-                Some(Action::Allow) => "allow",
                 Some(Action::Block) => "block",
+                _ if self.coverage == "blocked" => "block",
+                Some(Action::Allow) => "allow",
                 Some(Action::Approve) => "approve",
                 None => "-",
             }
@@ -590,6 +626,11 @@ mod app {
         FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
     }
 
+    /// Frame margins from the spacing grid.
+    fn pad(x: f32, y: f32) -> Margin {
+        Margin::symmetric(x as i8, y as i8)
+    }
+
     fn mono(size: f32) -> FontId {
         FontId::new(size, FontFamily::Monospace)
     }
@@ -603,13 +644,18 @@ mod app {
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(10)
-            .inner_margin(Margin::same(16))
+            .corner_radius(R_CARD)
+            .inner_margin(pad(SPACE_L, SPACE_L))
     }
 
     /// Small uppercase heading above a group of content.
     fn caption(ui: &mut egui::Ui, text: &str) {
-        ui.label(RichText::new(text).font(semibold(11.0)).color(SUBTLE));
+        ui.label(
+            RichText::new(text)
+                .font(semibold(CAPTION))
+                .extra_letter_spacing(0.6)
+                .color(MUTED),
+        );
     }
 
     /// Glyph-free status dot: painted, so it renders with any font.
@@ -621,14 +667,18 @@ mod app {
 
     /// A rounded badge painted into `rect`'s left edge, vertically centred.
     fn paint_badge(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) -> Rect {
-        let galley = painter.layout_no_wrap(text.to_owned(), semibold(11.5), color);
-        let size = galley.size() + egui::vec2(16.0, 6.0);
+        let galley = painter.layout_no_wrap(text.to_owned(), semibold(CAPTION), color);
+        let size = galley.size() + egui::vec2(SPACE_L, SPACE_XS);
         let badge = Rect::from_min_size(
             egui::pos2(rect.left(), rect.center().y - size.y / 2.0),
             size,
         );
-        painter.rect_filled(badge, CornerRadius::same(255), tint(color));
-        painter.galley(badge.min + egui::vec2(8.0, 3.0), galley, color);
+        painter.rect_filled(badge, CornerRadius::same(R_PILL), tint(color));
+        painter.galley(
+            badge.min + egui::vec2(SPACE_S, SPACE_XS / 2.0),
+            galley,
+            color,
+        );
         badge
     }
 
@@ -636,11 +686,11 @@ mod app {
     fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         let galley = ui
             .painter()
-            .layout_no_wrap(text.to_owned(), semibold(12.5), color);
+            .layout_no_wrap(text.to_owned(), semibold(SMALL), color);
         let size = egui::vec2(galley.size().x + 40.0, 30.0);
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(255), tint(color));
+        painter.rect_filled(rect, CornerRadius::same(R_PILL), tint(color));
         painter.circle_filled(egui::pos2(rect.left() + 16.0, rect.center().y), 4.0, color);
         let pos = egui::pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0);
         painter.galley(pos, galley, color);
@@ -649,7 +699,7 @@ mod app {
     fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
         let width = ui
             .painter()
-            .layout_no_wrap(text.to_owned(), semibold(11.5), color)
+            .layout_no_wrap(text.to_owned(), semibold(CAPTION), color)
             .size()
             .x;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width + 16.0, 22.0), Sense::hover());
@@ -683,17 +733,17 @@ mod app {
     }
 
     fn button(text: &str, fill: Color32, color: Color32) -> egui::Button<'static> {
-        egui::Button::new(RichText::new(text).font(semibold(13.5)).color(color))
+        egui::Button::new(RichText::new(text).font(semibold(BODY)).color(color))
             .fill(fill)
-            .corner_radius(8)
-            .min_size(egui::vec2(0.0, 34.0))
+            .corner_radius(R_CONTROL)
+            .min_size(egui::vec2(0.0, CONTROL_H))
     }
 
     fn quiet_button(text: &str) -> egui::Button<'static> {
-        egui::Button::new(RichText::new(text).size(12.5).color(MUTED))
+        egui::Button::new(RichText::new(text).size(SMALL).color(MUTED))
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(6)
+            .corner_radius(R_CONTROL)
     }
 
     /// A toggle chip: filters and duration presets.
@@ -704,31 +754,29 @@ mod app {
             (Color32::TRANSPARENT, Stroke::new(1.0, BORDER), MUTED)
         };
         ui.add(
-            egui::Button::new(RichText::new(text).size(12.5).color(color))
+            egui::Button::new(RichText::new(text).size(SMALL).color(color))
                 .fill(fill)
                 .stroke(stroke)
-                .corner_radius(255)
-                .min_size(egui::vec2(0.0, 28.0)),
+                .corner_radius(R_PILL)
+                .min_size(egui::vec2(0.0, CONTROL_H_SM)),
         )
         .on_hover_cursor(CursorIcon::PointingHand)
     }
 
     fn stat_card(ui: &mut egui::Ui, label: &str, value: usize, color: Color32, hint: &str) {
-        card()
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    dot(ui, color, 4.0);
-                    ui.label(RichText::new(label).font(semibold(12.5)).color(MUTED));
-                });
-                ui.label(
-                    RichText::new(value.to_string())
-                        .font(semibold(28.0))
-                        .color(TEXT),
-                );
-                ui.add(egui::Label::new(RichText::new(hint).size(11.5).color(SUBTLE)).truncate());
+        card().inner_margin(pad(SPACE_L, SPACE_L)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                dot(ui, color, 4.0);
+                ui.label(RichText::new(label).font(semibold(SMALL)).color(MUTED));
             });
+            ui.label(
+                RichText::new(value.to_string())
+                    .font(semibold(HERO))
+                    .color(TEXT),
+            );
+            ui.add(egui::Label::new(RichText::new(hint).size(CAPTION).color(SUBTLE)).truncate());
+        });
     }
 
     /// Label/value pairs in two aligned columns.
@@ -736,22 +784,23 @@ mod app {
         ui.spacing_mut().interact_size.y = 20.0;
         egui::Grid::new(id)
             .num_columns(2)
-            .spacing([20.0, 8.0])
+            .spacing([SPACE_XL, SPACE_S])
             .show(ui, |ui| {
                 for (key, value) in rows {
-                    ui.label(RichText::new(*key).size(12.5).color(SUBTLE));
-                    ui.add(egui::Label::new(RichText::new(*value).size(13.0).color(TEXT)).wrap());
+                    ui.label(RichText::new(*key).size(SMALL).color(SUBTLE));
+                    ui.add(egui::Label::new(RichText::new(*value).size(BODY).color(TEXT)).wrap());
                     ui.end_row();
                 }
             });
     }
 
-    fn decision_style(action: Option<Action>) -> (&'static str, Color32) {
-        match action {
-            Some(Action::Allow) => ("Allowed", GREEN),
-            Some(Action::Block) => ("Blocked", RED),
-            Some(Action::Approve) => ("Approval", AMBER),
-            None => ("Unknown", SUBTLE),
+    fn decision_style(event: &HistoryEvent) -> (&'static str, Color32) {
+        match event.decision() {
+            "allow" => ("Allowed", GREEN),
+            "block" if event.action == Some(Action::Approve) => ("Denied", RED),
+            "block" => ("Blocked", RED),
+            "approve" => ("Approved", AMBER),
+            _ => ("Unknown", SUBTLE),
         }
     }
 
@@ -761,7 +810,7 @@ mod app {
 
     /// Column rectangles of an activity row: time, program, destination, decision, status.
     fn history_columns(rect: Rect) -> [Rect; 5] {
-        let inner = rect.shrink2(egui::vec2(12.0, 0.0));
+        let inner = rect.shrink2(egui::vec2(SPACE_M, 0.0));
         let flex = (inner.width() - 150.0 - 104.0 - 52.0).max(120.0);
         let mut x = inner.left();
         [150.0, flex * 0.4, flex * 0.6, 104.0, 52.0].map(|width| {
@@ -783,7 +832,7 @@ mod app {
                 .iter()
                 .zip(["TIME (UTC)", "PROGRAM", "DESTINATION", "DECISION", "STATUS"])
         {
-            paint_cell(ui.painter(), *column, title, semibold(11.0), SUBTLE);
+            paint_cell(ui.painter(), *column, title, semibold(CAPTION), SUBTLE);
         }
         ui.painter()
             .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, BORDER));
@@ -798,12 +847,18 @@ mod app {
         if active {
             painter.rect_filled(rect, 6, tint(BLUE));
         } else if response.hovered() {
-            painter.rect_filled(rect, 6, RAISED);
+            painter.rect_filled(rect, R_CONTROL, RAISED);
         }
         let [time, program, host, decision, status] = history_columns(rect);
-        let (label, color) = decision_style(event.action);
+        let (label, color) = decision_style(event);
         let when = event.time.replace('T', " ");
-        paint_cell(painter, time, when.trim_end_matches('Z'), mono(12.0), MUTED);
+        paint_cell(
+            painter,
+            time,
+            when.trim_end_matches('Z'),
+            mono(SMALL),
+            MUTED,
+        );
         paint_cell(
             painter,
             program,
@@ -811,14 +866,14 @@ mod app {
             FontId::proportional(13.5),
             TEXT,
         );
-        paint_cell(painter, host, &event.host, mono(12.5), BLUE);
+        paint_cell(painter, host, &event.host, mono(SMALL), BLUE);
         paint_badge(painter, decision, label, color);
         let status_color = if event.status >= 400 { RED } else { MUTED };
         paint_cell(
             painter,
             status,
             &event.status.to_string(),
-            mono(12.5),
+            mono(SMALL),
             status_color,
         );
         response
@@ -982,20 +1037,20 @@ mod app {
                 (TextStyle::Small, FontId::proportional(11.5)),
                 (TextStyle::Body, FontId::proportional(13.5)),
                 (TextStyle::Button, FontId::proportional(13.5)),
-                (TextStyle::Heading, semibold(20.0)),
-                (TextStyle::Monospace, mono(12.5)),
+                (TextStyle::Heading, semibold(TITLE)),
+                (TextStyle::Monospace, mono(SMALL)),
             ]
             .into();
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(14.0, 6.0);
-            style.spacing.interact_size.y = 28.0;
+            style.spacing.item_spacing = egui::vec2(SPACE_S, SPACE_S);
+            style.spacing.button_padding = egui::vec2(SPACE_L, SPACE_XS);
+            style.spacing.interact_size.y = CONTROL_H_SM;
             style.interaction.selectable_labels = false;
             let visuals = &mut style.visuals;
             visuals.panel_fill = BG;
             visuals.window_fill = SURFACE;
             visuals.window_stroke = Stroke::new(1.0, BORDER);
-            visuals.window_corner_radius = CornerRadius::same(10);
-            visuals.menu_corner_radius = CornerRadius::same(8);
+            visuals.window_corner_radius = CornerRadius::same(R_CARD);
+            visuals.menu_corner_radius = CornerRadius::same(R_CONTROL);
             visuals.extreme_bg_color = Color32::from_rgb(0x0e, 0x12, 0x1a);
             visuals.faint_bg_color = SURFACE;
             visuals.override_text_color = None;
@@ -1015,7 +1070,7 @@ mod app {
                 state.weak_bg_fill = fill;
                 state.bg_stroke = Stroke::new(1.0, stroke);
                 state.fg_stroke = Stroke::new(1.0, TEXT);
-                state.corner_radius = CornerRadius::same(7);
+                state.corner_radius = CornerRadius::same(R_CONTROL);
                 state.expansion = 0.0;
             }
         });
@@ -1031,16 +1086,16 @@ mod app {
                     rect.center(),
                     Align2::CENTER_CENTER,
                     "G",
-                    semibold(20.0),
+                    semibold(TITLE),
                     Color32::from_rgb(0x0b, 0x12, 0x24),
                 );
-                ui.add_space(4.0);
+                ui.add_space(SPACE_XS);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("Gatewizz").font(semibold(18.0)).color(TEXT));
+                    ui.label(RichText::new("Gatewizz").font(semibold(TITLE)).color(TEXT));
                     ui.label(
                         RichText::new("Local security gate for outgoing traffic")
-                            .size(12.0)
+                            .size(SMALL)
                             .color(MUTED),
                     );
                 });
@@ -1053,12 +1108,12 @@ mod app {
                     status_pill(ui, &text, color);
                 });
             });
-            ui.add_space(14.0);
+            ui.add_space(SPACE_L);
             egui::Frame::new()
                 .fill(SURFACE)
                 .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(9)
-                .inner_margin(Margin::same(3))
+                .corner_radius(R_CARD)
+                .inner_margin(pad(SPACE_XS, SPACE_XS))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
@@ -1070,11 +1125,11 @@ mod app {
                             let selected = self.tab == tab;
                             let mut button = egui::Button::new(
                                 RichText::new(label)
-                                    .font(semibold(13.0))
+                                    .font(semibold(BODY))
                                     .color(if selected { TEXT } else { MUTED }),
                             )
-                            .corner_radius(7)
-                            .min_size(egui::vec2(96.0, 30.0))
+                            .corner_radius(R_CONTROL)
+                            .min_size(egui::vec2(96.0, CONTROL_H_SM))
                             .fill(if selected {
                                 RAISED
                             } else {
@@ -1088,7 +1143,7 @@ mod app {
                             if badge > 0 {
                                 button = button.right_text(
                                     RichText::new(badge.to_string())
-                                        .font(semibold(12.0))
+                                        .font(semibold(SMALL))
                                         .color(AMBER),
                                 );
                             }
@@ -1102,7 +1157,7 @@ mod app {
                         }
                     });
                 });
-            ui.add_space(14.0);
+            ui.add_space(SPACE_L);
         }
 
         fn status_bar(&mut self, ui: &mut egui::Ui, state: TrayState) {
@@ -1111,7 +1166,7 @@ mod app {
                 dot(ui, if paused { SUBTLE } else { GREEN }, 4.0);
                 ui.label(
                     RichText::new(format!("Proxy on http://{}", self.listen))
-                        .size(12.5)
+                        .size(SMALL)
                         .color(MUTED),
                 );
                 let copied = self
@@ -1134,19 +1189,19 @@ mod app {
                     }
                 }
                 if self.firewall_connected {
-                    ui.add_space(8.0);
+                    ui.add_space(SPACE_S);
                     dot(ui, GREEN, 4.0);
-                    ui.label(RichText::new("Firewall prompt on").size(12.5).color(MUTED))
+                    ui.label(RichText::new("Firewall prompt on").size(SMALL).color(MUTED))
                         .on_hover_text("Connected to the Gatewizz firewall service");
                 }
                 if let Some((at, ok, message)) = &self.firewall_result {
                     let shown = RESULT_SHOWN;
                     if at.elapsed() < shown {
-                        ui.add_space(8.0);
+                        ui.add_space(SPACE_S);
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!("Firewall: {message}"))
-                                    .size(12.5)
+                                    .size(SMALL)
                                     .color(if *ok { GREEN } else { RED }),
                             )
                             .truncate(),
@@ -1182,8 +1237,8 @@ mod app {
             egui::Frame::new()
                 .fill(tint(AMBER))
                 .stroke(Stroke::new(1.0, AMBER.gamma_multiply(0.45)))
-                .corner_radius(8)
-                .inner_margin(Margin::symmetric(14, 8))
+                .corner_radius(R_CARD)
+                .inner_margin(pad(SPACE_L, SPACE_S))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -1192,7 +1247,7 @@ mod app {
                             RichText::new(
                                 "Approvals are paused. Requests that need approval are blocked.",
                             )
-                            .size(13.0)
+                            .size(BODY)
                             .color(TEXT),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1202,7 +1257,7 @@ mod app {
                         });
                     });
                 });
-            ui.add_space(12.0);
+            ui.add_space(SPACE_M);
         }
 
         fn overview(&mut self, ui: &mut egui::Ui, pending: &[(u64, Held, Duration)]) {
@@ -1212,7 +1267,7 @@ mod app {
                 let blocked = self
                     .history
                     .iter()
-                    .filter(|event| event.action == Some(Action::Block))
+                    .filter(|event| event.decision() == "block")
                     .count();
                 let logged = self.events_path.is_some();
                 let source = if logged {
@@ -1238,7 +1293,7 @@ mod app {
                         source,
                     );
                 });
-                ui.add_space(16.0);
+                ui.add_space(SPACE_L);
             }
 
             egui::Panel::left("approval_queue")
@@ -1271,22 +1326,22 @@ mod app {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new((pending.len() + self.inbox.len()).to_string())
-                            .font(semibold(12.0))
+                            .font(semibold(SMALL))
                             .color(MUTED),
                     );
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(SPACE_XS);
             if pending.is_empty() && self.inbox.is_empty() {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.vertical_centered(|ui| {
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                         check_icon(ui, GREEN, 40.0);
-                        ui.add_space(6.0);
+                        ui.add_space(SPACE_S);
                         ui.label(
                             RichText::new("Queue is clear")
-                                .font(semibold(14.5))
+                                .font(semibold(SUBHEAD))
                                 .color(TEXT),
                         );
                         ui.label(
@@ -1295,10 +1350,10 @@ mod app {
                             } else {
                                 "Held requests appear here and open this window."
                             })
-                            .size(12.0)
+                            .size(SMALL)
                             .color(MUTED),
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                     });
                 });
                 return;
@@ -1314,15 +1369,15 @@ mod app {
                                 if active { 1.5 } else { 1.0 },
                                 if active { BLUE } else { BORDER },
                             ))
-                            .corner_radius(10)
-                            .inner_margin(Margin::same(12))
+                            .corner_radius(R_CARD)
+                            .inner_margin(pad(SPACE_M, SPACE_M))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(program(&held.process))
-                                                .font(semibold(14.0))
+                                                .font(semibold(SUBHEAD))
                                                 .color(TEXT),
                                         )
                                         .truncate(),
@@ -1333,7 +1388,7 @@ mod app {
                                 });
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&held.host).font(mono(12.5)).color(MUTED),
+                                        RichText::new(&held.host).font(mono(SMALL)).color(MUTED),
                                     )
                                     .truncate(),
                                 );
@@ -1342,7 +1397,7 @@ mod app {
                                     1 => ("1 finding".to_string(), AMBER),
                                     n => (format!("{n} findings"), AMBER),
                                 };
-                                ui.label(RichText::new(findings).size(12.0).color(color));
+                                ui.label(RichText::new(findings).size(SMALL).color(color));
                             })
                             .response
                             .interact(Sense::click())
@@ -1350,7 +1405,7 @@ mod app {
                         if response.clicked() {
                             self.selected = Some(*id);
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(SPACE_XS);
                     }
                     let notices: Vec<Notice> = self.inbox.notices().cloned().collect();
                     for notice in &notices {
@@ -1362,15 +1417,15 @@ mod app {
                                 if active { 1.5 } else { 1.0 },
                                 if active { BLUE } else { BORDER },
                             ))
-                            .corner_radius(10)
-                            .inner_margin(Margin::same(12))
+                            .corner_radius(R_CARD)
+                            .inner_margin(pad(SPACE_M, SPACE_M))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(&notice.program)
-                                                .font(semibold(14.0))
+                                                .font(semibold(SUBHEAD))
                                                 .color(TEXT),
                                         )
                                         .truncate(),
@@ -1390,7 +1445,7 @@ mod app {
                                             notice.port,
                                             notice.protocol,
                                         ))
-                                        .font(mono(12.5))
+                                        .font(mono(SMALL))
                                         .color(MUTED),
                                     )
                                     .truncate(),
@@ -1399,7 +1454,7 @@ mod app {
                                     1 => "Connection · 1 attempt".to_string(),
                                     n => format!("Connection · {n} attempts"),
                                 };
-                                ui.label(RichText::new(attempts).size(12.0).color(SUBTLE));
+                                ui.label(RichText::new(attempts).size(SMALL).color(SUBTLE));
                             })
                             .response
                             .interact(Sense::click())
@@ -1408,7 +1463,7 @@ mod app {
                             self.selected = None;
                             self.notice_selected = Some(notice.id);
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(SPACE_XS);
                     }
                 });
         }
@@ -1436,7 +1491,7 @@ mod app {
                 });
             let protocol = destination(notice.remote, notice.port, notice.protocol);
             let protocol = protocol.rsplit(' ').next().unwrap_or_default().to_string();
-            card().inner_margin(Margin::same(20)).show(ui, |ui| {
+            card().inner_margin(pad(SPACE_XL, SPACE_XL)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
                 egui::ScrollArea::vertical()
@@ -1461,19 +1516,19 @@ mod app {
                         });
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&notice.program).font(semibold(22.0)).color(TEXT),
+                                RichText::new(&notice.program).font(semibold(DISPLAY)).color(TEXT),
                             )
                             .truncate(),
                         );
                         ui.add(
                             egui::Label::new(
                                 RichText::new(destination(notice.remote, notice.port, notice.protocol))
-                                    .font(mono(14.0))
+                                    .font(mono(SUBHEAD))
                                     .color(BLUE),
                             )
                             .wrap(),
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                         caption(ui, if notice.held { "WHY IT IS WAITING" } else { "WHY IT WAS BLOCKED" });
                         ui.label(
                             RichText::new(if notice.held {
@@ -1484,10 +1539,10 @@ mod app {
                                 "No connection rule allows this, and the firewall asks about it. The first attempt \
                                  has failed; most programs retry once a rule allows them."
                             })
-                            .size(13.0)
+                            .size(BODY)
                             .color(MUTED),
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                         caption(ui, "CONNECTION");
                         let (address, port, attempts) = (
                             notice.remote.to_string(),
@@ -1526,13 +1581,13 @@ mod app {
         /// unless widened.
         fn connection_decision(&mut self, ui: &mut egui::Ui, notice: &Notice) -> Option<Decision> {
             let mut answer = None;
-            card().inner_margin(Margin::same(16)).show(ui, |ui| {
+            card().inner_margin(pad(SPACE_L, SPACE_L)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     let deny = button("Deny always", tint(RED), RED)
                         .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(deny)
                         .on_hover_text("Keep blocking, and stop asking")
@@ -1541,7 +1596,7 @@ mod app {
                         answer = Some((RuleAction::Block, Lasting::Always));
                     }
                     let allow = button("Allow once", GREEN_FILL, Color32::WHITE)
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui
                         .add(allow)
                         .on_hover_text(
@@ -1552,9 +1607,9 @@ mod app {
                         answer = Some((RuleAction::Allow, Lasting::Once));
                     }
                 });
-                ui.add_space(10.0);
+                ui.add_space(SPACE_M);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Or allow for").size(12.5).color(MUTED));
+                    ui.label(RichText::new("Or allow for").size(SMALL).color(MUTED));
                     // Only the service's durations: it refuses any other.
                     for minutes in crate::prompt::PRESETS {
                         if chip(ui, &duration_label(minutes), self.notice_minutes == minutes)
@@ -1564,7 +1619,7 @@ mod app {
                         }
                     }
                 });
-                ui.add_space(6.0);
+                ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
                     let grant = button(
                         &format!("Allow for {}", duration_label(self.notice_minutes)),
@@ -1572,13 +1627,13 @@ mod app {
                         TEXT,
                     )
                     .stroke(Stroke::new(1.0, BORDER_STRONG))
-                    .min_size(egui::vec2(150.0, 32.0));
+                    .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         answer = Some((RuleAction::Allow, Lasting::Minutes(self.notice_minutes)));
                     }
                     let always = button("Allow always", RAISED, TEXT)
                         .stroke(Stroke::new(1.0, BORDER_STRONG))
-                        .min_size(egui::vec2(120.0, 32.0));
+                        .min_size(egui::vec2(120.0, CONTROL_H));
                     if ui
                         .add(always)
                         .on_hover_text("Add a permanent rule to the firewall configuration")
@@ -1587,7 +1642,7 @@ mod app {
                         answer = Some((RuleAction::Allow, Lasting::Always));
                     }
                 });
-                ui.add_space(8.0);
+                ui.add_space(SPACE_S);
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.any_host, "Any address");
                     ui.checkbox(&mut self.any_port, "Any port");
@@ -1609,7 +1664,7 @@ mod app {
                                 "keeps it blocked"
                             }
                         ))
-                        .size(12.0)
+                        .size(SMALL)
                         .color(SUBTLE),
                     )
                     .wrap(),
@@ -1648,7 +1703,7 @@ mod app {
                 .show(ui, |ui| {
                     verdict = self.decision(ui, &name, &held.host);
                 });
-            card().inner_margin(Margin::same(20)).show(ui, |ui| {
+            card().inner_margin(pad(SPACE_XL, SPACE_XL)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
                 egui::ScrollArea::vertical()
@@ -1665,16 +1720,18 @@ mod app {
                             });
                         });
                         ui.add(
-                            egui::Label::new(RichText::new(&name).font(semibold(22.0)).color(TEXT))
-                                .truncate(),
+                            egui::Label::new(
+                                RichText::new(&name).font(semibold(DISPLAY)).color(TEXT),
+                            )
+                            .truncate(),
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&held.host).font(mono(14.0)).color(BLUE),
+                                RichText::new(&held.host).font(mono(SUBHEAD)).color(BLUE),
                             )
                             .wrap(),
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                         caption(ui, "WHY IT WAS HELD");
                         if held.findings.is_empty() {
                             ui.label(
@@ -1682,7 +1739,7 @@ mod app {
                                 "Rule \"{}\" asks for approval before traffic reaches this host.",
                                 held.rule
                             ))
-                            .size(13.0)
+                            .size(BODY)
                             .color(MUTED),
                         );
                         } else {
@@ -1692,7 +1749,7 @@ mod app {
                                 }
                             });
                         }
-                        ui.add_space(14.0);
+                        ui.add_space(SPACE_L);
                         caption(ui, "REQUEST");
                         details(
                             ui,
@@ -1704,6 +1761,43 @@ mod app {
                                 ("Matched rule", &held.rule),
                             ],
                         );
+                        ui.add_space(SPACE_L);
+                        caption(ui, "CONTENT");
+                        match &held.request {
+                            Some(text) => {
+                                egui::Frame::new()
+                                    .fill(ui.visuals().extreme_bg_color)
+                                    .stroke(Stroke::new(1.0, BORDER))
+                                    .corner_radius(R_CONTROL)
+                                    .inner_margin(pad(SPACE_M, SPACE_S))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("held_preview")
+                                            .max_height(220.0)
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(text)
+                                                            .font(mono(SMALL))
+                                                            .color(MUTED),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            });
+                                    });
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new(
+                                        "Not visible: this HTTPS connection is tunneled. Turn on TLS interception \
+                                         (intercept = true) to see a request before you allow it.",
+                                    )
+                                    .size(BODY)
+                                    .color(MUTED),
+                                );
+                            }
+                        }
                     });
             });
             if let Some(verdict) = verdict {
@@ -1715,24 +1809,24 @@ mod app {
         /// Deny, allow once, or allow this program and host for a while.
         fn decision(&mut self, ui: &mut egui::Ui, name: &str, host: &str) -> Option<Verdict> {
             let mut verdict = None;
-            card().inner_margin(Margin::same(16)).show(ui, |ui| {
+            card().inner_margin(pad(SPACE_L, SPACE_L)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
                     let deny = button("Deny", tint(RED), RED)
                         .stroke(Stroke::new(1.0, RED.gamma_multiply(0.5)))
-                        .min_size(egui::vec2(width, 38.0));
+                        .min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(deny).on_hover_text("Block this request").clicked() {
                         verdict = Some(Verdict::Deny);
                     }
-                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, 38.0));
+                    let allow = button("Allow once", GREEN_FILL, Color32::WHITE).min_size(egui::vec2(width, CONTROL_H_LG));
                     if ui.add(allow).on_hover_text("Send this request only").clicked() {
                         verdict = Some(Verdict::AllowOnce);
                     }
                 });
-                ui.add_space(10.0);
+                ui.add_space(SPACE_M);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Or allow for").size(12.5).color(MUTED));
+                    ui.label(RichText::new("Or allow for").size(SMALL).color(MUTED));
                     for minutes in [5, 15, 60, 480] {
                         if chip(ui, &duration_label(minutes), self.minutes == minutes).clicked() {
                             self.minutes = minutes;
@@ -1741,7 +1835,7 @@ mod app {
                     ui.add(egui::DragValue::new(&mut self.minutes).range(1..=480).suffix(" min"))
                         .on_hover_text("Custom duration, 1 to 480 minutes");
                 });
-                ui.add_space(6.0);
+                ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
                     let grant = button(
                         &format!("Allow for {}", duration_label(self.minutes)),
@@ -1749,19 +1843,19 @@ mod app {
                         TEXT,
                     )
                     .stroke(Stroke::new(1.0, BORDER_STRONG))
-                    .min_size(egui::vec2(150.0, 32.0));
+                    .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         verdict = Some(Verdict::AllowFor(Duration::from_secs(
                             u64::from(self.minutes) * 60,
                         )));
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(SPACE_XS);
                     ui.add(
                         egui::Label::new(
                             RichText::new(format!(
                                 "Covers only {name} connecting to {host}. Closing the window or letting the timer run out denies the request."
                             ))
-                            .size(12.0)
+                            .size(SMALL)
                             .color(SUBTLE),
                         )
                         .wrap(),
@@ -1784,20 +1878,20 @@ mod app {
                         }
                     });
                 });
-                ui.add_space(4.0);
+                ui.add_space(SPACE_XS);
                 if self.history.is_empty() {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
+                        ui.add_space(SPACE_XXL);
                         check_icon(ui, GREEN, 48.0);
-                        ui.add_space(8.0);
+                        ui.add_space(SPACE_S);
                         ui.label(
                             RichText::new("You're all caught up")
-                                .font(semibold(17.0))
+                                .font(semibold(TITLE))
                                 .color(TEXT),
                         );
                         ui.label(
                             RichText::new(self.empty_history_message())
-                                .size(12.5)
+                                .size(SMALL)
                                 .color(MUTED),
                         );
                     });
@@ -1825,25 +1919,25 @@ mod app {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     caption(ui, "CONNECTION MONITOR IS OFF");
-                    ui.add_space(4.0);
+                    ui.add_space(SPACE_XS);
                     ui.label(
                         RichText::new(
                             "Turn it on to see every outgoing TCP connection on this computer, per program, with \
                              the hostname where Windows' DNS cache knows it. It only watches; nothing is blocked.",
                         )
-                        .size(13.0)
+                        .size(BODY)
                         .color(MUTED),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(SPACE_S);
                     ui.label(
                         RichText::new("[monitor]\nenabled = true")
-                            .font(mono(12.5))
+                            .font(mono(SMALL))
                             .color(TEXT),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(SPACE_XS);
                     ui.label(
                         RichText::new("Add this to your configuration file and restart Gatewizz.")
-                            .size(12.0)
+                            .size(SMALL)
                             .color(SUBTLE),
                     );
                 });
@@ -1860,16 +1954,16 @@ mod app {
                     egui::TextEdit::singleline(&mut self.network_filter)
                         .hint_text("Search program, host or IP")
                         .desired_width(240.0)
-                        .margin(Margin::symmetric(10, 6)),
+                        .margin(pad(SPACE_M, SPACE_S)),
                 );
-                ui.add_space(8.0);
+                ui.add_space(SPACE_S);
                 ui.label(
                     RichText::new(format!(
                         "{} connections · {} programs · {new} new",
                         state.connections.len(),
                         groups.len()
                     ))
-                    .size(12.5)
+                    .size(SMALL)
                     .color(MUTED),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1879,33 +1973,33 @@ mod app {
                         Some(secs) => format!("Updated {secs} s ago"),
                         None => "Starting…".to_string(),
                     };
-                    ui.label(RichText::new(text).size(12.0).color(SUBTLE));
+                    ui.label(RichText::new(text).size(SMALL).color(SUBTLE));
                 });
             });
-            ui.add_space(10.0);
+            ui.add_space(SPACE_M);
             if let Some(error) = &state.error {
                 card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         dot(ui, RED, 4.0);
-                        ui.label(RichText::new(error).size(13.0).color(TEXT));
+                        ui.label(RichText::new(error).size(BODY).color(TEXT));
                     });
                 });
-                ui.add_space(10.0);
+                ui.add_space(SPACE_M);
             }
             if let Some(error) = &state.dns_error {
                 ui.horizontal(|ui| {
                     dot(ui, AMBER, 3.5);
                     ui.label(
                         RichText::new(format!("Hostnames unavailable: {error}"))
-                            .size(12.0)
+                            .size(SMALL)
                             .color(MUTED),
                     );
                 });
-                ui.add_space(8.0);
+                ui.add_space(SPACE_S);
             }
             if groups.is_empty() {
-                ui.add_space(24.0);
+                ui.add_space(SPACE_XL);
                 ui.vertical_centered(|ui| {
                     ui.label(
                         RichText::new(if self.network_filter.trim().is_empty() {
@@ -1913,7 +2007,7 @@ mod app {
                         } else {
                             "No connection matches the search."
                         })
-                        .size(13.0)
+                        .size(BODY)
                         .color(MUTED),
                     );
                 });
@@ -1924,14 +2018,14 @@ mod app {
                 .show(ui, |ui| {
                     for (name, list) in &groups {
                         card()
-                            .inner_margin(Margin::symmetric(16, 12))
+                            .inner_margin(pad(SPACE_L, SPACE_M))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(name).font(semibold(14.0)).color(TEXT));
+                                    ui.label(RichText::new(name).font(semibold(SUBHEAD)).color(TEXT));
                                     ui.label(
                                         RichText::new(format!("{}", list.len()))
-                                            .size(12.0)
+                                            .size(SMALL)
                                             .color(SUBTLE),
                                     );
                                     // Several instances of one program share a group; name the PID only
@@ -1943,11 +2037,11 @@ mod app {
                                     };
                                     if let Some(label) = label {
                                         ui.label(
-                                            RichText::new(label).font(mono(11.5)).color(SUBTLE),
+                                            RichText::new(label).font(mono(CAPTION)).color(SUBTLE),
                                         );
                                     }
                                 });
-                                ui.add_space(6.0);
+                                ui.add_space(SPACE_S);
                                 for conn in list {
                                     ui.horizontal(|ui| {
                                         let host = conn
@@ -1962,7 +2056,7 @@ mod app {
                                         ui.add_sized(
                                             [280.0, 20.0],
                                             egui::Label::new(
-                                                RichText::new(host).size(13.0).color(TEXT),
+                                                RichText::new(host).size(BODY).color(TEXT),
                                             )
                                             .truncate(),
                                         );
@@ -1970,7 +2064,7 @@ mod app {
                                             [220.0, 20.0],
                                             egui::Label::new(
                                                 RichText::new(conn.remote.to_string())
-                                                    .font(mono(12.0))
+                                                    .font(mono(SMALL))
                                                     .color(MUTED),
                                             )
                                             .truncate(),
@@ -1980,7 +2074,7 @@ mod app {
                                                 Direction::Outbound => "TCP out",
                                                 Direction::Inbound => "TCP in",
                                             })
-                                            .size(12.0)
+                                            .size(SMALL)
                                             .color(SUBTLE),
                                         );
                                         if conn.first_seen {
@@ -1995,7 +2089,7 @@ mod app {
                                     });
                                 }
                             });
-                        ui.add_space(8.0);
+                        ui.add_space(SPACE_S);
                     }
                 });
         }
@@ -2019,7 +2113,7 @@ mod app {
                 ("all", "All", rows.len()),
                 ("allow", "Allowed", count("allow")),
                 ("block", "Blocked", count("block")),
-                ("approve", "Approval", count("approve")),
+                ("approve", "Approved", count("approve")),
             ];
             let filtered = filter_history(rows, &self.history_filter, &self.history_decision);
 
@@ -2028,9 +2122,9 @@ mod app {
                     egui::TextEdit::singleline(&mut self.history_filter)
                         .hint_text("Search program or host")
                         .desired_width(220.0)
-                        .margin(Margin::symmetric(10, 6)),
+                        .margin(pad(SPACE_M, SPACE_S)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(SPACE_S);
                 for (value, label, n) in counts {
                     if chip(ui, &format!("{label}  {n}"), self.history_decision == value).clicked()
                     {
@@ -2053,12 +2147,12 @@ mod app {
                     }
                     ui.label(
                         RichText::new(format!("{} of {}", filtered.len(), rows.len()))
-                            .size(12.0)
+                            .size(SMALL)
                             .color(SUBTLE),
                     );
                 });
             });
-            ui.add_space(12.0);
+            ui.add_space(SPACE_M);
 
             egui::Panel::bottom("privacy_note")
                 .show_separator_line(false)
@@ -2066,7 +2160,7 @@ mod app {
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new("Metadata only. Request bodies, header values, query strings and secrets are never stored or exported.")
-                            .size(11.5)
+                            .size(CAPTION)
                             .color(SUBTLE),
                     );
                 });
@@ -2088,12 +2182,12 @@ mod app {
                     });
             }
 
-            card().inner_margin(Margin::same(8)).show(ui, |ui| {
+            card().inner_margin(pad(SPACE_S, SPACE_S)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
                 if rows.is_empty() || filtered.is_empty() {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(48.0);
+                        ui.add_space(SPACE_XXL);
                         let (title, message) = if rows.is_empty() {
                             ("No activity yet", self.empty_history_message())
                         } else {
@@ -2102,8 +2196,8 @@ mod app {
                                 "Try another search or decision filter.",
                             )
                         };
-                        ui.label(RichText::new(title).font(semibold(16.0)).color(TEXT));
-                        ui.label(RichText::new(message).size(12.5).color(MUTED));
+                        ui.label(RichText::new(title).font(semibold(SUBHEAD)).color(TEXT));
+                        ui.label(RichText::new(message).size(SMALL).color(MUTED));
                     });
                     return;
                 }
@@ -2156,7 +2250,7 @@ mod app {
             ui.add(
                 egui::Label::new(
                     RichText::new(event.process_name())
-                        .font(semibold(17.0))
+                        .font(semibold(TITLE))
                         .color(TEXT),
                 )
                 .truncate(),
@@ -2164,13 +2258,13 @@ mod app {
             ui.add(
                 egui::Label::new(
                     RichText::new(format!("{}:{}", event.host, event.port))
-                        .font(mono(13.0))
+                        .font(mono(BODY))
                         .color(BLUE),
                 )
                 .wrap(),
             );
-            ui.add_space(6.0);
-            let (label, color) = decision_style(event.action);
+            ui.add_space(SPACE_S);
+            let (label, color) = decision_style(event);
             ui.horizontal(|ui| {
                 badge(ui, label, color);
                 badge(
@@ -2179,7 +2273,7 @@ mod app {
                     if event.status >= 400 { RED } else { SUBTLE },
                 );
             });
-            ui.add_space(10.0);
+            ui.add_space(SPACE_M);
             let when = format!("{} UTC", event.time.replace('T', " ").trim_end_matches('Z'));
             let path = if event.path.is_empty() {
                 "(CONNECT tunnel)"
@@ -2313,7 +2407,7 @@ mod app {
                 .frame(
                     egui::Frame::new()
                         .fill(SURFACE)
-                        .inner_margin(Margin::symmetric(20, 8)),
+                        .inner_margin(pad(SPACE_XL, SPACE_S)),
                 )
                 .show(ui, |ui| self.status_bar(ui, state));
             egui::CentralPanel::default()
@@ -2417,6 +2511,7 @@ mod app {
                 r#"{"host":"api.anthropic.com","action":"block","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#,
                 r#"{"host":"internal.example.com","action":"approve","process":{"unknown":"access denied"}}"#,
                 r#"{"host":"example.org"}"#,
+                r#"{"host":"denied.example.com","action":"approve","coverage":"blocked","status":403}"#,
             ]
             .iter()
             .map(|line| serde_json::from_str(line).expect("parse test event"))
@@ -2460,8 +2555,9 @@ mod app {
             );
             assert_eq!(
                 hosts(&filter_history(&rows, "", "block")),
-                ["api.anthropic.com"]
+                ["api.anthropic.com", "denied.example.com"]
             );
+            assert_eq!(decision_style(&rows[4]).0, "Denied");
             assert_eq!(
                 hosts(&filter_history(&rows, "", "approve")),
                 ["internal.example.com"]
@@ -2635,6 +2731,10 @@ mod tests {
         assert_eq!(
             program(&Process::Unknown("pid reused")),
             "unknown (pid reused)"
+        );
+        assert_eq!(
+            program(&Process::Unknown(crate::process::OUTSIDE_WINDOWS)),
+            "WSL / VM"
         );
     }
 }

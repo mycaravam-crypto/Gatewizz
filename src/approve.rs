@@ -19,6 +19,8 @@ pub struct Held {
     pub host: String,
     pub rule: String,
     pub findings: Vec<String>,
+    /// Request line, headers and body with secrets masked, while the request waits. `None` for a blind tunnel.
+    pub request: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +243,7 @@ mod tests {
             host: host.into(),
             rule: "secrets-to-unknown-hosts".into(),
             findings: vec!["secret.github_token".into()],
+            request: None,
         }
     }
 

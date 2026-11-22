@@ -30,6 +30,9 @@ pub enum Process {
     Unknown(&'static str),
 }
 
+/// The reason when the client is not a Windows process, e.g. WSL in mirrored networking mode.
+pub const OUTSIDE_WINDOWS: &str = "WSL or VM";
+
 /// One row of `TCP_TABLE_OWNER_PID_CONNECTIONS`, decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Row {
@@ -107,8 +110,12 @@ pub fn client_process(peer: SocketAddr, local: SocketAddr) -> Process {
     if !cfg!(windows) {
         return Process::Unknown("unsupported");
     }
-    let Some(pid) = sys::tcp_table().and_then(|rows| find_client_pid(&rows, peer, local)) else {
-        return Process::Unknown("no table row");
+    let Some(rows) = sys::tcp_table() else {
+        return Process::Unknown("tcp table unavailable");
+    };
+    // Loopback from WSL (mirrored networking) or another VM has no Windows socket, so no row.
+    let Some(pid) = find_client_pid(&rows, peer, local) else {
+        return Process::Unknown(OUTSIDE_WINDOWS);
     };
     let Some(start) = sys::start_time(pid) else {
         return Process::Unknown("process exited or access denied");

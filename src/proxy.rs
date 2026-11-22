@@ -282,7 +282,7 @@ async fn forward(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early, None).await {
         return blocked;
     }
     let authority = req.uri().authority().map(|a| a.as_str().to_string());
@@ -342,13 +342,13 @@ async fn relay(
     req: Request<Incoming>,
 ) -> Response<Body> {
     // Plain HTTP and decrypted HTTPS both end here: the body is read and inspected before any request byte is sent.
-    let req = match detect::inspect(req, &ctx.settings.body).await {
-        Inspected::Forward(req, inspection) => {
+    let (req, body) = match detect::inspect(req, &ctx.settings.body).await {
+        Inspected::Forward(req, inspection, body) => {
             event.findings = inspection.findings;
             event.model = inspection.model;
             event.coverage = inspection.coverage;
             event.bytes_up = inspection.bytes_up;
-            *req
+            (*req, body)
         }
         Inspected::Refuse(inspection, status, reason) => {
             event.findings = inspection.findings;
@@ -372,7 +372,16 @@ async fn relay(
             defer_content: false,
         })
     };
-    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Final).await {
+    // Only a request that will be held gets a preview; it lives in the approval card until the decision.
+    let preview = (decision.action == Action::Approve).then(|| {
+        detect::preview(
+            req.method(),
+            req.uri().path(),
+            req.headers(),
+            body.as_deref(),
+        )
+    });
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Final, preview).await {
         return blocked;
     }
     let mut connected;
@@ -472,7 +481,7 @@ async fn tunnel(
     } else {
         Stage::Final
     };
-    if let Some(blocked) = enforce(&ctx, &mut event, decision, stage).await {
+    if let Some(blocked) = enforce(&ctx, &mut event, decision, stage, None).await {
         return blocked;
     }
     if let Some(interceptor) = interceptor {
@@ -667,7 +676,7 @@ async fn inside(
         content: None,
         defer_content: true,
     });
-    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early).await {
+    if let Some(blocked) = enforce(ctx, &mut event, decision, Stage::Early, None).await {
         return blocked;
     }
     let authority = if port == 443 {
@@ -712,6 +721,7 @@ async fn enforce(
     event: &mut Event,
     decision: Decision,
     stage: Stage,
+    preview: Option<String>,
 ) -> Option<Response<Body>> {
     event.action = Some(decision.action);
     event.rule = Some(decision.rule.clone());
@@ -727,6 +737,7 @@ async fn enforce(
                             host: event.host.clone(),
                             rule: decision.rule.clone(),
                             findings: event.findings.iter().map(|f| f.kind.to_string()).collect(),
+                            request: preview,
                         })
                         .await
                 }

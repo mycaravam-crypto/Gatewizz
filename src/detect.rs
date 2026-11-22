@@ -1,6 +1,7 @@
 //! Request inspection: buffers a request body before anything goes upstream, then reports what it contains as finding
 //! kinds and counts. Matched text never leaves this module; only kinds, counts and an AI model name do.
 
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -57,8 +58,13 @@ pub struct Inspection {
 }
 
 pub enum Inspected {
-    /// Forward this request; its body is the buffered one (plus the unread rest when over the limit).
-    Forward(Box<Request<BoxBody<Bytes, hyper::Error>>>, Inspection),
+    /// Forward this request; its body is the buffered one (plus the unread rest when over the limit). The last field
+    /// is the whole body when it was read in full, for the approval preview.
+    Forward(
+        Box<Request<BoxBody<Bytes, hyper::Error>>>,
+        Inspection,
+        Option<Bytes>,
+    ),
     /// Refuse it; nothing has gone upstream.
     Refuse(Inspection, StatusCode, &'static str),
 }
@@ -106,6 +112,7 @@ pub async fn inspect(req: Request<Incoming>, limits: &BodyLimits) -> Inspected {
                 Inspected::Forward(
                     Box::new(Request::from_parts(parts, body.boxed())),
                     inspection,
+                    None,
                 )
             }
         };
@@ -146,6 +153,7 @@ pub async fn inspect(req: Request<Incoming>, limits: &BodyLimits) -> Inspected {
                 Inspected::Forward(
                     Box::new(Request::from_parts(parts, body.boxed())),
                     inspection,
+                    None,
                 )
             }
         };
@@ -154,10 +162,15 @@ pub async fn inspect(req: Request<Incoming>, limits: &BodyLimits) -> Inspected {
     inspection.findings = scan_secrets(&buffered);
     inspection.model = ai_model(parts.method.as_str(), parts.uri.path(), &buffered);
     inspection.bytes_up = Some(buffered.len() as u64);
-    let body = Full::new(Bytes::from(buffered))
+    let buffered = Bytes::from(buffered);
+    let body = Full::new(buffered.clone())
         .map_err(|never| match never {})
         .boxed();
-    Inspected::Forward(Box::new(Request::from_parts(parts, body)), inspection)
+    Inspected::Forward(
+        Box::new(Request::from_parts(parts, body)),
+        inspection,
+        Some(buffered),
+    )
 }
 
 /// The bytes already read, followed by the rest of the client's body.
@@ -259,7 +272,7 @@ const PATTERNS: &[Pattern] = &[
         min: 32,
         max: 250,
     },
-    // Also covers `sk-proj-…` and `sk-svcacct-…`; `sk-ant-` is excluded in `count_pattern`.
+    // Also covers `sk-proj-…` and `sk-svcacct-…`; `sk-ant-` is excluded in `pattern_matches`.
     Pattern {
         kind: "secret.openai_key",
         prefixes: &["sk-"],
@@ -276,8 +289,8 @@ const PATTERNS: &[Pattern] = &[
     },
 ];
 
-fn count_pattern(text: &[u8], p: &Pattern) -> u32 {
-    let mut count = 0;
+fn pattern_matches(text: &[u8], p: &Pattern) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
     for prefix in p.prefixes {
         let prefix = prefix.as_bytes();
         let mut from = 0;
@@ -292,16 +305,17 @@ fn count_pattern(text: &[u8], p: &Pattern) -> u32 {
             }
             let run = rest.iter().take_while(|&&b| (p.body)(b)).count();
             if (p.min..=p.max).contains(&run) {
-                count += 1;
+                found.push(at..at + prefix.len() + run);
             }
         }
     }
-    count
+    found
 }
 
-/// `-----BEGIN … PRIVATE KEY-----` (RSA, EC, OPENSSH, PKCS#8 and encrypted forms).
-fn count_private_keys(text: &[u8]) -> u32 {
-    let mut count = 0;
+/// `-----BEGIN … PRIVATE KEY-----` (RSA, EC, OPENSSH, PKCS#8 and encrypted forms). A match runs to the end of its
+/// `-----END …-----` line, or to the end of the text when that is missing.
+fn private_key_matches(text: &[u8]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
     let mut from = 0;
     while let Some(at) = find(&text[from..], b"-----BEGIN ").map(|i| i + from) {
         from = at + 1;
@@ -309,15 +323,21 @@ fn count_private_keys(text: &[u8]) -> u32 {
         if let Some(end) = find(label, b"-----")
             && label[..end].ends_with(b"PRIVATE KEY")
         {
-            count += 1;
+            let end = find(&text[at..], b"-----END ")
+                .and_then(|e| {
+                    let close = at + e + 9;
+                    find(&text[close..], b"-----").map(|c| close + c + 5)
+                })
+                .unwrap_or(text.len());
+            found.push(at..end);
         }
     }
-    count
+    found
 }
 
 /// A JWT: three dot-separated base64url segments, the first two JSON objects (`eyJ`).
-fn count_jwts(text: &[u8]) -> u32 {
-    let mut count = 0;
+fn jwt_matches(text: &[u8]) -> Vec<Range<usize>> {
+    let mut found = Vec::new();
     let mut from = 0;
     while let Some(at) = find(&text[from..], b"eyJ").map(|i| i + from) {
         from = at + 1;
@@ -342,10 +362,10 @@ fn count_jwts(text: &[u8]) -> u32 {
             && payload.starts_with(b"eyJ")
             && payload.get(b) == Some(&b'.')
         {
-            count += 1;
+            found.push(at..at + a + 1 + b + 1 + c);
         }
     }
-    count
+    found
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -363,10 +383,99 @@ fn scan_text(text: &[u8], totals: &mut Vec<Finding>) {
         }
     };
     for p in PATTERNS {
-        add(p.kind, count_pattern(text, p));
+        add(p.kind, pattern_matches(text, p).len() as u32);
     }
-    add("secret.private_key", count_private_keys(text));
-    add("secret.jwt", count_jwts(text));
+    add("secret.private_key", private_key_matches(text).len() as u32);
+    add("secret.jwt", jwt_matches(text).len() as u32);
+}
+
+/// Replaces every secret match in `text` with `[redacted]`.
+fn mask_secrets(text: &[u8]) -> Vec<u8> {
+    let mut ranges: Vec<Range<usize>> = PATTERNS
+        .iter()
+        .flat_map(|p| pattern_matches(text, p))
+        .chain(private_key_matches(text))
+        .chain(jwt_matches(text))
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut out = Vec::with_capacity(text.len());
+    let mut at = 0;
+    for r in ranges {
+        if r.end <= at {
+            continue;
+        }
+        out.extend_from_slice(&text[at..r.start.max(at)]);
+        out.extend_from_slice(b"[redacted]");
+        at = r.end;
+    }
+    out.extend_from_slice(&text[at..]);
+    out
+}
+
+/// Header names whose values are credentials or session state: never shown.
+const SECRET_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+];
+/// How much of the body the approval card shows.
+const PREVIEW_BYTES: usize = 4096;
+
+/// What the approval card shows of a held request: request line, headers and the start of the body, with secrets
+/// masked. It is never logged or written to disk. Anything that still scans as a secret after masking (for example a
+/// key hidden by JSON escapes) hides that part instead.
+pub fn preview(
+    method: &hyper::Method,
+    path: &str,
+    headers: &hyper::HeaderMap,
+    body: Option<&[u8]>,
+) -> String {
+    let safe = |bytes: &[u8]| {
+        let masked = mask_secrets(bytes);
+        scan_secrets(&masked).is_empty().then_some(masked)
+    };
+    let mut out = format!("{method} {path}\n");
+    for (name, value) in headers {
+        let lower = name.as_str();
+        let secretish = SECRET_HEADERS.contains(&lower)
+            || ["token", "secret", "key", "auth"]
+                .iter()
+                .any(|w| lower.contains(w));
+        let shown = if secretish {
+            "[redacted]".to_owned()
+        } else {
+            safe(value.as_bytes()).map_or_else(
+                || "[redacted]".to_owned(),
+                |v| String::from_utf8_lossy(&v).into_owned(),
+            )
+        };
+        out.push_str(&format!("{name}: {shown}\n"));
+    }
+    out.push('\n');
+    let Some(body) = body else {
+        out.push_str("(body not shown: it was over the inspection limit or compressed)");
+        return out;
+    };
+    if body.is_empty() {
+        out.push_str("(no body)");
+    } else if std::str::from_utf8(body).is_err() {
+        out.push_str(&format!("({} bytes of binary data)", body.len()));
+    } else if let Some(masked) = safe(body) {
+        let text = String::from_utf8_lossy(&masked);
+        let mut cut = text.len().min(PREVIEW_BYTES);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.push_str(&text[..cut]);
+        if cut < text.len() {
+            out.push_str(&format!("\n… ({} more bytes)", text.len() - cut));
+        }
+    } else {
+        out.push_str("(body hidden: it contains a secret that could not be masked)");
+    }
+    out
 }
 
 /// Secret kinds and counts in a body. A JSON body is scanned per decoded string (keys and values), so escapes such as
@@ -439,6 +548,72 @@ mod tests {
 
     fn found(body: &str, kind: &str) -> bool {
         kinds(body).iter().any(|(k, _)| *k == kind)
+    }
+
+    fn show(headers: &[(&str, &str)], body: Option<&str>) -> String {
+        let mut map = hyper::HeaderMap::new();
+        for (k, v) in headers {
+            map.insert(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        preview(
+            &hyper::Method::POST,
+            "/v1/messages",
+            &map,
+            body.map(str::as_bytes),
+        )
+    }
+
+    #[test]
+    fn preview_masks_secrets_and_never_leaks_them() {
+        let key = fake(&["sk", "-ant-"].concat(), 'x', 40);
+        let jwt = format!("eyJ{0}.eyJ{0}.{0}", "a".repeat(12));
+        let pem = format!(
+            "-----BEGIN {0}-----\nMIIabc\n-----END {0}-----",
+            "RSA PRIVATE KEY"
+        );
+        let body = format!(r#"{{"key":"{key}","t":"{jwt}","pem":"x"}} {pem} tail"#);
+        let out = show(
+            &[
+                ("content-type", "application/json"),
+                ("authorization", "Bearer abc"),
+                ("x-trace", &key),
+            ],
+            Some(&body),
+        );
+        assert!(out.starts_with("POST /v1/messages\n"));
+        assert!(out.contains("content-type: application/json"));
+        assert!(out.contains("authorization: [redacted]"));
+        assert!(out.contains("x-trace: [redacted]"));
+        assert!(out.ends_with(" [redacted] tail"), "{out}");
+        assert!(scan_secrets(out.as_bytes()).is_empty(), "{out}");
+        assert!(!out.contains("Bearer abc"));
+    }
+
+    #[test]
+    fn preview_hides_a_body_with_an_unmaskable_secret() {
+        // A JSON escape hides the prefix from the raw scan, but the decoded scan still finds the key.
+        let key = fake(&[r"\u00", "73k-ant-"].concat(), 'x', 40);
+        let out = show(&[], Some(&format!(r#"{{"key":"{key}"}}"#)));
+        assert!(out.ends_with("(body hidden: it contains a secret that could not be masked)"));
+        assert!(!out.contains("xxxxxxxx"));
+    }
+
+    #[test]
+    fn preview_truncates_and_names_missing_bodies() {
+        let out = show(&[], Some(&"é".repeat(3000)));
+        assert!(
+            out.ends_with("… (1904 more bytes)"),
+            "{}",
+            &out[out.len() - 40..]
+        );
+        assert!(show(&[], Some("")).ends_with("(no body)"));
+        assert!(
+            show(&[], None)
+                .ends_with("(body not shown: it was over the inspection limit or compressed)")
+        );
     }
 
     #[test]
