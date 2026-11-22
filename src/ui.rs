@@ -526,6 +526,8 @@ mod app {
         last_geometry_save: Instant,
         /// Set once the first frame has asked to hide the window again (see `logic`).
         first_frame_done: bool,
+        /// The background the title bar was last painted with; it follows the theme.
+        title_bar: Option<Color32>,
         saved_geometry: Option<WindowGeometry>,
     }
 
@@ -805,6 +807,7 @@ mod app {
                 geometry_path,
                 last_geometry_save: Instant::now(),
                 first_frame_done: false,
+                title_bar: None,
                 saved_geometry,
             })
         }
@@ -1116,11 +1119,10 @@ mod app {
         }
         let [time, program, host, decision, status] = history_columns(rect);
         let (label, color) = decision_style(event);
-        let when = event.time.replace('T', " ");
         paint_cell(
             painter,
             time,
-            when.trim_end_matches('Z'),
+            &row_time(&event.time),
             mono(SMALL),
             colors().muted,
         );
@@ -1133,19 +1135,21 @@ mod app {
         );
         paint_cell(painter, host, &event.host, mono(SMALL), colors().blue);
         paint_badge(painter, decision, label, color);
-        let status_color = if event.status >= 400 {
-            colors().red
-        } else {
-            colors().muted
+        // 0 means no upstream response (refused or blocked before forwarding).
+        let (code, status_color) = match event.status {
+            0 => ("–".to_string(), colors().subtle),
+            code if code >= 400 => (code.to_string(), colors().red),
+            code => (code.to_string(), colors().muted),
         };
-        paint_cell(
-            painter,
-            status,
-            &event.status.to_string(),
-            mono(SMALL),
-            status_color,
-        );
+        paint_badge(painter, status, &code, status_color);
         response
+    }
+
+    /// `2026-11-22T18:58:01.123Z` as `11-22 18:58:01`: what fits the time column. The details panel shows the full
+    /// timestamp.
+    fn row_time(time: &str) -> String {
+        time.get(5..19)
+            .map_or_else(|| time.to_string(), |short| short.replace('T', " "))
     }
 
     /// Loads only a bounded tail from each log file. File I/O and JSON parsing run on a worker thread.
@@ -1153,7 +1157,7 @@ mod app {
     /// `path` comes from the local events.path configuration, which intentionally supports custom locations.
     fn load_history(path: &Path) -> Vec<HistoryEvent> {
         let mut rows = Vec::new();
-        for suffix in 0..=MAX_LOG_ROTATIONS {
+        'files: for suffix in 0..=MAX_LOG_ROTATIONS {
             let candidate = if suffix == 0 {
                 path.to_path_buf()
             } else {
@@ -1195,11 +1199,14 @@ mod app {
                 {
                     rows.push(event);
                     if rows.len() >= MAX_HISTORY_ROWS {
-                        return rows;
+                        break 'files;
                     }
                 }
             }
         }
+        // An event's time is when the request started, but a tunnel is logged when it closes, so log order is not
+        // time order. Newest first; the times are fixed-width UTC, and the stable sort keeps log order within a tie.
+        rows.sort_by(|a, b| b.time.cmp(&a.time));
         rows
     }
 
@@ -1365,23 +1372,31 @@ mod app {
         icons_available
     }
 
-    fn tab_icon(ui: &mut egui::Ui, tab: Tab, font_available: bool, color: Color32) {
+    /// A tab's icon as the first atom of its button: a Segoe Fluent/MDL2 glyph, or space reserved for
+    /// `paint_tab_icon` when neither font is installed.
+    fn tab_icon(
+        tab: Tab,
+        font_available: bool,
+        color: Color32,
+        id: egui::Id,
+    ) -> egui::Atom<'static> {
         let glyph = match tab {
             Tab::Overview => '\u{e80f}',
             Tab::Activity => '\u{e81c}',
             Tab::Network => '\u{e968}',
         };
         if font_available {
-            ui.label(
-                RichText::new(glyph.to_string())
-                    .font(FontId::new(16.0, FontFamily::Name(SYMBOLS.into())))
-                    .color(color),
-            );
-            return;
+            RichText::new(glyph.to_string())
+                .font(FontId::new(16.0, FontFamily::Name(SYMBOLS.into())))
+                .color(color)
+                .into()
+        } else {
+            egui::Atom::custom(id, egui::vec2(18.0, 18.0))
         }
+    }
 
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
-        let painter = ui.painter();
+    /// The fallback icon, drawn into the space `tab_icon` reserved.
+    fn paint_tab_icon(painter: &egui::Painter, rect: Rect, tab: Tab, color: Color32) {
         let center = rect.center();
         let stroke = Stroke::new(1.5, color);
         match tab {
@@ -1416,6 +1431,35 @@ mod app {
                 for node in nodes {
                     painter.circle_filled(node, 2.5, color);
                 }
+            }
+        }
+    }
+
+    /// Paints the system title bar in the window's own colours, so Windows 11 does not tint it with Mica (from the
+    /// wallpaper). Earlier Windows does not know these attributes and keeps its default caption.
+    fn paint_title_bar(frame: &eframe::Frame, background: Color32, text: Color32) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
+        };
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(window) = handle.as_raw() else {
+            return;
+        };
+        let colorref =
+            |c: Color32| u32::from(c.r()) | u32::from(c.g()) << 8 | u32::from(c.b()) << 16;
+        for (attribute, color) in [(DWMWA_CAPTION_COLOR, background), (DWMWA_TEXT_COLOR, text)] {
+            let value = colorref(color);
+            // SAFETY: the HWND belongs to this live window, and `value` is a COLORREF of the size passed.
+            unsafe {
+                DwmSetWindowAttribute(
+                    window.hwnd.get() as _,
+                    attribute as u32,
+                    (&raw const value).cast(),
+                    size_of::<u32>() as u32,
+                );
             }
         }
     }
@@ -1486,30 +1530,33 @@ mod app {
                                 selected,
                                 0.12,
                             );
-                            let mut button =
-                                egui::Button::new(RichText::new(label).font(semibold(BODY)).color(
-                                    if selected {
-                                        colors().text
-                                    } else {
-                                        colors().muted
-                                    },
-                                ))
-                                .corner_radius(R_CONTROL)
-                                .min_size(egui::vec2(124.0, CONTROL_H_SM))
-                                .fill(if selected {
-                                    Color32::from_rgba_unmultiplied(
-                                        colors().blue.r(),
-                                        colors().blue.g(),
-                                        colors().blue.b(),
-                                        (progress * 42.0) as u8,
-                                    )
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    colors().blue.gamma_multiply(progress * 0.65),
-                                ));
+                            let color = if selected {
+                                colors().text
+                            } else {
+                                colors().muted
+                            };
+                            // The icon is part of the button, so it sits inside the tab and its highlight.
+                            let icon_id = egui::Id::new(("tab-icon", label));
+                            let mut button = egui::Button::new((
+                                tab_icon(tab, self.icons_available, color, icon_id),
+                                RichText::new(label).font(semibold(BODY)).color(color),
+                            ))
+                            .corner_radius(R_CONTROL)
+                            .min_size(egui::vec2(124.0, CONTROL_H_SM))
+                            .fill(if selected {
+                                Color32::from_rgba_unmultiplied(
+                                    colors().blue.r(),
+                                    colors().blue.g(),
+                                    colors().blue.b(),
+                                    (progress * 42.0) as u8,
+                                )
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                colors().blue.gamma_multiply(progress * 0.65),
+                            ));
                             if badge > 0 {
                                 button = button.right_text(
                                     RichText::new(badge.to_string())
@@ -1517,25 +1564,26 @@ mod app {
                                         .color(colors().amber),
                                 );
                             }
-                            ui.horizontal(|ui| {
-                                tab_icon(
-                                    ui,
-                                    tab,
-                                    self.icons_available,
-                                    if selected {
-                                        colors().text
-                                    } else {
-                                        colors().muted
-                                    },
-                                );
-                                if ui
-                                    .add(button)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .clicked()
-                                {
-                                    self.tab = tab;
-                                }
+                            let shown = button.atom_ui(ui);
+                            // The glyph is a private-use character; screen readers get the plain label.
+                            shown.response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    selected,
+                                    label,
+                                )
                             });
+                            if let Some(rect) = shown.rect(icon_id) {
+                                paint_tab_icon(ui.painter(), rect, tab, color);
+                            }
+                            if shown
+                                .response
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.tab = tab;
+                            }
                         }
                     });
                 });
@@ -2179,8 +2227,10 @@ mod app {
             card().inner_margin(pad(SPACE_XL, SPACE_XL)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
+                // An always-visible bar shows there is more below; egui's floating bar only appears on hover.
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             caption(ui, "APPROVAL REQUIRED");
@@ -2223,18 +2273,7 @@ mod app {
                             });
                         }
                         ui.add_space(SPACE_L);
-                        caption(ui, "REQUEST");
-                        details(
-                            ui,
-                            "held_request",
-                            &[
-                                ("Program", &image),
-                                ("Process ID", &pid),
-                                ("User", &user),
-                                ("Matched rule", &held.rule),
-                            ],
-                        );
-                        ui.add_space(SPACE_L);
+                        // What is being sent comes first: it is what the decision is about.
                         caption(ui, "CONTENT");
                         match &held.request {
                             Some(text) => {
@@ -2271,6 +2310,18 @@ mod app {
                                 );
                             }
                         }
+                        ui.add_space(SPACE_L);
+                        caption(ui, "REQUEST");
+                        details(
+                            ui,
+                            "held_request",
+                            &[
+                                ("Program", &image),
+                                ("Process ID", &pid),
+                                ("User", &user),
+                                ("Matched rule", &held.rule),
+                            ],
+                        );
                     });
             });
             if let Some(verdict) = verdict {
@@ -2305,6 +2356,9 @@ mod app {
                             self.minutes = minutes;
                         }
                     }
+                    // Labelled and set apart, so the field reads as an input and not as a fifth preset chip.
+                    ui.separator();
+                    ui.label(RichText::new("Custom").size(SMALL).color(colors().muted));
                     ui.add(egui::DragValue::new(&mut self.minutes).range(1..=480).suffix(" min"))
                         .on_hover_text("Custom duration, 1 to 480 minutes");
                 });
@@ -2792,7 +2846,12 @@ mod app {
     }
 
     impl eframe::App for App {
-        fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            let palette = colors();
+            if self.title_bar != Some(palette.bg) {
+                self.title_bar = Some(palette.bg);
+                paint_title_bar(frame, palette.bg, palette.text);
+            }
             // eframe shows the window after painting its first frame, whatever the viewport builder said
             // (`EpiIntegration::post_rendering`). Viewport commands are applied after that in the same frame, so
             // hiding here keeps Gatewizz in the tray at start, unless a waiting request has already opened it.
@@ -3009,6 +3068,37 @@ mod app {
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].host, "example.com");
+        }
+
+        #[test]
+        fn row_time_keeps_month_day_and_seconds() {
+            assert_eq!(row_time("2026-11-22T18:58:01.123Z"), "11-22 18:58:01");
+            assert_eq!(row_time("bad"), "bad");
+        }
+
+        #[test]
+        fn history_is_newest_first_by_start_time_not_log_order() {
+            let dir =
+                std::env::temp_dir().join(format!("gatewizz-history-order-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("events.jsonl");
+            // A long tunnel that started first is logged last, when it closes.
+            std::fs::write(
+                &path,
+                concat!(
+                    r#"{"time":"2026-11-20T11:00:05.000Z","host":"b.example","status":200,"action":"allow"}"#,
+                    "\n",
+                    r#"{"time":"2026-11-20T11:00:09.000Z","host":"c.example","status":200,"action":"allow"}"#,
+                    "\n",
+                    r#"{"time":"2026-11-20T11:00:01.000Z","host":"a.example","status":200,"action":"allow"}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let rows = load_history(&path);
+            let _ = std::fs::remove_dir_all(&dir);
+            let hosts: Vec<&str> = rows.iter().map(|row| row.host.as_str()).collect();
+            assert_eq!(hosts, ["c.example", "b.example", "a.example"]);
         }
 
         #[test]
