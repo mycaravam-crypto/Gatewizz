@@ -1257,9 +1257,9 @@ mod app {
 
     fn tab_icon(ui: &mut egui::Ui, tab: Tab, font_available: bool, color: Color32) {
         let glyph = match tab {
-            Tab::Overview => '\\u{e80f}',
-            Tab::Activity => '\\u{e81c}',
-            Tab::Network => '\\u{e968}',
+            Tab::Overview => '\u{e80f}',
+            Tab::Activity => '\u{e81c}',
+            Tab::Network => '\u{e968}',
         };
         if font_available {
             ui.label(
