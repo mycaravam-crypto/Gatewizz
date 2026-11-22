@@ -279,25 +279,34 @@ mod app {
         PALETTE.with(|current| current.set(palette));
     }
 
-    fn registry_dword(key: &str, value: &str) -> Option<u32> {
-        let output = std::process::Command::new("reg.exe")
-            .args(["query", key, "/v", value])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let raw = stdout.split_whitespace().last()?;
-        u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
+    fn registry_dword(subkey: &str, value: &str) -> Option<u32> {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegGetValueW};
+
+        let subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut data = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // Read the DWORD directly. Spawning reg.exe from a GUI process can flash a console window.
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                0x10, // RRF_RT_REG_DWORD
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        (result == 0).then_some(data)
     }
 
     fn system_palette() -> Palette {
         let light = registry_dword(
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
             "AppsUseLightTheme",
         ) == Some(1);
-        let accent = registry_dword(r"HKCU\Software\Microsoft\Windows\DWM", "AccentColor")
+        let accent = registry_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor")
             .map(|argb| {
                 Color32::from_rgb(
                     ((argb >> 16) & 0xff) as u8,
