@@ -277,7 +277,9 @@ mod app {
                 ((value + 0.055) / 1.055).powf(2.4)
             }
         };
-        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        0.2126 * channel(color.r())
+            + 0.7152 * channel(color.g())
+            + 0.0722 * channel(color.b())
     }
 
     fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
@@ -303,7 +305,11 @@ mod app {
                     (f32::from(value) + (255.0 - f32::from(value)) * 0.14) as u8
                 }
             };
-            accent = Color32::from_rgb(adjust(accent.r()), adjust(accent.g()), adjust(accent.b()));
+            accent = Color32::from_rgb(
+                adjust(accent.r()),
+                adjust(accent.g()),
+                adjust(accent.b()),
+            );
         }
         if light {
             Color32::from_rgb(0x1d, 0x4e, 0x89)
@@ -1856,10 +1862,18 @@ mod app {
                         let active =
                             self.selected.is_none() && self.notice_selected == Some(notice.id);
                         let response = egui::Frame::new()
-                            .fill(if active { colors().raised } else { colors().surface })
+                            .fill(if active {
+                                colors().raised
+                            } else {
+                                colors().surface
+                            })
                             .stroke(Stroke::new(
                                 if active { 1.5 } else { 1.0 },
-                                if active { colors().blue } else { colors().border },
+                                if active {
+                                    colors().blue
+                                } else {
+                                    colors().border
+                                },
                             ))
                             .corner_radius(R_CARD)
                             .inner_margin(pad(SPACE_M, SPACE_M))
