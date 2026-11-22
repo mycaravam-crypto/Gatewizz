@@ -65,7 +65,8 @@ Usage:
   gatewizz --version | --help
 
 Options:
-  --config <path>   TOML configuration; without it every default applies
+  --config <path>   TOML configuration; without it %LOCALAPPDATA%\\gatewizz\\gatewizz.toml
+                    is used if it exists, else every default applies
                     (see config/gatewizz.example.toml)
   --check-config    validate and print the configuration, then exit
   -V, --version     print the version
@@ -182,6 +183,18 @@ fn parse(args: &[String]) -> Result<Command, String> {
 
 fn load(path: Option<PathBuf>) -> Result<Config, String> {
     path.map_or_else(|| Ok(Config::default()), |p| Config::load(&p))
+}
+
+/// The configuration to use: `--config` if given, else the one `install.ps1` creates in the data directory if it
+/// exists, else none (built-in defaults). A click on the executable then runs with the user's rules, not silently
+/// without them (#86).
+fn config_path(given: Option<PathBuf>, data_dir: Result<PathBuf, String>) -> Option<PathBuf> {
+    given.or_else(|| {
+        data_dir
+            .ok()
+            .map(|dir| dir.join("gatewizz.toml"))
+            .filter(|path| path.is_file())
+    })
 }
 
 /// Resolves on Ctrl+C or, on Windows, when the console window is closed.
@@ -330,6 +343,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::CaInstall => println!("{}", ca::install(&config::data_dir()?)?),
         Command::CaRemove => println!("{}", ca::remove(&config::data_dir()?)?),
         Command::StartupInstall(path) => {
+            let path = config_path(path, config::data_dir());
             let config = load(path.clone())?;
             config.event_target()?;
             proxy_settings(&config, config::data_dir())?;
@@ -350,8 +364,13 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::FirewallStatus => println!("{}", elevated(service::describe)?),
         Command::FirewallService => service::run()?,
         Command::CheckConfig(path) => {
-            let config = load(path)?;
+            let path = config_path(path, config::data_dir());
+            let config = load(path.clone())?;
             config.event_target()?;
+            match &path {
+                Some(path) => println!("# loaded from {}", path.display()),
+                None => println!("# no configuration file: built-in defaults"),
+            }
             print!("{}", config.effective());
         }
         Command::Run(path) => {
@@ -363,7 +382,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
                     return Ok(ExitCode::SUCCESS);
                 }
             };
-            let config = load(path)?;
+            let config = load(config_path(path, config::data_dir()))?;
             run_with_ui(config)?;
             eprintln!("gatewizz: stopped");
             return Ok(ExitCode::from(EXIT_CANCELLED));
@@ -452,6 +471,27 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn config_path_prefers_flag_then_installed_file_then_defaults() {
+        let dir = std::env::temp_dir().join(format!("gatewizz-config-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let installed = dir.join("gatewizz.toml");
+        let given = PathBuf::from("g.toml");
+
+        assert_eq!(config_path(None, Ok(dir.clone())), None);
+        std::fs::write(&installed, "").unwrap();
+        assert_eq!(config_path(None, Ok(dir.clone())), Some(installed));
+        assert_eq!(
+            config_path(Some(given.clone()), Ok(dir.clone())),
+            Some(given)
+        );
+        assert_eq!(
+            config_path(None, Err("LOCALAPPDATA is not set".into())),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

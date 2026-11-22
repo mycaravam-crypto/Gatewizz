@@ -34,7 +34,7 @@ gatewizz firewall remove                           # asks for administrator righ
 ```
 
 - `gatewizz`: starts the proxy and tray application; Ctrl+C or **Quit** in the tray stops it (exit 130).
-- `--config <path>`: selects a TOML configuration file.
+- `--config <path>`: selects a TOML configuration file. Without it, Gatewizz (and `--check-config`, `startup install`) uses `%LOCALAPPDATA%\gatewizz\gatewizz.toml`, the file the installer creates, if it exists; otherwise every default applies. `--check-config` prints which file it loaded on its first line. The `firewall` commands keep their own protected copy and still need `--config` to change it.
 - `--check-config`: validates and prints effective configuration (exit 0; exit 2 on error).
 - `ca install`: creates the local CA if needed and trusts it for the current Windows user.
 - `ca remove`: removes gatewizz CA certificates from the current user's store and deletes its key files.
