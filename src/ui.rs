@@ -57,6 +57,15 @@ fn icon_rgba(rgb: [u8; 3], size: u32) -> Vec<u8> {
 }
 
 /// The program's file name, for the window: `smartwizz.exe` rather than its full path.
+/// A client Gatewizz cannot name. WSL and VMs get their own label: that is expected, not a failure.
+fn unknown_label(why: &str) -> String {
+    if why == crate::process::OUTSIDE_WINDOWS {
+        "WSL / VM".into()
+    } else {
+        format!("unknown ({why})")
+    }
+}
+
 fn program(process: &Process) -> String {
     match process {
         Process::Known { image, .. } => image
@@ -64,7 +73,7 @@ fn program(process: &Process) -> String {
             .next()
             .unwrap_or(image)
             .to_string(),
-        Process::Unknown(why) => format!("unknown ({why})"),
+        Process::Unknown(why) => unknown_label(why),
     }
 }
 
@@ -181,7 +190,7 @@ mod app {
 
     use super::{
         TrayState, countdown, destination, duration_label, icon_rgba, network_groups, process_ids,
-        program, prompt_scope,
+        program, prompt_scope, unknown_label,
     };
     use crate::approve::{Approvals, Held, Verdict, Window};
     use crate::connections::{Direction, Live};
@@ -404,7 +413,7 @@ mod app {
                     .next()
                     .unwrap_or(image)
                     .to_string(),
-                HistoryProcess::Unknown(reason) => format!("unknown ({reason})"),
+                HistoryProcess::Unknown(reason) => unknown_label(reason),
                 HistoryProcess::Unavailable => "unknown".into(),
             }
         }
@@ -1748,6 +1757,43 @@ mod app {
                                 ("Matched rule", &held.rule),
                             ],
                         );
+                        ui.add_space(SPACE_L);
+                        caption(ui, "CONTENT");
+                        match &held.request {
+                            Some(text) => {
+                                egui::Frame::new()
+                                    .fill(ui.visuals().extreme_bg_color)
+                                    .stroke(Stroke::new(1.0, BORDER))
+                                    .corner_radius(R_CONTROL)
+                                    .inner_margin(pad(SPACE_M, SPACE_S))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("held_preview")
+                                            .max_height(220.0)
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(text)
+                                                            .font(mono(SMALL))
+                                                            .color(MUTED),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            });
+                                    });
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new(
+                                        "Not visible: this HTTPS connection is tunneled. Turn on TLS interception \
+                                         (intercept = true) to see a request before you allow it.",
+                                    )
+                                    .size(BODY)
+                                    .color(MUTED),
+                                );
+                            }
+                        }
                     });
             });
             if let Some(verdict) = verdict {
@@ -2679,6 +2725,10 @@ mod tests {
         assert_eq!(
             program(&Process::Unknown("pid reused")),
             "unknown (pid reused)"
+        );
+        assert_eq!(
+            program(&Process::Unknown(crate::process::OUTSIDE_WINDOWS)),
+            "WSL / VM"
         );
     }
 }
