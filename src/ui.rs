@@ -501,8 +501,12 @@ mod app {
         };
         geometry.width = geometry.width.clamp(820.0, width);
         geometry.height = geometry.height.clamp(580.0, height);
-        geometry.x = geometry.x.clamp(left - geometry.width + 120.0, left + width - 120.0);
-        geometry.y = geometry.y.clamp(top - geometry.height + 64.0, top + height - 64.0);
+        geometry.x = geometry
+            .x
+            .clamp(left - geometry.width + 120.0, left + width - 120.0);
+        geometry.y = geometry
+            .y
+            .clamp(top - geometry.height + 64.0, top + height - 64.0);
         geometry
     }
 
@@ -514,7 +518,10 @@ mod app {
 
     fn save_geometry(path: &Path, geometry: WindowGeometry) -> std::io::Result<()> {
         let parent = path.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "window path has no parent")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "window path has no parent",
+            )
         })?;
         std::fs::create_dir_all(parent)?;
         let temporary = path.with_extension("json.tmp");
@@ -918,9 +925,17 @@ mod app {
     /// A toggle chip: filters and duration presets.
     fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
         let (fill, stroke, color) = if selected {
-            (tint(colors().blue), Stroke::new(1.0, colors().blue), colors().text)
+            (
+                tint(colors().blue),
+                Stroke::new(1.0, colors().blue),
+                colors().text,
+            )
         } else {
-            (Color32::TRANSPARENT, Stroke::new(1.0, colors().border), colors().muted)
+            (
+                Color32::TRANSPARENT,
+                Stroke::new(1.0, colors().border),
+                colors().muted,
+            )
         };
         ui.add(
             egui::Button::new(RichText::new(text).size(SMALL).color(color))
@@ -937,14 +952,21 @@ mod app {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 dot(ui, color, 4.0);
-                ui.label(RichText::new(label).font(semibold(SMALL)).color(colors().muted));
+                ui.label(
+                    RichText::new(label)
+                        .font(semibold(SMALL))
+                        .color(colors().muted),
+                );
             });
             ui.label(
                 RichText::new(value.to_string())
                     .font(mono(HERO))
                     .color(colors().text),
             );
-            ui.add(egui::Label::new(RichText::new(hint).size(CAPTION).color(colors().subtle)).truncate());
+            ui.add(
+                egui::Label::new(RichText::new(hint).size(CAPTION).color(colors().subtle))
+                    .truncate(),
+            );
         });
     }
 
@@ -957,7 +979,10 @@ mod app {
             .show(ui, |ui| {
                 for (key, value) in rows {
                     ui.label(RichText::new(*key).size(SMALL).color(colors().subtle));
-                    ui.add(egui::Label::new(RichText::new(*value).size(BODY).color(colors().text)).wrap());
+                    ui.add(
+                        egui::Label::new(RichText::new(*value).size(BODY).color(colors().text))
+                            .wrap(),
+                    );
                     ui.end_row();
                 }
             });
@@ -974,7 +999,11 @@ mod app {
     }
 
     fn urgency(left: Duration) -> Color32 {
-        if left.as_secs() < 15 { colors().red } else { colors().amber }
+        if left.as_secs() < 15 {
+            colors().red
+        } else {
+            colors().amber
+        }
     }
 
     /// Column rectangles of an activity row: time, program, destination, decision, status.
@@ -1001,10 +1030,19 @@ mod app {
                 .iter()
                 .zip(["TIME (UTC)", "PROGRAM", "DESTINATION", "DECISION", "STATUS"])
         {
-            paint_cell(ui.painter(), *column, title, semibold(CAPTION), colors().subtle);
+            paint_cell(
+                ui.painter(),
+                *column,
+                title,
+                semibold(CAPTION),
+                colors().subtle,
+            );
         }
-        ui.painter()
-            .hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, colors().border));
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            Stroke::new(1.0, colors().border),
+        );
     }
 
     /// One clickable, full-width activity row.
@@ -1037,7 +1075,11 @@ mod app {
         );
         paint_cell(painter, host, &event.host, mono(SMALL), colors().blue);
         paint_badge(painter, decision, label, color);
-        let status_color = if event.status >= 400 { colors().red } else { colors().muted };
+        let status_color = if event.status >= 400 {
+            colors().red
+        } else {
+            colors().muted
+        };
         paint_cell(
             painter,
             status,
@@ -1209,7 +1251,11 @@ mod app {
     fn setup_style(ctx: &egui::Context) -> bool {
         let icons_available = setup_fonts(ctx);
         let palette = colors();
-        ctx.set_theme(if palette.light { egui::Theme::Light } else { egui::Theme::Dark });
+        ctx.set_theme(if palette.light {
+            egui::Theme::Light
+        } else {
+            egui::Theme::Dark
+        });
         ctx.all_styles_mut(|style| {
             use egui::TextStyle;
             style.text_styles = [
@@ -1242,7 +1288,11 @@ mod app {
             widgets.noninteractive.fg_stroke = Stroke::new(1.0, colors().text);
             for (state, fill, stroke) in [
                 (&mut widgets.inactive, colors().surface, colors().border),
-                (&mut widgets.hovered, colors().raised, colors().border_strong),
+                (
+                    &mut widgets.hovered,
+                    colors().raised,
+                    colors().border_strong,
+                ),
                 (&mut widgets.active, colors().raised, colors().blue),
                 (&mut widgets.open, colors().raised, colors().border_strong),
             ] {
@@ -1278,8 +1328,17 @@ mod app {
         let stroke = Stroke::new(1.5, color);
         match tab {
             Tab::Overview => {
-                for offset in [egui::vec2(-4.0, -4.0), egui::vec2(4.0, -4.0), egui::vec2(-4.0, 4.0), egui::vec2(4.0, 4.0)] {
-                    painter.rect_filled(Rect::from_center_size(center + offset, egui::vec2(5.0, 5.0)), 1.0, color);
+                for offset in [
+                    egui::vec2(-4.0, -4.0),
+                    egui::vec2(4.0, -4.0),
+                    egui::vec2(-4.0, 4.0),
+                    egui::vec2(4.0, 4.0),
+                ] {
+                    painter.rect_filled(
+                        Rect::from_center_size(center + offset, egui::vec2(5.0, 5.0)),
+                        1.0,
+                        color,
+                    );
                 }
             }
             Tab::Activity => {
@@ -1288,7 +1347,11 @@ mod app {
                 painter.line_segment([center, center + egui::vec2(4.0, 2.0)], stroke);
             }
             Tab::Network => {
-                let nodes = [center + egui::vec2(-5.0, -4.0), center + egui::vec2(5.0, -4.0), center + egui::vec2(0.0, 5.0)];
+                let nodes = [
+                    center + egui::vec2(-5.0, -4.0),
+                    center + egui::vec2(5.0, -4.0),
+                    center + egui::vec2(0.0, 5.0),
+                ];
                 painter.line_segment([nodes[0], nodes[1]], stroke);
                 painter.line_segment([nodes[0], nodes[2]], stroke);
                 painter.line_segment([nodes[1], nodes[2]], stroke);
@@ -1315,7 +1378,11 @@ mod app {
                 ui.add_space(SPACE_XS);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("Gatewizz").font(semibold(TITLE)).color(colors().text));
+                    ui.label(
+                        RichText::new("Gatewizz")
+                            .font(semibold(TITLE))
+                            .color(colors().text),
+                    );
                     ui.label(
                         RichText::new("Local security gate for outgoing traffic")
                             .size(SMALL)
@@ -1326,7 +1393,9 @@ mod app {
                     let (text, color) = match state {
                         TrayState::Running => ("Proxy running".to_string(), colors().green),
                         TrayState::Paused => ("Approvals paused".to_string(), colors().muted),
-                        TrayState::Waiting => (format!("{waiting} awaiting review"), colors().amber),
+                        TrayState::Waiting => {
+                            (format!("{waiting} awaiting review"), colors().amber)
+                        }
                     };
                     status_pill(ui, &text, color);
                 });
@@ -1351,20 +1420,26 @@ mod app {
                                 selected,
                                 0.12,
                             );
-                            let mut button = egui::Button::new(
-                                RichText::new(label)
-                                    .font(semibold(BODY))
-                                    .color(if selected { colors().text } else { colors().muted }),
-                            )
-                            .corner_radius(R_CONTROL)
-                            .min_size(egui::vec2(112.0, CONTROL_H_SM))
-                            .fill(Color32::from_rgba_unmultiplied(
-                                colors().raised.r(),
-                                colors().raised.g(),
-                                colors().raised.b(),
-                                (progress * 255.0) as u8,
-                            ))
-                            .stroke(Stroke::new(1.0, colors().border_strong.gamma_multiply(progress)));
+                            let mut button =
+                                egui::Button::new(RichText::new(label).font(semibold(BODY)).color(
+                                    if selected {
+                                        colors().text
+                                    } else {
+                                        colors().muted
+                                    },
+                                ))
+                                .corner_radius(R_CONTROL)
+                                .min_size(egui::vec2(112.0, CONTROL_H_SM))
+                                .fill(Color32::from_rgba_unmultiplied(
+                                    colors().raised.r(),
+                                    colors().raised.g(),
+                                    colors().raised.b(),
+                                    (progress * 255.0) as u8,
+                                ))
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    colors().border_strong.gamma_multiply(progress),
+                                ));
                             if badge > 0 {
                                 button = button.right_text(
                                     RichText::new(badge.to_string())
@@ -1373,7 +1448,16 @@ mod app {
                                 );
                             }
                             ui.horizontal(|ui| {
-                                tab_icon(ui, tab, self.icons_available, if selected { colors().text } else { colors().muted });
+                                tab_icon(
+                                    ui,
+                                    tab,
+                                    self.icons_available,
+                                    if selected {
+                                        colors().text
+                                    } else {
+                                        colors().muted
+                                    },
+                                );
                                 if ui
                                     .add(button)
                                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -1391,7 +1475,15 @@ mod app {
         fn status_bar(&mut self, ui: &mut egui::Ui, state: TrayState) {
             ui.horizontal(|ui| {
                 let paused = state == TrayState::Paused;
-                dot(ui, if paused { colors().subtle } else { colors().green }, 4.0);
+                dot(
+                    ui,
+                    if paused {
+                        colors().subtle
+                    } else {
+                        colors().green
+                    },
+                    4.0,
+                );
                 ui.label(
                     RichText::new(format!("Proxy on http://{}", self.listen))
                         .size(SMALL)
@@ -1419,8 +1511,12 @@ mod app {
                 if self.firewall_connected {
                     ui.add_space(SPACE_S);
                     dot(ui, colors().green, 4.0);
-                    ui.label(RichText::new("Firewall prompt on").size(SMALL).color(colors().muted))
-                        .on_hover_text("Connected to the Gatewizz firewall service");
+                    ui.label(
+                        RichText::new("Firewall prompt on")
+                            .size(SMALL)
+                            .color(colors().muted),
+                    )
+                    .on_hover_text("Connected to the Gatewizz firewall service");
                 }
                 if let Some((at, ok, message)) = &self.firewall_result {
                     let shown = RESULT_SHOWN;
@@ -1479,7 +1575,10 @@ mod app {
                             .color(colors().text),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(button("Resume", colors().amber, colors().bg)).clicked() {
+                            if ui
+                                .add(button("Resume", colors().amber, colors().bg))
+                                .clicked()
+                            {
                                 self.set_paused(false);
                             }
                         });
@@ -1548,7 +1647,13 @@ mod app {
                 });
                 ui.add_space(SPACE_M);
                 ui.columns(4, |columns| {
-                    stat_card(&mut columns[0], "Loaded events", loaded, colors().blue, source);
+                    stat_card(
+                        &mut columns[0],
+                        "Loaded events",
+                        loaded,
+                        colors().blue,
+                        source,
+                    );
                     stat_card(&mut columns[1], "Allowed", allowed, colors().green, source);
                     stat_card(&mut columns[2], "Blocked", blocked, colors().red, source);
                     stat_card(
@@ -1638,10 +1743,18 @@ mod app {
                     for (id, held, left) in pending {
                         let active = self.selected == Some(*id);
                         let response = egui::Frame::new()
-                            .fill(if active { colors().raised } else { colors().surface })
+                            .fill(if active {
+                                colors().raised
+                            } else {
+                                colors().surface
+                            })
                             .stroke(Stroke::new(
                                 if active { 1.5 } else { 1.0 },
-                                if active { colors().blue } else { colors().border },
+                                if active {
+                                    colors().blue
+                                } else {
+                                    colors().border
+                                },
                             ))
                             .corner_radius(R_CARD)
                             .inner_margin(pad(SPACE_M, SPACE_M))
@@ -1662,7 +1775,9 @@ mod app {
                                 });
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&held.host).font(mono(SMALL)).color(colors().muted),
+                                        RichText::new(&held.host)
+                                            .font(mono(SMALL))
+                                            .color(colors().muted),
                                     )
                                     .truncate(),
                                 );
@@ -1728,7 +1843,9 @@ mod app {
                                     1 => "Connection · 1 attempt".to_string(),
                                     n => format!("Connection · {n} attempts"),
                                 };
-                                ui.label(RichText::new(attempts).size(SMALL).color(colors().subtle));
+                                ui.label(
+                                    RichText::new(attempts).size(SMALL).color(colors().subtle),
+                                );
                             })
                             .response
                             .interact(Sense::click())
@@ -1883,7 +2000,11 @@ mod app {
                 });
                 ui.add_space(SPACE_M);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Or allow for").size(SMALL).color(colors().muted));
+                    ui.label(
+                        RichText::new("Or allow for")
+                            .size(SMALL)
+                            .color(colors().muted),
+                    );
                     // Only the service's durations: it refuses any other.
                     for minutes in crate::prompt::PRESETS {
                         if chip(ui, &duration_label(minutes), self.notice_minutes == minutes)
@@ -1895,13 +2016,16 @@ mod app {
                 });
                 ui.add_space(SPACE_S);
                 ui.horizontal(|ui| {
-                    let grant = quiet_button(&format!("Allow for {}", duration_label(self.notice_minutes)))
-                        .min_size(egui::vec2(150.0, CONTROL_H));
+                    let grant = quiet_button(&format!(
+                        "Allow for {}",
+                        duration_label(self.notice_minutes)
+                    ))
+                    .min_size(egui::vec2(150.0, CONTROL_H));
                     if ui.add(grant).clicked() {
                         answer = Some((RuleAction::Allow, Lasting::Minutes(self.notice_minutes)));
                     }
-                    let always = quiet_button("Allow always")
-                        .min_size(egui::vec2(120.0, CONTROL_H));
+                    let always =
+                        quiet_button("Allow always").min_size(egui::vec2(120.0, CONTROL_H));
                     if ui
                         .add(always)
                         .on_hover_text("Add a permanent rule to the firewall configuration")
@@ -2466,9 +2590,21 @@ mod app {
                                 "Try another search or decision filter.",
                             )
                         };
-                        check_icon(ui, if rows.is_empty() { colors().green } else { colors().blue }, 40.0);
+                        check_icon(
+                            ui,
+                            if rows.is_empty() {
+                                colors().green
+                            } else {
+                                colors().blue
+                            },
+                            40.0,
+                        );
                         ui.add_space(SPACE_S);
-                        ui.label(RichText::new(title).font(semibold(SUBHEAD)).color(colors().text));
+                        ui.label(
+                            RichText::new(title)
+                                .font(semibold(SUBHEAD))
+                                .color(colors().text),
+                        );
                         ui.label(RichText::new(message).size(SMALL).color(colors().muted));
                     });
                     return;
@@ -2542,7 +2678,11 @@ mod app {
                 badge(
                     ui,
                     &format!("HTTP {}", event.status),
-                    if event.status >= 400 { colors().red } else { colors().subtle },
+                    if event.status >= 400 {
+                        colors().red
+                    } else {
+                        colors().subtle
+                    },
                 );
             });
             ui.add_space(SPACE_M);
