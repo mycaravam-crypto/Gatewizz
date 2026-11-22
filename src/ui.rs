@@ -1433,11 +1433,19 @@ mod app {
                 ui.add_space(SPACE_XS);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(
-                        RichText::new("Gatewizz")
-                            .font(semibold(TITLE))
-                            .color(colors().text),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Gatewizz")
+                                .font(semibold(TITLE))
+                                .color(colors().text),
+                        );
+                        ui.label(
+                            RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                .size(SMALL)
+                                .color(colors().muted),
+                        )
+                        .on_hover_text("Gatewizz version");
+                    });
                     ui.label(
                         RichText::new("Local security gate for outgoing traffic")
                             .size(SMALL)
