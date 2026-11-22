@@ -1101,7 +1101,7 @@ mod app {
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (text, color) = match state {
-                        TrayState::Running => ("Protected".to_string(), GREEN),
+                        TrayState::Running => ("Proxy running".to_string(), GREEN),
                         TrayState::Paused => ("Approvals paused".to_string(), MUTED),
                         TrayState::Waiting => (format!("{waiting} awaiting review"), AMBER),
                     };
@@ -1263,7 +1263,12 @@ mod app {
         fn overview(&mut self, ui: &mut egui::Ui, pending: &[(u64, Held, Duration)]) {
             // While requests wait, the decision gets the space; the summary returns once the queue is clear.
             if pending.is_empty() && self.inbox.is_empty() {
-                let recent = self.history.len();
+                let loaded = self.history.len();
+                let allowed = self
+                    .history
+                    .iter()
+                    .filter(|event| event.decision() == "allow")
+                    .count();
                 let blocked = self
                     .history
                     .iter()
@@ -1271,26 +1276,55 @@ mod app {
                     .count();
                 let logged = self.events_path.is_some();
                 let source = if logged {
-                    "from the event log"
+                    "latest entries in the event log"
                 } else {
                     "event log disabled"
                 };
+                let live_connections = self
+                    .network
+                    .as_ref()
+                    .map(|network| network.snapshot().connections.len());
+                card().inner_margin(pad(SPACE_M, SPACE_L)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        caption(ui, "SYSTEM COMPONENTS");
+                        ui.add_space(SPACE_S);
+                        status_pill(ui, "Proxy running", GREEN);
+                        status_pill(
+                            ui,
+                            if self.firewall_connected {
+                                "Firewall connected"
+                            } else {
+                                "Firewall not connected"
+                            },
+                            if self.firewall_connected { GREEN } else { SUBTLE },
+                        );
+                        status_pill(
+                            ui,
+                            if self.network.is_some() {
+                                "Connection monitor on"
+                            } else {
+                                "Connection monitor off"
+                            },
+                            if self.network.is_some() { GREEN } else { SUBTLE },
+                        );
+                    });
+                });
+                ui.add_space(SPACE_M);
                 ui.columns(4, |columns| {
-                    stat_card(
-                        &mut columns[0],
-                        "Awaiting review",
-                        pending.len(),
-                        AMBER,
-                        "held until you decide",
-                    );
-                    stat_card(&mut columns[1], "Recent requests", recent, BLUE, source);
+                    stat_card(&mut columns[0], "Loaded events", loaded, BLUE, source);
+                    stat_card(&mut columns[1], "Allowed", allowed, GREEN, source);
                     stat_card(&mut columns[2], "Blocked", blocked, RED, source);
                     stat_card(
                         &mut columns[3],
-                        "Not blocked",
-                        recent - blocked,
-                        GREEN,
-                        source,
+                        "Live connections",
+                        live_connections.unwrap_or(0),
+                        if live_connections.is_some() { GREEN } else { SUBTLE },
+                        if live_connections.is_some() {
+                            "currently observed"
+                        } else {
+                            "monitor disabled"
+                        },
                     );
                 });
                 ui.add_space(SPACE_L);
@@ -2043,6 +2077,11 @@ mod app {
                                 });
                                 ui.add_space(SPACE_S);
                                 for conn in list {
+                                    // Scale the two long fields to the available width instead of
+                                    // reserving 500 px even when the window is at its minimum size.
+                                    let row_width = ui.available_width();
+                                    let host_width = (row_width * 0.38).clamp(140.0, 280.0);
+                                    let remote_width = (row_width * 0.30).clamp(120.0, 220.0);
                                     ui.horizontal(|ui| {
                                         let host = conn
                                             .hostname
@@ -2054,14 +2093,14 @@ mod app {
                                             3.5,
                                         );
                                         ui.add_sized(
-                                            [280.0, 20.0],
+                                            [host_width, 20.0],
                                             egui::Label::new(
                                                 RichText::new(host).size(BODY).color(TEXT),
                                             )
                                             .truncate(),
                                         );
                                         ui.add_sized(
-                                            [220.0, 20.0],
+                                            [remote_width, 20.0],
                                             egui::Label::new(
                                                 RichText::new(conn.remote.to_string())
                                                     .font(mono(SMALL))
