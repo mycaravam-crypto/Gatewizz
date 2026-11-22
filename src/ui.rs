@@ -418,10 +418,13 @@ mod app {
             }
         }
 
+        /// What happened to the request, not which rule matched: an approval that was denied or timed out, and a
+        /// request refused before any rule (bad CONNECT port, oversized body), were blocked too.
         fn decision(&self) -> &'static str {
             match self.action {
-                Some(Action::Allow) => "allow",
                 Some(Action::Block) => "block",
+                _ if self.coverage == "blocked" => "block",
+                Some(Action::Allow) => "allow",
                 Some(Action::Approve) => "approve",
                 None => "-",
             }
@@ -791,12 +794,13 @@ mod app {
             });
     }
 
-    fn decision_style(action: Option<Action>) -> (&'static str, Color32) {
-        match action {
-            Some(Action::Allow) => ("Allowed", GREEN),
-            Some(Action::Block) => ("Blocked", RED),
-            Some(Action::Approve) => ("Approval", AMBER),
-            None => ("Unknown", SUBTLE),
+    fn decision_style(event: &HistoryEvent) -> (&'static str, Color32) {
+        match event.decision() {
+            "allow" => ("Allowed", GREEN),
+            "block" if event.action == Some(Action::Approve) => ("Denied", RED),
+            "block" => ("Blocked", RED),
+            "approve" => ("Approved", AMBER),
+            _ => ("Unknown", SUBTLE),
         }
     }
 
@@ -843,10 +847,10 @@ mod app {
         if active {
             painter.rect_filled(rect, 6, tint(BLUE));
         } else if response.hovered() {
-            painter.rect_filled(rect, 6, RAISED);
+            painter.rect_filled(rect, R_CONTROL, RAISED);
         }
         let [time, program, host, decision, status] = history_columns(rect);
-        let (label, color) = decision_style(event.action);
+        let (label, color) = decision_style(event);
         let when = event.time.replace('T', " ");
         paint_cell(
             painter,
@@ -1263,7 +1267,7 @@ mod app {
                 let blocked = self
                     .history
                     .iter()
-                    .filter(|event| event.action == Some(Action::Block))
+                    .filter(|event| event.decision() == "block")
                     .count();
                 let logged = self.events_path.is_some();
                 let source = if logged {
@@ -2109,7 +2113,7 @@ mod app {
                 ("all", "All", rows.len()),
                 ("allow", "Allowed", count("allow")),
                 ("block", "Blocked", count("block")),
-                ("approve", "Approval", count("approve")),
+                ("approve", "Approved", count("approve")),
             ];
             let filtered = filter_history(rows, &self.history_filter, &self.history_decision);
 
@@ -2260,7 +2264,7 @@ mod app {
                 .wrap(),
             );
             ui.add_space(SPACE_S);
-            let (label, color) = decision_style(event.action);
+            let (label, color) = decision_style(event);
             ui.horizontal(|ui| {
                 badge(ui, label, color);
                 badge(
@@ -2507,6 +2511,7 @@ mod app {
                 r#"{"host":"api.anthropic.com","action":"block","process":{"known":{"image":"C:\\Tools\\curl.exe"}}}"#,
                 r#"{"host":"internal.example.com","action":"approve","process":{"unknown":"access denied"}}"#,
                 r#"{"host":"example.org"}"#,
+                r#"{"host":"denied.example.com","action":"approve","coverage":"blocked","status":403}"#,
             ]
             .iter()
             .map(|line| serde_json::from_str(line).expect("parse test event"))
@@ -2550,8 +2555,9 @@ mod app {
             );
             assert_eq!(
                 hosts(&filter_history(&rows, "", "block")),
-                ["api.anthropic.com"]
+                ["api.anthropic.com", "denied.example.com"]
             );
+            assert_eq!(decision_style(&rows[4]).0, "Denied");
             assert_eq!(
                 hosts(&filter_history(&rows, "", "approve")),
                 ["internal.example.com"]
