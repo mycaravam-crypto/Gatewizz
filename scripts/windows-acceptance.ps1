@@ -142,7 +142,9 @@ function Read-GwEvents {
 function Find-GwEvent([scriptblock] $Where, [int] $Seconds = 10) {
     $deadline = (Get-Date).AddSeconds($Seconds)
     do {
-        $found = @(Read-GwEvents | Where-Object $Where) | Select-Object -Last 1
+        # A record without a property the filter reads (a monitor "connection" line has no method) simply does not
+        # match; under Set-StrictMode the bare property access would otherwise end the whole run.
+        $found = @(Read-GwEvents | Where-Object { try { & $Where } catch { $false } }) | Select-Object -Last 1
         if ($found) { return $found }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
